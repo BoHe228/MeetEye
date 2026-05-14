@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python AngleCalculator.py)",
+      "Bash(python3 AngleCalculator.py)",
+      "Bash(py AngleCalculator.py)"
+    ]
+  }
+}
