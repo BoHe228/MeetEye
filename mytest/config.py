@@ -81,7 +81,14 @@ def parse_args():
                         help='是否使用匈牙利算法进行线性分配，否则使用贪心算法')
 
     # 是否使用外部UI
-    parser.add_argument('--webui',action='store_true',help='Run with local web UI (browser)')
+    parser.add_argument('--webui', action='store_true', help='Run with local web UI (browser)')
+
+    # 摄像头上传方式（webui 模式下生效）
+    parser.add_argument('--upload-mode', type=str, default='websocket',
+                        choices=['websocket', 'udp'],
+                        help='摄像头上传方式: websocket(默认) 或 udp（更低延迟，需配套 camera_client.py --format udp）')
+    parser.add_argument('--udp-port', type=int, default=5000,
+                        help='UDP 接收端口（--upload-mode udp 时有效，默认 5000）')
 
     return parser.parse_args()
 

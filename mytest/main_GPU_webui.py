@@ -205,19 +205,37 @@ def main() -> None:
     ws.inference_fn = inference_and_encode
     start_gpu_monitor()  # GPU/CPU 指标独立后台线程，不阻塞推理
 
+    # 3. 配置上传方式
+    ws.upload_mode = args.upload_mode
+    ws.upload_udp_port = args.udp_port
+    ws.performance_data['upload_mode'] = args.upload_mode
+    if args.upload_mode == 'udp':
+        import webui.udp_receiver as udp_receiver
+        udp_receiver.configure(args.udp_port)
+
     port = _find_free_port()
     local_ip = _get_local_ip()
+
+    if args.upload_mode == 'udp':
+        upload_desc  = f'UDP (端口 {args.udp_port})'
+        stream_cmd   = (f'python camera_client.py ws://{local_ip}:{port}/ws/camera'
+                        f' --format udp --udp-port {args.udp_port}')
+    else:
+        upload_desc  = 'WebSocket'
+        stream_cmd   = f'python camera_client.py ws://{local_ip}:{port}/ws/camera'
+
     print()
     print("=" * 60)
     print("  WebUI 已启动")
     print(f"  本机访问:   http://localhost:{port}")
     print(f"  局域网访问: http://{local_ip}:{port}")
-    print(f"  推流命令:   python camera_client.py ws://{local_ip}:{port}/ws/camera")
+    print(f"  上传方式:   {upload_desc}")
+    print(f"  推流命令:   {stream_cmd}")
     print("  Ctrl+C 停止")
     print("=" * 60)
     print()
 
-    # 3. 启动 FastAPI 服务（禁用 WebSocket ping 防止并发写冲突）
+    # 4. 启动 FastAPI 服务（禁用 WebSocket ping 防止并发写冲突）
     try:
         uvicorn.run(
             app,

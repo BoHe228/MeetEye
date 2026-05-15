@@ -34,8 +34,10 @@ app = FastAPI(title="Fisheye YOLO GPU WebUI")
 
 @app.on_event("startup")
 async def _startup() -> None:
-    # 在服务启动时记录 asyncio 事件循环，供 _encode_worker 线程的 call_soon_threadsafe 使用
     state._frame_event_loop = asyncio.get_running_loop()
+    if state.upload_mode == 'udp':
+        from . import udp_receiver
+        asyncio.create_task(udp_receiver.recv_loop())
 
 
 # ── WebSocket：接收摄像头帧（单向）─────────────────────────────────────

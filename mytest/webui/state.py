@@ -33,6 +33,10 @@ processor = None
 # ── 推理回调（由 main() 赋值，供 routes.py 的 WebSocket handler 调用）
 inference_fn: Optional[Callable] = None
 
+# ── 上传方式（由 main() 根据 --upload-mode 赋值）
+upload_mode: str = 'websocket'    # 'websocket' | 'udp'
+upload_udp_port: int = 5000
+
 # ── 定期 GPU 显存清理计数器
 gpu_clean_counter: int = 0
 
@@ -66,5 +70,6 @@ performance_data: Dict[str, Any] = {
     "system_memory": 0.0,
     "connected_clients": 0,
     "theoretical_fps": 0.0,     # 理论最高 FPS = 1000/帧处理耗时，用于判断瓶颈在推理还是摄像头
+    "upload_mode": "websocket", # 上传方式，由 main() 赋值后写入，前端通过 /performance 读取
     # 注：网络耗时由浏览器端 Date.now()-T0 展示，服务端不重复计算
 }

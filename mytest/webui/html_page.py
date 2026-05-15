@@ -76,7 +76,7 @@ button:hover{opacity:.85;transform:translateY(-1px);}
 </head>
 <body>
 <h1>鱼眼全景 YOLO 姿态检测 — GPU版</h1>
-<p class="subtitle">本地摄像头推流 → WebSocket → GPU推理 → 实时显示</p>
+<p class="subtitle">本地摄像头推流（WebSocket / UDP）→ GPU推理 → 实时显示</p>
 
 <div class="howto">
     <strong>使用步骤：</strong>
@@ -118,6 +118,7 @@ button:hover{opacity:.85;transform:translateY(-1px);}
     <div class="metric sys"><div class="mlabel">系统 CPU</div><div class="mval" id="m-cpu">—</div></div>
     <div class="metric sys"><div class="mlabel">系统内存</div><div class="mval" id="m-mem">—</div></div>
     <div class="metric net"><div class="mlabel">推流客户端</div><div class="mval" id="m-clients">—</div></div>
+    <div class="metric" style="border-left-color:#06b6d4;"><div class="mlabel">上传方式</div><div class="mval" id="m-upload-mode" style="font-size:14px;">—</div></div>
     <div class="metric" style="border-left-color:#ec4899;"><div class="mlabel">WebRTC 状态</div><div class="mval" id="m-webrtc-state" style="font-size:13px;">连接中…</div></div>
     <div class="metric" style="border-left-color:#ec4899;"><div class="mlabel">浏览器帧率 (FPS)</div><div class="mval" id="m-display-fps">—</div></div>
 </div>
@@ -225,6 +226,7 @@ async function updateMetrics() {
         setText('m-cpu',      d.system_cpu.toFixed(1) + '%');
         setText('m-mem',      d.system_memory.toFixed(1) + '%');
         setText('m-clients',     d.connected_clients);
+        setText('m-upload-mode', d.upload_mode === 'udp' ? 'UDP' : 'WebSocket');
         // WebRTC 状态由 RTCPeerConnection.onconnectionstatechange 直接更新，此处不轮询
         setText('last-update', new Date().toLocaleTimeString());
         const dot = document.getElementById('stream-dot');

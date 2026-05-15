@@ -1,15 +1,23 @@
 """
 本地摄像头推流客户端（零编解码）
 
-数据链路：
+数据链路（WebSocket 模式，默认）：
   相机硬件 MJPEG
     → FFmpeg (-c:v copy，直通不重编码) → stdout
     → Python 按 FFD8/FFD9 切割完整 JPEG 帧（最新帧优先，丢弃积压旧帧）
     → WebSocket 发往服务器 /ws/camera
 
+数据链路（UDP 模式，--format udp）：
+  相机硬件 MJPEG → FFmpeg → stdout
+    → Python 切割完整帧 → UDP 分片（带帧序列号）发往服务器
+  服务器端无需运行 FFmpeg，延迟更低。
+
 用法:
     python camera_client.py ws://<server-ip>:<port>/ws/camera
     python camera_client.py ws://192.168.1.100:8000/ws/camera --cam 1 --fps 30 --width 1920 --height 1080
+
+    # UDP 模式（服务器需以 --upload-mode udp --udp-port 5000 启动）
+    python camera_client.py ws://192.168.1.100:8000/ws/camera --format udp --udp-port 5000
 
     # 列出 Windows 可用摄像头
     ffmpeg -list_devices true -f dshow -i dummy
@@ -161,7 +169,112 @@ async def _drain_ffmpeg_stderr(proc) -> None:
             print(f'[ffmpeg] {msg}')
 
 
-# ── 主推流协程 ────────────────────────────────────────────────────────
+# ── UDP 推流协程 ──────────────────────────────────────────────────────
+
+async def run_stream_udp(server_host: str, udp_port: int, cam_index: int,
+                         fps: float, width: int, height: int,
+                         retry_sec: float) -> None:
+    """
+    UDP 直推模式：
+      FFmpeg 抓取摄像头 MJPEG → stdout
+      Python 按 FFD8/FFD9 切割完整帧
+      每帧添加 4 字节包头 [frame_id:u16][chunk_idx:u16] 后分片发送
+
+    服务器需以 --upload-mode udp --udp-port <port> 启动。
+    包头让接收端能检测丢包/乱序，整帧丢弃而非喂给解码器残缺数据。
+    """
+    import socket as _socket
+    import struct as _struct
+
+    try:
+        cmd = _build_ffmpeg_cmd(cam_index, width, height, fps)
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 4 * 1024 * 1024)
+
+    _HEADER    = 4           # frame_id (2B) + chunk_idx (2B)
+    _DATA_SIZE = 1400 - _HEADER  # 每包净荷 1396 字节（不触发 IP 分片，传输可靠）
+
+    print(f"🎥 FFmpeg: {' '.join(cmd)}")
+    print(f"📡 UDP 发往: {server_host}:{udp_port}  净荷 {_DATA_SIZE} B/包 + {_HEADER} B 包头")
+
+    while True:
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            asyncio.create_task(_drain_ffmpeg_stderr(proc))
+            print("✅ FFmpeg 已启动，UDP 推流中（Ctrl+C 停止）...")
+
+            buf      = b''
+            frame_n  = 0
+            frame_id = 0
+            t0       = time.time()
+            loop     = asyncio.get_running_loop()
+
+            def _send(jpeg: bytes, fid: int) -> None:
+                for idx, off in enumerate(range(0, len(jpeg), _DATA_SIZE)):
+                    hdr = _struct.pack('>HH', fid, idx)
+                    sock.sendto(hdr + jpeg[off:off + _DATA_SIZE], (server_host, udp_port))
+
+            while True:
+                chunk = await proc.stdout.read(524288)
+                if not chunk:
+                    print("⚠️  FFmpeg 输出结束（摄像头断开或不支持原生 MJPEG）")
+                    break
+                buf += chunk
+
+                latest_jpeg = None
+                while True:
+                    s = buf.find(b'\xff\xd8')
+                    if s == -1:
+                        buf = b''
+                        break
+                    e = buf.find(b'\xff\xd9', s + 2)
+                    if e == -1:
+                        buf = buf[s:]
+                        break
+                    latest_jpeg = buf[s:e + 2]
+                    buf = buf[e + 2:]
+
+                if latest_jpeg is not None:
+                    frame_id = (frame_id + 1) & 0xFFFF
+                    n_chunks = (len(latest_jpeg) + _DATA_SIZE - 1) // _DATA_SIZE
+                    await loop.run_in_executor(None, _send, latest_jpeg, frame_id)
+
+                    frame_n += 1
+                    if frame_n == 1:
+                        print(f"✅ 首帧已发  大小={len(latest_jpeg)//1024} KB  "
+                              f"分 {n_chunks} 包  frame_id={frame_id}")
+                    elif frame_n % 150 == 0:
+                        elapsed = time.time() - t0
+                        print(f"  已发 {frame_n} 帧  均速 {frame_n/elapsed:.1f} fps  "
+                              f"{len(latest_jpeg)//1024} KB/帧")
+
+        except KeyboardInterrupt:
+            print("\n🛑 用户中断，停止推流")
+            return
+        except Exception as e:
+            print(f"❌ 推流异常: {type(e).__name__}: {e}")
+        finally:
+            if proc and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+        print(f"🔄 {retry_sec}s 后重新推流...")
+        await asyncio.sleep(retry_sec)
+
+
+# ── WebSocket 推流协程 ────────────────────────────────────────────────
 
 async def run_stream(ws_url: str, cam_index: int, fps: float,
                      width: int, height: int, retry_sec: float) -> None:
@@ -275,36 +388,57 @@ async def run_stream(ws_url: str, cam_index: int, fps: float,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="鱼眼全景 GPU WebUI — 本地摄像头推流客户端（零编解码）",
+        description="MeetEye — 本地摄像头推流客户端（FFmpeg 零编解码）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
+  # WebSocket 模式（默认，服务器默认启动即可）
   python camera_client.py ws://192.168.1.100:8000/ws/camera
   python camera_client.py ws://192.168.1.100:8000/ws/camera --cam 1 --fps 30
-  python camera_client.py ws://192.168.1.100:8000/ws/camera --width 1920 --height 1080
+
+  # UDP 模式（服务器需以 --upload-mode udp --udp-port 5000 启动）
+  python camera_client.py ws://192.168.1.100:8000/ws/camera --format udp --udp-port 5000
 
   # 列出 Windows 可用摄像头索引
   ffmpeg -list_devices true -f dshow -i dummy
 """,
     )
-    p.add_argument("url",    nargs="?", default="ws://localhost:8000/ws/camera",
-                             help="服务器 WebSocket 地址")
-    p.add_argument("--cam",  type=int,   default=0,    help="摄像头索引（默认 0）")
-    p.add_argument("--fps",  type=float, default=30.0, help="帧率（默认 30）")
-    p.add_argument("--width",  type=int, default=1920, help="分辨率宽（默认 1920）")
-    p.add_argument("--height", type=int, default=1080, help="分辨率高（默认 1080）")
-    p.add_argument("--retry",  type=float, default=3.0, help="断线重连等待秒数（默认 3）")
+    p.add_argument("url",      nargs="?", default="ws://localhost:8000/ws/camera",
+                               help="服务器 WebSocket 地址（UDP 模式下仅用于解析主机名）")
+    p.add_argument("--cam",    type=int,   default=1,    help="摄像头索引（默认 0）")
+    p.add_argument("--fps",    type=float, default=30.0, help="帧率（默认 30）")
+    p.add_argument("--width",  type=int,   default=1920, help="分辨率宽（默认 1920）")
+    p.add_argument("--height", type=int,   default=1080, help="分辨率高（默认 1080）")
+    p.add_argument("--retry",  type=float, default=3.0,  help="断线重连等待秒数（默认 3）")
+    p.add_argument("--format", type=str,   default='websocket',
+                               choices=['websocket', 'udp'],
+                               help="上传格式: websocket(默认) 或 udp")
+    p.add_argument("--udp-port", type=int, default=5000,
+                               help="UDP 目标端口（--format udp 时有效，需与服务器 --udp-port 一致，默认 5000）")
     args = p.parse_args()
+
+    from urllib.parse import urlparse
+    server_host = urlparse(args.url).hostname or 'localhost'
 
     print("=" * 56)
     print("  摄像头推流客户端（FFmpeg 零编解码）")
     print(f"  服务器  : {args.url}")
     print(f"  摄像头  : {args.cam}   FPS: {args.fps}   分辨率: {args.width}x{args.height}")
+    if args.format == 'udp':
+        print(f"  上传方式: UDP (端口 {args.udp_port})")
+    else:
+        print(f"  上传方式: WebSocket")
     print("=" * 56)
 
-    asyncio.run(run_stream(
-        args.url, args.cam, args.fps,
-        args.width, args.height, args.retry,
-    ))
+    if args.format == 'udp':
+        asyncio.run(run_stream_udp(
+            server_host, args.udp_port, args.cam, args.fps,
+            args.width, args.height, args.retry,
+        ))
+    else:
+        asyncio.run(run_stream(
+            args.url, args.cam, args.fps,
+            args.width, args.height, args.retry,
+        ))
 
 
 if __name__ == "__main__":
