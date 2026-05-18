@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument('--output-width', type=int, default=3840, help='输出宽度')
     parser.add_argument('--output-height', type=int, default=1080, help='输出高度')
     parser.add_argument('--vertical-fov', type=float, default=100.0, help='垂直视场角')
-    parser.add_argument('--map-file', type=str, default=r'maps/3840_fisheye_maps_垂直.npz', help='映射文件路径')
+    parser.add_argument('--map-file', type=str, default=r'maps/3840_fisheye_maps_2026.5.18.npz', help='映射文件路径')
 
     # 全景切片参数
     parser.add_argument('--num-slices', type=int, default=3, choices=[2, 3, 4, 5, 6,7],

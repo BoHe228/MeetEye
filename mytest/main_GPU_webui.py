@@ -50,6 +50,38 @@ def _make_webrtc_frame(bgr: np.ndarray) -> av.VideoFrame:
     return av.VideoFrame.from_ndarray(yuv, format='yuv420p')
 
 
+# ── 双眼像素距离 → 物理距离（m）─────────────────────────────────────
+# 标定公式：distance = 1 / (0.024030 * D + 0.044812)
+_EYE_K1 = 0.024030
+_EYE_K2 = 0.044812
+
+
+def _eye_pixel_dist(keypoints) -> Optional[float]:
+    """
+    从 YOLO-Pose keypoints 提取双眼像素距离 D。
+    COCO 关键点格式：kpt[1]=左眼, kpt[2]=右眼，每行 [x, y] 或 [x, y, conf]。
+    任一眼置信度 < 0.3 或坐标无效时返回 None。
+    """
+    if keypoints is None:
+        return None
+    import numpy as _np
+    kpts = _np.array(keypoints)
+    if kpts.shape[0] < 3:
+        return None
+    lx, ly = float(kpts[1, 0]), float(kpts[1, 1])
+    rx, ry = float(kpts[2, 0]), float(kpts[2, 1])
+    if kpts.shape[1] >= 3 and (float(kpts[1, 2]) < 0.1 or float(kpts[2, 2]) < 0.1):
+        return None
+    d = ((rx - lx) ** 2 + (ry - ly) ** 2) ** 0.5
+    return d if d > 0 else None
+
+
+def _estimate_distance(eye_d: float) -> float:
+    """由双眼像素距离 D 估算物理距离（m）。"""
+    denom = _EYE_K1 * eye_d + _EYE_K2
+    return 1.0 / denom if denom > 0 else None
+
+
 # ── 推理结果序列化（在 inference_executor 单线程中调用，天然无竞争）────
 _frame_id_counter = 0
 
@@ -87,11 +119,16 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
         else:
             feat_list = []
 
+        eye_d    = _eye_pixel_dist(det.get('keypoints'))
+        distance = _estimate_distance(eye_d) if eye_d is not None else None
+
         targets[str(tid)] = {
-            'id': tid,
-            'azimuth':   round(float(angle['azimuth_deg']),   3) if angle else None,
-            'elevation': round(float(angle['elevation_deg']), 3) if angle else None,
-            'features':  feat_list,
+            'id':             tid,
+            'azimuth':        round(float(angle['azimuth_deg']),   3) if angle else None,
+            'elevation':      round(float(angle['elevation_deg']), 3) if angle else None,
+            'eye_pixel_dist': round(eye_d,    2) if eye_d    is not None else None,
+            'distance':       round(distance, 3) if distance is not None else None,
+            'features':       feat_list,
         }
 
     payload = {
