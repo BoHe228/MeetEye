@@ -64,8 +64,7 @@ def _eye_pixel_dist(keypoints) -> Optional[float]:
     """
     if keypoints is None:
         return None
-    import numpy as _np
-    kpts = _np.array(keypoints)
+    kpts = np.array(keypoints)
     if kpts.shape[0] < 3:
         return None
     lx, ly = float(kpts[1, 0]), float(kpts[1, 1])
