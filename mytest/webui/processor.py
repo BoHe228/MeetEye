@@ -38,6 +38,7 @@ class FisheyePanoramaYOLOPose:
         self.display_manager = None
         self.angle_calculator: Optional[AngleCalculator] = None
         self.feature_extractor: Optional[FeatureExtractor] = None
+        self.seg_masker = None   # SegMasker，初始化时按模型文件是否存在决定是否加载
 
         self.show_angles = True
         self.show_angle_overview = False
@@ -136,6 +137,24 @@ class FisheyePanoramaYOLOPose:
         except Exception as e:
             print(f"OSNet 初始化失败: {e}，将不使用 ReID 特征")
             self.feature_extractor = None
+
+        # YOLO-Seg 分割模型（Seg-guided ReID，需 --use-seg-reid 开关启用）
+        if getattr(self.args, 'use_seg_reid', False):
+            seg_path = getattr(self.args, 'seg_model_path', './yolo26n-seg.pt')
+            if os.path.exists(seg_path):
+                try:
+                    from core.seg_masker import SegMasker
+                    self.seg_masker = SegMasker(
+                        seg_path,
+                        device='cuda' if _CUDA else 'cpu',
+                    )
+                except Exception as e:
+                    print(f"[SegMasker] 加载失败: {e}，将跳过 Seg 步骤")
+                    self.seg_masker = None
+            else:
+                print(f"[SegMasker] 模型文件不存在: {seg_path}，将跳过 Seg 步骤")
+        else:
+            print("[SegMasker] --use-seg-reid 未启用，跳过分割模型加载")
 
         print("模型加载完成！等待第一帧以完成全景处理器初始化...")
         return True
@@ -274,7 +293,14 @@ class FisheyePanoramaYOLOPose:
         dets_with_feat = filtered  # 特征已挂在 det['feature'] 上（numpy [1,feat_dim] 或 None）
         t[7] = time.perf_counter()
 
-        # ⑧ 跟踪 + 绘制  [CPU]
+        # ⑧ Seg-guided ReID：Pose 框 → YOLO-Seg 掩码 → 背景置黑 → 特征重提取  [CPU]
+        #    分割失败的框回退到原始 crop，不丢特征
+        if self.seg_masker is not None and self.feature_extractor is not None:
+            self.seg_masker.reextract_features(panorama, dets_with_feat,
+                                               self.feature_extractor)
+        t[8] = time.perf_counter()
+
+        # ⑨ 跟踪 + 绘制  [CPU]
         if self.use_deep_sort:
             tracked = self.tracker.update(dets_with_feat)
         else:
@@ -283,9 +309,11 @@ class FisheyePanoramaYOLOPose:
                 d['track_id'] = i + 1
 
         annotated = draw_detections(panorama, tracked, self.tracker)
-        t[8] = time.perf_counter()
+        if self.seg_masker is not None:
+            self.seg_masker.draw_last_masks(annotated)
+        t[9] = time.perf_counter()
 
-        # ⑨ 角度计算  [CPU]
+        # ⑩ 角度计算  [CPU]
         angle_info = None
         if tracked and self.angle_calculator:
             kpts_list = [np.array(d['keypoints']) for d in tracked if d.get('keypoints')]
@@ -296,7 +324,7 @@ class FisheyePanoramaYOLOPose:
                 draw_fn = (self.angle_calculator.draw_angle_overview if self.show_angle_overview
                            else self.angle_calculator.draw_angles_on_image)
                 annotated = draw_fn(annotated, angle_info)
-        t[9] = time.perf_counter()
+        t[10] = time.perf_counter()
 
         # ─── 每 30 帧打印一次各步耗时 ────────────────────────────────
         self._timing_counter += 1
@@ -328,17 +356,18 @@ class FisheyePanoramaYOLOPose:
         """打印各步耗时及设备标注"""
         ms = lambda a, b: (t[b] - t[a]) * 1000
         steps = [
-            ("①CPU→GPU",   "CPU→GPU", 0, 1),
-            ("②鱼眼展开",  "GPU",     1, 2),
-            ("③GPU→CPU",   "GPU→CPU", 2, 3),
-            ("④裁剪切片",  "CPU",     3, 4),
-            ("⑤YOLO推理",  "GPU",     4, 5),
-            ("⑥合并过滤",  "CPU",     5, 6),
-            ("⑦特征复用",   "CPU",     6, 7),
-            ("⑧跟踪绘制",  "CPU",     7, 8),
-            ("⑨角度计算",  "CPU",     8, 9),
+            ("①CPU→GPU",    "CPU→GPU", 0,  1),
+            ("②鱼眼展开",   "GPU",     1,  2),
+            ("③GPU→CPU",    "GPU→CPU", 2,  3),
+            ("④裁剪切片",   "CPU",     3,  4),
+            ("⑤YOLO推理",   "GPU",     4,  5),
+            ("⑥合并过滤",   "CPU",     5,  6),
+            ("⑦特征复用",   "CPU",     6,  7),
+            ("⑧Seg+ReID",   "CPU",     7,  8),
+            ("⑨跟踪绘制",   "CPU",     8,  9),
+            ("⑩角度计算",   "CPU",     9, 10),
         ]
-        total = (t[9] - t[0]) * 1000
+        total = (t[10] - t[0]) * 1000
         parts = "  ".join(f"{name}[{dev}]={ms(a,b):.1f}ms"
                           for name, dev, a, b in steps)
         print(f"[总耗时 {total:.1f}ms | 检测 {n_det} 人]  {parts}")

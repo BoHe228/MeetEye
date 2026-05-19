@@ -90,6 +90,7 @@ class FisheyePanoramaYOLOPose:
         )
 
         self.feature_extractor = None
+        self.seg_masker = None   # SegMasker，initialize() 中按模型文件是否存在决定是否加载
         self.model_path = "imagenet.pyth/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth"
         if not os.path.exists(self.model_path):
             self.model_path = None
@@ -184,6 +185,25 @@ class FisheyePanoramaYOLOPose:
             print("将不使用ReID特征进行跟踪")
             self.feature_extractor = None
 
+        # Seg-guided ReID: 加载分割模型（需 --use-seg-reid 开关启用）
+        if getattr(self.args, 'use_seg_reid', False):
+            import torch as _torch
+            seg_path = getattr(self.args, 'seg_model_path', './yolo26n-seg.pt')
+            if os.path.exists(seg_path):
+                try:
+                    from core.seg_masker import SegMasker
+                    self.seg_masker = SegMasker(
+                        seg_path,
+                        device='cuda' if _torch.cuda.is_available() else 'cpu',
+                    )
+                except Exception as e:
+                    print(f"[SegMasker] 加载失败: {e}，将跳过 Seg 步骤")
+                    self.seg_masker = None
+            else:
+                print(f"[SegMasker] 模型文件不存在: {seg_path}，将跳过 Seg 步骤")
+        else:
+            print("[SegMasker] --use-seg-reid 未启用，跳过分割模型加载")
+
         print("初始化完成！")
         return True
 
@@ -233,6 +253,10 @@ class FisheyePanoramaYOLOPose:
         filtered_detections = filter_cross_boundary_detections(merged_detections, panorama.shape)
         filtered_detections = self.slicer.filter_wide_detections(filtered_detections, panorama.shape[1])
 
+        # Seg-guided ReID：用分割掩码消除背景后重提特征
+        if self.seg_masker is not None and self.feature_extractor is not None:
+            self.seg_masker.reextract_features(panorama, filtered_detections, self.feature_extractor)
+
         detections_with_features = []
         for det in filtered_detections:
             det_with_feat = det.copy()
@@ -249,6 +273,8 @@ class FisheyePanoramaYOLOPose:
 
         yolo_only_image = draw_yolo_only(panorama, filtered_detections)
         annotated_panorama = draw_detections(panorama, tracked_detections, self.deep_sort_tracker)
+        if self.seg_masker is not None:
+            self.seg_masker.draw_last_masks(annotated_panorama)
 
         angle_info = None
         if tracked_detections and self.angle_calculator:

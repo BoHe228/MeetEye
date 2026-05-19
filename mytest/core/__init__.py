@@ -9,6 +9,7 @@ from .slicer import PanoramaSlicer
 from .angle_calculator import AngleCalculator
 from .boundary_matcher import BoundaryIDMatcher, BoundaryCrossingTracker
 from .tracker import BoT_SORTTracker, print_assignment_stats
+from .seg_masker import SegMasker
 
 __all__ = [
     'CameraProcessor',
@@ -21,4 +22,5 @@ __all__ = [
     'BoundaryCrossingTracker',
     'BoT_SORTTracker',
     'print_assignment_stats',
+    'SegMasker',
 ]

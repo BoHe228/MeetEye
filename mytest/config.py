@@ -38,6 +38,10 @@ def parse_args():
     
     # YOLO参数
     parser.add_argument('--model-path', type=str, default='./yolo26n-pose.engine', help='YOLO模型路径（.pt 或 .engine）')
+    parser.add_argument('--seg-model-path', type=str, default='./yolo26n-seg.pt',
+                        help='YOLO 分割模型路径，用于 Seg-guided ReID（默认: ./yolo26n-seg.pt）')
+    parser.add_argument('--use-seg-reid', action='store_true', default=False,
+                        help='是否启用 Seg-guided ReID：用分割掩码去除背景后再提取 ReID 特征（默认: False）')
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
     
