@@ -381,7 +381,7 @@ class STrack(BaseTrack):
         - 低置信度检测时更信任历史
         - 新目标快速学习
         """
-        feat = np.array(feat, dtype=np.float32)
+        feat = np.array(feat, dtype=np.float32).flatten()  # 强制 1D，避免 (1,512) 形状污染
         feat /= np.linalg.norm(feat) + 1e-6
         self.curr_feat = feat
 
@@ -769,10 +769,9 @@ class BoT_SORTTracker:
 
         # 如果有ReID特征，融合外观距离
         if self.with_reid:
-            emb_dists = embedding_distance(strack_pool, detections_high) / 2.0
+            emb_dists = embedding_distance(strack_pool, detections_high)  # 余弦距离 [0,1]，不缩放
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
-            emb_dists[ious_dists_mask] = 1.0
-            # BoT-SORT策略：取IoU和外观距离的最小值
+            emb_dists[ious_dists_mask] = 1.0  # IoU 不足时不信任 ReID
             dists = np.minimum(ious_dists, emb_dists)
         else:
             dists = ious_dists
@@ -790,20 +789,24 @@ class BoT_SORTTracker:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        # 6. 第二阶段关联：低置信度检测 + 未匹配的轨迹
+        # 6. 按状态拆分第一阶段未匹配轨迹
+        #    - Lost 轨迹：IoU≈0，交给第三阶段纯 ReID 尝试恢复
+        #    - Tracked 轨迹：交给第二阶段与低分框做 IoU 关联
+        u_lost_stracks    = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Lost]
+        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+
+        # 第二阶段：低置信度检测框 + 未匹配 Tracked 轨迹（纯 IoU）
         if len(low_score_detections) > 0:
-            # 找出低置信度但不是高置信度的检测
-            # 这里简化处理：直接使用low_score_detections
             detections_second = [STrack(d, self.feat_history) for d in low_score_detections
-                                if d.score <= self.track_high_thresh]
+                                 if d.score <= self.track_high_thresh]
         else:
             detections_second = []
 
-        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         if r_tracked_stracks and detections_second:
             dists = iou_distance(r_tracked_stracks, detections_second)
-            matches, u_track, u_detection_second = linear_assignment(dists, thresh=0.5, use_hungarian=self.use_hungarian)
-            for itracked, idet in matches:
+            stage2_matches, u_r_tracked, _ = linear_assignment(
+                dists, thresh=0.5, use_hungarian=self.use_hungarian)
+            for itracked, idet in stage2_matches:
                 track = r_tracked_stracks[itracked]
                 det = detections_second[idet]
                 if track.state == TrackState.Tracked:
@@ -812,14 +815,13 @@ class BoT_SORTTracker:
                 else:
                     track.re_activate(det, self.frame_id, new_id=False)
                     refind_stracks.append(track)
+            unmatched_r_tracked = [r_tracked_stracks[i] for i in u_r_tracked]
         else:
-            u_track = u_track
+            unmatched_r_tracked = r_tracked_stracks
 
-        # 标记未匹配的轨迹为丢失
-        for it in u_track:
-            track = r_tracked_stracks[it] if it < len(r_tracked_stracks) else strack_pool[it]
+        # 标记未匹配的 Tracked 轨迹为丢失
+        for track in unmatched_r_tracked:
             if not track.state == TrackState.Lost:
-                # === 边界匹配：记录消失在边界的目标 ===
                 if self.enable_boundary_matching and self.boundary_tracker is not None:
                     prev_info = self.prev_track_info.get(track.track_id)
                     prev_bbox = prev_info.get('bbox') if prev_info else None
@@ -833,9 +835,27 @@ class BoT_SORTTracker:
                             smooth_feat=track.smooth_feat,
                             prev_bbox=prev_bbox
                         )
-
                 track.mark_lost()
                 lost_stracks.append(track)
+
+        # 第三阶段：纯 ReID 恢复 Lost 轨迹（无 IoU 门控）
+        # Lost 轨迹与新检测 IoU≈0，第一阶段无法匹配；此阶段仅凭外观相似度尝试 re-activate
+        if self.with_reid and u_lost_stracks and u_detection:
+            reid_dets = [detections_high[i] for i in u_detection]
+            emb_dists_lost = embedding_distance(u_lost_stracks, reid_dets)
+            emb_dists_lost[emb_dists_lost > self.appearance_thresh] = 1.0
+            stage3_matches, _, _ = linear_assignment(
+                emb_dists_lost, thresh=self.appearance_thresh, use_hungarian=self.use_hungarian)
+            matched_det_local = set()
+            for i_lost, i_det in stage3_matches:
+                track = u_lost_stracks[i_lost]
+                det = reid_dets[i_det]
+                track.re_activate(det, self.frame_id, new_id=False)
+                refind_stracks.append(track)
+                matched_det_local.add(i_det)
+            # 从 u_detection 中移除已被第三阶段认领的检测
+            u_detection = [u_detection[i] for i in range(len(u_detection))
+                           if i not in matched_det_local]
 
         # 7. 处理未确认的轨迹
         detections_unconfirmed = [detections_high[i] for i in u_detection]
@@ -844,7 +864,7 @@ class BoT_SORTTracker:
         ious_dists = fuse_score(ious_dists, detections_unconfirmed)
 
         if self.with_reid:
-            emb_dists = embedding_distance(unconfirmed, detections_unconfirmed) / 2.0
+            emb_dists = embedding_distance(unconfirmed, detections_unconfirmed)
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0
             dists = np.minimum(ious_dists, emb_dists)

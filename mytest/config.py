@@ -75,8 +75,8 @@ def parse_args():
                         help='是否使用BoT-SORT跟踪器（结合运动和外观特征）')
     parser.add_argument('--deep-sort-match-thresh', type=float, default=0.3,
                         help='BoT-SORT匹配阈值')
-    parser.add_argument('--appearance-thresh', type=float, default=0.6,
-                        help='BoT-SORT外观特征匹配阈值')
+    parser.add_argument('--appearance-thresh', type=float, default=0.4,
+                        help='BoT-SORT外观特征匹配阈值（余弦距离，越小越严格，建议 0.35-0.45）')
     parser.add_argument('--use-hungarian', action='store_true', default=True,
                         help='是否使用匈牙利算法进行线性分配，否则使用贪心算法')
 
