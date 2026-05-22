@@ -11,6 +11,7 @@ import json
 import sys
 import threading
 
+
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -41,6 +42,7 @@ _frame_count: int = 0
 # 动态元素追踪（用于帧间精确清理，避免误删静态标注）
 _radar_dynamic_artists: list = []
 _sphere_dynamic_artists: list = []   # 3D 文字、连线、弧线（scatter/Arrow3D 由类型清理）
+_legend_artists: list = []           # 底部图注区域的动态元素
 
 # 雷达最大显示距离（m）
 _RADAR_MAX_DIST = 5.0
@@ -60,7 +62,16 @@ _PALETTE = [
 ]
 
 def _id_color(tid: str) -> str:
-    return _PALETTE[hash(tid) % len(_PALETTE)]
+    # 尝试将ID解析为数字，如果是数字直接用数字索引
+    try:
+        idx = int(float(tid))
+        return _PALETTE[idx % len(_PALETTE)]
+    except (ValueError, TypeError):
+        # 如果不是数字，使用改进的哈希方法
+        h = 0
+        for char in str(tid):
+            h = (h * 31 + ord(char)) & 0xFFFFFFFF
+        return _PALETTE[h % len(_PALETTE)]
 
 
 # ── Arrow3D ───────────────────────────────────────────────────────────
@@ -90,10 +101,6 @@ def _on_message(ws, message):
             if az is None or el is None:
                 continue
             dist = tdata.get('distance')
-            if dist is None:
-                eye_d = tdata.get('eye_pixel_dist')
-                if eye_d is not None and float(eye_d) > 0:
-                    dist = estimate_distance_from_eyes(float(eye_d))
             new_targets[str(tid)] = {
                 'azimuth':   float(az),
                 'elevation': float(el),
@@ -162,13 +169,6 @@ def spherical_to_cartesian(azimuth_deg: float, elevation_deg: float,
     return x, y, z
 
 
-# ── 双眼像素距离 → 估计物理距离（m，备用）────────────────────────────
-_EYE_K1 = 0.024030
-_EYE_K2 = 0.044812
-
-def estimate_distance_from_eyes(eye_pixel_dist: float):
-    denom = _EYE_K1 * eye_pixel_dist + _EYE_K2
-    return 1.0 / denom if denom > 0 else None
 
 
 # ── 3D 半球体静态背景（只在启动时绘制一次）──────────────────────────
@@ -339,18 +339,77 @@ def update_radar(ax, points_dict: dict) -> None:
                         marker='o' if has_dist else '^', alpha=0.95)
         _radar_dynamic_artists.append(sc)
 
-        # 标注：沿径向外推，避免超出边界
+        # 在点旁边只显示简单的ID编号，不显示完整信息
         norm = max((px ** 2 + py ** 2) ** 0.5, 0.01)
-        ox   = (px / norm) * _RADAR_MAX_DIST * 0.09
-        oy   = (py / norm) * _RADAR_MAX_DIST * 0.09
-        dist_str = f'{dist:.1f} m' if has_dist else '距离未知'
+        ox   = (px / norm) * _RADAR_MAX_DIST * 0.06
+        oy   = (py / norm) * _RADAR_MAX_DIST * 0.06
         txt = ax.text(px + ox, py + oy,
-                      f'ID {tid}\n方位 {az:.1f}°\n{dist_str}',
-                      fontsize=8, color='#1e293b', zorder=14,
-                      bbox=dict(boxstyle='round,pad=0.35',
-                                facecolor='#ffffff', alpha=0.82,
-                                edgecolor=c, linewidth=1.0))
+                      f'{tid}',
+                      fontsize=9, color='#1e293b', zorder=14,
+                      fontweight='bold')
         _radar_dynamic_artists.append(txt)
+
+
+# ── 更新中间图注（每帧调用）────────────────────────────────────────
+def update_legend(fig, points_dict: dict) -> None:
+    global _legend_artists
+    for artist in _legend_artists:
+        try:
+            artist.remove()
+        except ValueError:
+            pass
+    _legend_artists.clear()
+
+    # 标题
+    title = fig.text(0.5, 0.90, '目标信息', fontsize=12, ha='center',
+                     color='#1e293b', fontweight='medium')
+    _legend_artists.append(title)
+
+    if not points_dict:
+        return
+
+    # 按ID排序，保持图注顺序稳定
+    sorted_items = sorted(points_dict.items(), key=lambda x: str(x[0]))
+
+    n = len(sorted_items)
+    # 起始位置（基于 figure 坐标），垂直居中，增加行间距
+    item_height = 0.10
+    total_height = n * item_height
+    y_start = 0.5 + total_height / 2 - item_height * 0.2
+    x_start = 0.40
+
+    for i, (tid, pd) in enumerate(sorted_items):
+        y = y_start - i * item_height
+
+        c = _id_color(tid)
+        az = pd['azimuth']
+        el = pd['elevation']
+        dist = pd.get('distance')
+
+        # 绘制颜色标记点
+        point = fig.text(x_start, y, '●', fontsize=14, color=c, va='center')
+        _legend_artists.append(point)
+
+        # ID 标题
+        id_txt = fig.text(x_start + 0.025, y, f'ID {tid}', fontsize=10,
+                          color='#1e293b', va='center', fontweight='bold')
+        _legend_artists.append(id_txt)
+
+        # 方位
+        az_txt = fig.text(x_start + 0.025, y - 0.03, f'方位: {az:.1f}°',
+                          fontsize=10, color='#475569', va='center')
+        _legend_artists.append(az_txt)
+
+        # 俯仰
+        el_txt = fig.text(x_start + 0.11, y - 0.03, f'俯仰: {el:.1f}°',
+                          fontsize=10, color='#475569', va='center')
+        _legend_artists.append(el_txt)
+
+        # 距离
+        dist_str = f'{dist:.1f} m' if dist is not None else '—'
+        dist_txt = fig.text(x_start + 0.025, y - 0.058, f'距离: {dist_str}',
+                            fontsize=10, color='#475569', va='center')
+        _legend_artists.append(dist_txt)
 
 
 # ── 3D 半球体动态元素（每帧调用）────────────────────────────────────
@@ -397,7 +456,7 @@ def update_dynamic(ax, points_dict: dict) -> None:
         _sphere_dynamic_artists.append(arc)
 
         # 目标点
-        ax.scatter(x, y, z, color=c, s=160, alpha=0.98,
+        ax.scatter(x, y, z, color=c, s=100, alpha=0.98,
                    edgecolors='#1e293b', linewidths=1.5,
                    depthshade=True, zorder=30)
 
@@ -408,14 +467,11 @@ def update_dynamic(ax, points_dict: dict) -> None:
             color=c, alpha=0.80, linewidth=2.5, zorder=25,
         ))
 
-        # 标注文字
-        txt = ax.text(x * 1.22, y * 1.22, z * 1.22,
-                      f'ID {tid}\n方位 {az:.1f}°  俯仰 {el:.1f}°',
-                      fontsize=8.5, color='#1e293b',
-                      bbox=dict(boxstyle='round,pad=0.35',
-                                facecolor='#ffffff', alpha=0.82,
-                                edgecolor=c, linewidth=1.0),
-                      zorder=35)
+        # 在点旁边只显示简单的ID编号，不显示完整信息
+        txt = ax.text(x * 1.18, y * 1.18, z * 1.18,
+                      f'{tid}',
+                      fontsize=10, color='#1e293b',
+                      fontweight='bold', zorder=35)
         _sphere_dynamic_artists.append(txt)
 
 
@@ -449,17 +505,17 @@ def main():
         print(f"=== 连接 {url} ===")
         start_ws_thread(url)
 
-    # 左：3D 半球体，右：俯视雷达
-    fig = plt.figure(figsize=(17, 7.5))
+    # 左：3D 半球体，中：图注区，右：俯视雷达
+    fig = plt.figure(figsize=(10, 4))
     fig.patch.set_facecolor('#ffffff')
-    gs  = fig.add_gridspec(1, 2, wspace=0.30)
+    gs  = fig.add_gridspec(1, 3, width_ratios=[1.1, 0.5, 1], wspace=0.3)
     ax3d = fig.add_subplot(gs[0, 0], projection='3d')
-    ax2d = fig.add_subplot(gs[0, 1])
+    ax2d = fig.add_subplot(gs[0, 2])
 
     build_static_scene(ax3d)
     build_radar_scene(ax2d)
     plt.ion()
-    plt.tight_layout(pad=3.2)
+    plt.tight_layout(pad=2.5)
 
     # 标题对象创建一次，后续只更新文字和颜色（避免每帧重建）
     title_main = fig.suptitle(
@@ -498,6 +554,7 @@ def main():
 
                 update_dynamic(ax3d, targets)
                 update_radar(ax2d, targets)
+                update_legend(fig, targets)
                 fig.canvas.draw_idle()
                 last_frame = fc
 

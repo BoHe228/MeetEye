@@ -1,15 +1,16 @@
 """
 FastAPI 应用 + 所有路由
-  - WebSocket /ws/camera  : 接收摄像头推流（单向，不回发）
-  - WebSocket /ws/webrtc  : WebRTC 信令（SDP Offer/Answer，vanilla ICE）
-  - GET /video/original   : 原始画面 MJPEG 流（备用）
-  - GET /video/infer      : 推理结果 MJPEG 流（备用）
-  - GET /performance      : 性能指标 JSON
-  - GET /snapshot         : 截图并保存
-  - GET /                 : WebUI 首页
+  - WebSocket /ws/camera   : 接收摄像头推流（单向，不回发）
+  - WebSocket /ws/webrtc   : WebRTC 信令（SDP Offer/Answer，vanilla ICE）
+  - GET  /video/original   : 原始画面 MJPEG 流（备用）
+  - GET  /performance      : 性能指标 JSON
+  - POST /record/start     : 开始录制原始+推理双路视频到服务器
+  - POST /record/stop      : 停止录制并返回保存路径
+  - GET  /                 : WebUI 首页
 """
 import asyncio
 import os
+import subprocess
 import time
 import cv2
 
@@ -179,18 +180,69 @@ async def inference_ws(websocket: WebSocket) -> None:
             state._inference_ready_waiters.discard(ev)
 
 
-@app.get("/snapshot")
-def snapshot():
-    with state.frame_lock:
-        f = state.latest_annotated_frame
-    if f is None:
-        return {"msg": "no frame available", "filename": None}
-    os.makedirs("screenshots", exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    path = f"screenshots/snapshot_{ts}.jpg"
-    cv2.imwrite(path, f)
-    print(f"📸 截图已保存: {path}")
-    return {"msg": "saved", "filename": path}
+@app.post("/record/start")
+def record_start():
+    with state.record_lock:
+        if state.is_recording:
+            return JSONResponse({"msg": "already recording", "filenames": state.record_filenames})
+        os.makedirs("recordings", exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        state.record_filenames = {
+            "original":  f"recordings/original_{ts}.mp4",
+            "annotated": f"recordings/annotated_{ts}.mp4",
+        }
+        state.is_recording = True
+    print(f"[录制] 开始 → {state.record_filenames}")
+    return JSONResponse({"msg": "started", "filenames": state.record_filenames})
+
+
+def _fix_mp4_faststart(path: str) -> None:
+    """Move moov atom to file front so the MP4 is seekable before fully downloaded."""
+    if not os.path.exists(path):
+        return
+    tmp = path + '.tmp.mp4'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-i', path, '-c', 'copy', '-movflags', 'faststart', tmp],
+            check=True, capture_output=True, timeout=300,
+        )
+        os.replace(tmp, path)
+        print(f"[录制] faststart 完成: {path}")
+    except FileNotFoundError:
+        print("[录制] ffmpeg 未安装，跳过 faststart（视频可播放但进度条可能受限）")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except subprocess.CalledProcessError as e:
+        print(f"[录制] faststart 失败: {e.stderr.decode('utf-8', errors='replace')[:300]}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception as e:
+        print(f"[录制] faststart 异常: {e}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+import threading as _threading
+
+@app.post("/record/stop")
+def record_stop():
+    with state.record_lock:
+        if not state.is_recording:
+            return JSONResponse({"msg": "not recording", "filenames": {}})
+        state.is_recording = False
+        filenames = dict(state.record_filenames)
+        state.record_filenames = {}
+        if state._video_writer_original is not None:
+            state._video_writer_original.release()
+            state._video_writer_original = None
+        if state._video_writer_annotated is not None:
+            state._video_writer_annotated.release()
+            state._video_writer_annotated = None
+    print(f"[录制] 停止，文件已保存: {filenames}")
+    # Run faststart in background — VideoWriters are already released at this point
+    for path in filenames.values():
+        _threading.Thread(target=_fix_mp4_faststart, args=(path,), daemon=True).start()
+    return JSONResponse({"msg": "stopped", "filenames": filenames})
 
 
 @app.websocket("/ws/webrtc")

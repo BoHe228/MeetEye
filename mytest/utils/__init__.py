@@ -16,6 +16,7 @@ from .feature import (
     box_iou,
     box_iou_batch,
 )
+from .distance_estimator import HeadPoseDistanceEstimator, estimate_distance_from_eyes
 
 __all__ = [
     'DisplayManager',
@@ -29,4 +30,6 @@ __all__ = [
     'cosine_distance',
     'box_iou',
     'box_iou_batch',
+    'HeadPoseDistanceEstimator',
+    'estimate_distance_from_eyes',
 ]

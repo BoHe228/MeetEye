@@ -34,6 +34,7 @@ import webui.state as ws
 from webui.gpu_info import update_perf, start_gpu_monitor
 from webui.processor import FisheyePanoramaYOLOPose
 from webui.routes import app
+from utils.distance_estimator import HeadPoseDistanceEstimator
 
 
 # ── WebRTC 预转换（在推理线程完成，不在 asyncio 事件循环中执行）────────
@@ -50,35 +51,27 @@ def _make_webrtc_frame(bgr: np.ndarray) -> av.VideoFrame:
     return av.VideoFrame.from_ndarray(yuv, format='yuv420p')
 
 
-# ── 双眼像素距离 → 物理距离（m）─────────────────────────────────────
-# 标定公式：distance = 1 / (0.024030 * D + 0.044812)
-_EYE_K1 = 0.024030
-_EYE_K2 = 0.044812
-
-
+# ── 双眼像素距离（原始值，仅用于 JSON 中的 eye_pixel_dist 监控字段）────
 def _eye_pixel_dist(keypoints) -> Optional[float]:
     """
-    从 YOLO-Pose keypoints 提取双眼像素距离 D。
+    从 YOLO-Pose keypoints 提取双眼像素距离（未做偏转修正）。
     COCO 关键点格式：kpt[1]=左眼, kpt[2]=右眼，每行 [x, y] 或 [x, y, conf]。
-    任一眼置信度 < 0.3 或坐标无效时返回 None。
     """
     if keypoints is None:
         return None
     kpts = np.array(keypoints)
     if kpts.shape[0] < 3:
         return None
-    lx, ly = float(kpts[1, 0]), float(kpts[1, 1])
-    rx, ry = float(kpts[2, 0]), float(kpts[2, 1])
     if kpts.shape[1] >= 3 and (float(kpts[1, 2]) < 0.1 or float(kpts[2, 2]) < 0.1):
         return None
+    lx, ly = float(kpts[1, 0]), float(kpts[1, 1])
+    rx, ry = float(kpts[2, 0]), float(kpts[2, 1])
     d = ((rx - lx) ** 2 + (ry - ly) ** 2) ** 0.5
     return d if d > 0 else None
 
 
-def _estimate_distance(eye_d: float) -> float:
-    """由双眼像素距离 D 估算物理距离（m）。"""
-    denom = _EYE_K1 * eye_d + _EYE_K2
-    return 1.0 / denom if denom > 0 else None
+# ── 每个跟踪目标独立持有一个距离估算器，用于帧间熔断与姿态修正 ────────
+_distance_estimators: dict = {}
 
 
 # ── 推理结果序列化（在 inference_executor 单线程中调用，天然无竞争）────
@@ -93,8 +86,11 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
     track_id ↔ angle_info 对齐方式：
       angle_info['persons'][j] 对应 tracked 中第 j 个有 keypoints 的目标，
       因此用过滤后的下标重建 (tracked_index → angle_data) 映射。
+
+    distance 字段使用 HeadPoseDistanceEstimator 进行偏转角修正，
+    每个 track_id 持有独立实例以支持帧间熔断缓存。
     """
-    global _frame_id_counter
+    global _frame_id_counter, _distance_estimators
     _frame_id_counter += 1
 
     # 建立 tracked 下标 → 角度数据 的映射
@@ -107,19 +103,31 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
                 angle_by_tracked_idx[ti] = persons[j]
 
     targets: dict = {}
+    current_tids: set = set()
+
     for i, det in enumerate(tracked or []):
         tid = int(det.get('track_id', i + 1))
+        current_tids.add(tid)
         angle = angle_by_tracked_idx.get(i)
 
         feat = det.get('feature')
-        if feat is not None:
-            # feature shape: [1, feat_dim] (numpy)，展平为 1-D list
-            feat_list = feat.reshape(-1).tolist()
-        else:
-            feat_list = []
+        feat_list = feat.reshape(-1).tolist() if feat is not None else []
 
-        eye_d    = _eye_pixel_dist(det.get('keypoints'))
-        distance = _estimate_distance(eye_d) if eye_d is not None else None
+        # 原始双眼像素距离（未修正，供监控用）
+        eye_d = _eye_pixel_dist(det.get('keypoints'))
+
+        # 头部姿态修正距离：每个 track_id 独立维护估算器
+        estimator = _distance_estimators.get(tid)
+        if estimator is None:
+            estimator = HeadPoseDistanceEstimator()
+            _distance_estimators[tid] = estimator
+
+        kpts = det.get('keypoints')
+        l_eye, r_eye, nose = HeadPoseDistanceEstimator.extract_keypoints(kpts)
+        if l_eye is not None:
+            distance = estimator.compute_distance(l_eye, r_eye, nose)
+        else:
+            distance = estimator.last_valid_distance
 
         targets[str(tid)] = {
             'id':             tid,
@@ -129,6 +137,11 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
             'distance':       round(distance, 3) if distance is not None else None,
             'features':       feat_list,
         }
+
+    # 清理不再活跃的轨迹对应的估算器，防止内存持续增长
+    stale_tids = [tid for tid in _distance_estimators if tid not in current_tids]
+    for tid in stale_tids:
+        del _distance_estimators[tid]
 
     payload = {
         'timestamp': round(time.time(), 3),
@@ -203,6 +216,21 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
         ws.latest_webrtc_frame      = webrtc_vf
         # latest_original_jpeg 已由 camera_ws.drain_recv 在摄像头速率直接更新，此处不重复赋值
     _notify_inference_waiters()     # 立即唤醒所有 /ws/inference 协程
+
+    # ── 视频录制（record_lock 保护，与 /record/start、/record/stop 互斥）
+    with ws.record_lock:
+        if ws.is_recording:
+            if ws._video_writer_original is None:
+                # 首帧时懒初始化 VideoWriter（此时才知道分辨率）
+                oh, ow = frame.shape[:2]
+                ah, aw = annotated.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                ws._video_writer_original  = cv2.VideoWriter(
+                    ws.record_filenames['original'],  fourcc, 25.0, (ow, oh))
+                ws._video_writer_annotated = cv2.VideoWriter(
+                    ws.record_filenames['annotated'], fourcc, 25.0, (aw, ah))
+            ws._video_writer_original.write(frame)
+            ws._video_writer_annotated.write(annotated)
 
     # GPU 显存碎片清理（每 200 帧一次，原在 _encode_worker 中，现移至此）
     if _infer_log_counter % 200 == 0 and torch.cuda.is_available():

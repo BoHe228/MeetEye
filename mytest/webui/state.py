@@ -51,6 +51,13 @@ _frame_event_loop: Optional[asyncio.AbstractEventLoop] = None
 _inference_ready_waiters: Set[asyncio.Event] = set()
 _inference_waiters_lock = threading.Lock()
 
+# ── 视频录制状态（由 /record/start、/record/stop 接口控制）
+record_lock = threading.Lock()
+is_recording: bool = False
+_video_writer_original = None   # cv2.VideoWriter | None
+_video_writer_annotated = None  # cv2.VideoWriter | None
+record_filenames: dict = {}     # {'original': str, 'annotated': str}
+
 # ── 性能指标（由 gpu_info.update_perf 更新，由 /performance 接口读取）
 performance_data: Dict[str, Any] = {
     "fps": 0.0,
@@ -64,6 +71,7 @@ performance_data: Dict[str, Any] = {
     "tracking_ids": [],
     "system_cpu": 0.0,
     "system_memory": 0.0,
+    "system_memory_avail_mb": 0.0,   # 系统可用内存 MB，录制期间低于阈值时触发急停
     "connected_clients": 0,
     "theoretical_fps": 0.0,     # 理论最高 FPS = 1000/帧处理耗时，用于判断瓶颈在推理还是摄像头
     # 注：网络耗时由浏览器端 Date.now()-T0 展示，服务端不重复计算
