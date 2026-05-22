@@ -198,8 +198,9 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
 
     _infer_log_counter += 1
     if _infer_log_counter % 30 == 1:
+        fps_str = f"{1000/total_ms:.1f}" if total_ms > 0 else "∞"
         print(f"[inference_and_encode] decode={decode_ms:.1f}ms  pipeline={pipeline_ms:.1f}ms"
-              f"  total={total_ms:.1f}ms  → 理论上限 {1000/total_ms:.1f} FPS")
+              f"  total={total_ms:.1f}ms  → 理论上限 {fps_str} FPS")
 
     detected_persons = len(tracked) if tracked else 0
     tracking_ids = [str(d.get('track_id', '?')) for d in tracked] if tracked else []
@@ -221,7 +222,7 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
     with ws.record_lock:
         if ws.is_recording:
             if ws._video_writer_original is None:
-                # 首帧时懒初始化 VideoWriter（此时才知道分辨率）
+                # 首帧时初始化 VideoWriter（此时才知道分辨率）
                 oh, ow = frame.shape[:2]
                 ah, aw = annotated.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')

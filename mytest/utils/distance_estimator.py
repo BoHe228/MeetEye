@@ -11,10 +11,10 @@
     - 双眼像素距离  Dapp = Dreal_px * cos(yaw)
     - 鼻尖横向偏移  nose_lateral = D_nose * sin(yaw)
   其中 D_nose 是鼻尖相对于面部中心的深度（单位与眼距相同）。
-  两式相除：
-    nose_lateral / (Dapp/2) ≈ (2*D_nose/W) * tan(yaw) = _NOSE_SCALE * tan(yaw)
+  两式相除（分子分母均取水平X分量，消除头部roll和全景投影带来的Y误差）：
+    nose_lateral / (Dapp_x/2) ≈ (2*D_nose/W) * tan(yaw) = _NOSE_SCALE * tan(yaw)
   因此：
-    tan(yaw) = (nose_lateral / (Dapp/2)) / _NOSE_SCALE
+    tan(yaw) = (nose_lateral / (Dapp_x/2)) / _NOSE_SCALE
     cos(yaw) = 1 / sqrt(1 + tan(yaw)^2)
     Dreal   = Dapp / cos(yaw) = Dapp * sqrt(1 + tan(yaw)^2)
 """
@@ -180,9 +180,12 @@ class HeadPoseDistanceEstimator:
         re = np.array(right_eye, dtype=np.float64)
         no = np.array(nose,      dtype=np.float64)
 
-        # ── Step 1: 表观像素眼距 Dapp ──────────────────────────────────
-        Dapp = float(np.linalg.norm(re - le))
-        if Dapp < 1e-6:
+        # ── Step 1: 表观像素眼距 ────────────────────────────────────────
+        # Dapp_x：水平分量，用于偏转角归一化（与 nose_lateral 方向一致）
+        # Dapp  ：2D 欧氏距离，用于最终距离估算（与标定数据一致）
+        Dapp_x = abs(float(re[0] - le[0]))
+        Dapp   = float(np.linalg.norm(re - le))
+        if Dapp_x < 1e-6:
             return self._last_valid_distance
 
         # ── Step 2: 鼻尖横向偏移（相对于眼睛中点）──────────────────────
@@ -190,8 +193,8 @@ class HeadPoseDistanceEstimator:
         eye_mid_x = (le[0] + re[0]) / 2.0
         nose_lateral = float(no[0] - eye_mid_x)
 
-        # 归一化：以半眼距为单位，量纲消除，结果对分辨率不敏感
-        nose_norm = nose_lateral / (Dapp / 2.0)
+        # 归一化：分子分母均为水平(X)方向，量纲一致，消除分辨率依赖
+        nose_norm = nose_lateral / (Dapp_x / 2.0)
 
         # ── Step 3: 估算偏转角 yaw ──────────────────────────────────────
         # 在简化透视模型下：nose_norm ≈ _NOSE_SCALE * tan(yaw)

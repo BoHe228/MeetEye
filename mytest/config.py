@@ -48,7 +48,7 @@ def parse_args():
     # 性能参数
     parser.add_argument('--save-frames', action='store_true', help='保存处理后的帧')
     parser.add_argument('--save-crops', action='store_true', help='保存每个检测框的内容（抠图）')
-    parser.add_argument('--show-fps', action='store_true', default=True, help='显示FPS')
+    parser.add_argument('--show-fps', action='store_true', default=False, help='显示FPS')
 
     # 显示窗口参数
     parser.add_argument('--use-dual-windows', action='store_true', default=False,
@@ -71,14 +71,14 @@ def parse_args():
                         help='裁剪全景图正上方区域的分母，0表示不裁剪，3表示裁剪1/3，以此类推 (默认: 0)')
 
     # BoT-SORT跟踪器参数
-    parser.add_argument('--use-deep-sort', action='store_true', default=True,
-                        help='是否使用BoT-SORT跟踪器（结合运动和外观特征）')
+    parser.add_argument('--use-deep-sort', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否使用BoT-SORT跟踪器（结合运动和外观特征），--no-use-deep-sort 禁用')
     parser.add_argument('--deep-sort-match-thresh', type=float, default=0.3,
                         help='BoT-SORT匹配阈值')
     parser.add_argument('--appearance-thresh', type=float, default=0.4,
                         help='BoT-SORT外观特征匹配阈值（余弦距离，越小越严格，建议 0.35-0.45）')
-    parser.add_argument('--use-hungarian', action='store_true', default=True,
-                        help='是否使用匈牙利算法进行线性分配，否则使用贪心算法')
+    parser.add_argument('--use-hungarian', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否使用匈牙利算法进行线性分配，--no-use-hungarian 改用贪心算法')
 
     # 是否使用外部UI
     parser.add_argument('--webui',action='store_true',help='Run with local web UI (browser)')

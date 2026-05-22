@@ -8,6 +8,7 @@ BoT-SORT多目标跟踪器
 5. 边界穿越ID连续性匹配（新增）
 """
 import time
+import threading
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 from collections import deque, OrderedDict
@@ -34,6 +35,7 @@ PERF_STATS = {
     'greedy_calls': 0,
     'greedy_total_time': 0.0,
 }
+_stats_lock = threading.Lock()
 
 
 class TrackState:
@@ -260,8 +262,9 @@ def linear_assignment(dist_matrix: np.ndarray, thresh: float, use_hungarian: boo
 
             # 统计性能
             elapsed = time.time() - start_time
-            PERF_STATS['hungarian_calls'] += 1
-            PERF_STATS['hungarian_total_time'] += elapsed
+            with _stats_lock:
+                PERF_STATS['hungarian_calls'] += 1
+                PERF_STATS['hungarian_total_time'] += elapsed
 
             return matches, unmatched_a, unmatched_b
         except Exception as e:
@@ -307,8 +310,9 @@ def linear_assignment(dist_matrix: np.ndarray, thresh: float, use_hungarian: boo
 
     # 统计性能
     elapsed = time.time() - start_time
-    PERF_STATS['greedy_calls'] += 1
-    PERF_STATS['greedy_total_time'] += elapsed
+    with _stats_lock:
+        PERF_STATS['greedy_calls'] += 1
+        PERF_STATS['greedy_total_time'] += elapsed
 
     return matches, unmatched_a, unmatched_b
 
@@ -1020,8 +1024,9 @@ def print_assignment_stats():
 def reset_assignment_stats():
     """重置性能统计"""
     global ALGORITHM_LOGGED
-    ALGORITHM_LOGGED = False
-    PERF_STATS['hungarian_calls'] = 0
-    PERF_STATS['hungarian_total_time'] = 0.0
-    PERF_STATS['greedy_calls'] = 0
-    PERF_STATS['greedy_total_time'] = 0.0
+    with _stats_lock:
+        ALGORITHM_LOGGED = False
+        PERF_STATS['hungarian_calls'] = 0
+        PERF_STATS['hungarian_total_time'] = 0.0
+        PERF_STATS['greedy_calls'] = 0
+        PERF_STATS['greedy_total_time'] = 0.0
