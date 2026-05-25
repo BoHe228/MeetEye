@@ -1,31 +1,20 @@
 """
-鱼眼全景YOLO姿态检测主程序 — GPU 优化版
-整合了 webui/processor.py 的 GPU 推理流水线：
-  ① CPU→GPU 帧上传
-  ② GPU 鱼眼展开（FisheyePanoramaGPU / grid_sample）
-  ③ GPU→CPU 优先转 uint8 再拷贝（减少带宽约4倍）
-  ④ 裁剪切片 + 构建 GPU 切片张量（供 OSNet 直接在 GPU crop）
-  ⑤ torch.no_grad() YOLO 批量推理
-  ⑥ merge_detections 传入 slice_tensors_gpu（跳过 CPU numpy→PIL→transform）
-  ⑦ OSNet / YOLO .pt 模型初始化时移至 GPU
-  ⑧ 每 200 帧调用 torch.cuda.empty_cache() 清理显存碎片
-  ⑨ 每 30 帧打印各步耗时日志，方便定位性能瓶颈
+鱼眼全景YOLO姿态检测主程序 - 重构版
+整合了原 main.py 的功能，使用新的目录结构
 """
 import cv2
 import numpy as np
-import threading
 import time
 import os
 from typing import List, Tuple, Optional, Dict
-
-import torch
 
 # 导入配置
 import config
 
 # 导入核心模块
 from core import (
-    FisheyePanoramaGPU,
+    CameraProcessor,
+    FisheyePanorama,
     YOLOPoseDetector,
     PanoramaSlicer,
     AngleCalculator,
@@ -44,17 +33,17 @@ from utils import (
 # 导入特征提取器
 from utils.feature_extractor import FeatureExtractor
 
-# ── 全局 CUDA 标志（导入时确定一次）─────────────────────────────────────
-_CUDA = torch.cuda.is_available()
-
 
 class FisheyePanoramaYOLOPose:
-    """鱼眼全景YOLO姿态检测主类（GPU 优化版）"""
+    """鱼眼全景YOLO姿态检测主类"""
 
     def __init__(self, args):
+        """
+        初始化
+        """
         self.args = args
         self.camera = None
-        self.panorama_processor: Optional[FisheyePanoramaGPU] = None
+        self.panorama_processor = None
         self.yolo_detector = None
         self.display_manager = None
         self.last_detection_result = None
@@ -67,13 +56,6 @@ class FisheyePanoramaYOLOPose:
         self.image_files = []
         self.current_image_index = 0
         self.no_display = args.no_display
-
-        # 全景处理器懒初始化（第一帧时触发）
-        self._panorama_ready = False
-        self._panorama_init_lock = threading.Lock()
-
-        # 耗时日志计数器
-        self._timing_counter = 0
 
         if not hasattr(self, 'slicer'):
             self.slicer = PanoramaSlicer(
@@ -112,7 +94,6 @@ class FisheyePanoramaYOLOPose:
         if not os.path.exists(self.model_path):
             self.model_path = None
 
-    # ──────────────────────────────────────────────────────────────────
     def initialize(self) -> bool:
         """初始化所有组件"""
         print("初始化鱼眼展开和YOLO姿态检测系统...")
@@ -130,25 +111,57 @@ class FisheyePanoramaYOLOPose:
                 print(f"错误: 文件夹 {self.args.folder_path} 中没有找到图片文件")
                 return False
             print(f"输入源: 图片文件夹 ({len(self.image_files)} 张图片)")
+            first_img = cv2.imread(self.image_files[0])
+            if first_img is None:
+                print(f"错误: 无法读取图片 {self.image_files[0]}")
+                return False
+            actual_width, actual_height = first_img.shape[1], first_img.shape[0]
         else:
-            from core import CameraProcessor
             self.camera = CameraProcessor(
                 cam_index=self.args.cam_index,
                 video_path=self.args.video_path,
                 width=self.args.cam_width,
                 height=self.args.cam_height
             )
+
             if not self.camera.initialize():
                 return False
+
+            camera_info = self.camera.get_camera_info()
             source_type = "视频文件" if self.args.video_path else "摄像头"
             print(f"输入源: {source_type}")
+            actual_width, actual_height = camera_info['width'], camera_info['height']
 
-        # 全景处理器在第一帧时懒初始化，此处不提前创建
-        print("全景处理器将在第一帧时完成 GPU 初始化...")
+        print(f"使用实际分辨率: {actual_width}x{actual_height} 初始化全景处理器")
 
-        # ── YOLO 模型加载 ────────────────────────────────────────────
+        self.panorama_processor = FisheyePanorama(
+            cam_width=actual_width,
+            cam_height=actual_height,
+            output_width=self.args.output_width,
+            output_height=self.args.output_height,
+            vertical_fov=self.args.vertical_fov,
+            map_file=self.args.map_file,
+            cam_index=self.args.cam_index
+        )
+
+        if self.panorama_processor:
+            output_width = self.panorama_processor.output_width
+            output_height = self.panorama_processor.output_height
+            self.angle_calculator = AngleCalculator(
+                output_width,
+                output_height,
+                self.args.vertical_fov,
+                fit_degree=getattr(self.args, 'fit_degree', 5),
+                yaml_file=getattr(self.args, 'calib_yaml', None)
+            )
+
+            if self.deep_sort_tracker.enable_boundary_matching:
+                self.deep_sort_tracker.set_boundary_frame_size(output_width, output_height)
+                print(f"边界匹配器初始化：画面={output_width}x{output_height}")
+
         if not os.path.exists(self.args.model_path):
             print(f"错误: YOLO模型文件 {self.args.model_path} 不存在")
+            print("请确保模型文件在当前目录，或指定正确的路径")
             return False
 
         self.yolo_detector = YOLOPoseDetector(
@@ -157,35 +170,15 @@ class FisheyePanoramaYOLOPose:
             iou_threshold=self.args.iou_threshold
         )
 
-        if _CUDA:
-            print(f"GPU 已就绪: {torch.cuda.get_device_name(0)}")
-            # TensorRT .engine 在导出时已绑定 GPU，无需也不能调用 .to()
-            if not self.args.model_path.endswith('.engine'):
-                self.yolo_detector.model.to('cuda')
-                print("YOLO 已移至 GPU（FP16 由推理时 half=True 控制）")
-            else:
-                print("YOLO TensorRT 引擎已就绪（GPU 绑定在导出时完成）")
-        else:
-            print("未检测到 CUDA GPU，使用 CPU 推理")
+        self.display_manager = DisplayManager(use_dual_windows=self.args.use_dual_windows,no_display= self.no_display)
 
-        self.display_manager = DisplayManager(
-            use_dual_windows=self.args.use_dual_windows,
-            no_display=self.no_display
-        )
-
-        # ── OSNet 特征提取器 ─────────────────────────────────────────
         print("初始化OSNet特征提取器...")
         try:
             self.feature_extractor = FeatureExtractor(
                 model_name='osnet_x0_25',
                 model_path=self.model_path
             )
-            if _CUDA:
-                self.feature_extractor.extractor.model.to('cuda')
-                self.feature_extractor.device = 'cuda'
-                print("OSNet 已移至 GPU（FP32，BatchNorm 不支持 FP16）")
-            else:
-                print("OSNet 特征提取器初始化成功（CPU 模式）")
+            print("OSNet特征提取器初始化成功！")
         except Exception as e:
             print(f"警告: OSNet特征提取器初始化失败: {e}")
             print("将不使用ReID特征进行跟踪")
@@ -194,149 +187,58 @@ class FisheyePanoramaYOLOPose:
         print("初始化完成！")
         return True
 
-    # ──────────────────────────────────────────────────────────────────
-    def _init_panorama_from_frame(self, frame: np.ndarray) -> bool:
-        """使用第一帧懒初始化 GPU 全景处理器（线程安全）"""
-        with self._panorama_init_lock:
-            if self._panorama_ready:
-                return True
-
-            h, w = frame.shape[:2]
-            print(f"初始化 GPU 全景处理器，输入分辨率: {w}×{h}")
-
-            self.panorama_processor = FisheyePanoramaGPU(
-                cam_width=w, cam_height=h,
-                output_width=self.args.output_width,
-                output_height=self.args.output_height,
-                vertical_fov=self.args.vertical_fov,
-                map_file=self.args.map_file,
-                cam_index=self.args.cam_index,
-            )
-            if not self.panorama_processor.init_from_frame(frame):
-                print("GPU 映射矩阵初始化失败")
-                return False
-
-            out_w = self.panorama_processor.output_width
-            out_h = self.panorama_processor.output_height
-            print(f"GPU 全景处理器就绪，全景输出: {out_w}×{out_h}")
-
-            self.angle_calculator = AngleCalculator(
-                out_w, out_h, self.args.vertical_fov,
-                fit_degree=getattr(self.args, 'fit_degree', 5),
-                yaml_file=getattr(self.args, 'calib_yaml', None)
-            )
-
-            if self.deep_sort_tracker.enable_boundary_matching:
-                self.deep_sort_tracker.set_boundary_frame_size(out_w, out_h)
-                print(f"边界匹配器初始化：画面={out_w}×{out_h}")
-
-            self._panorama_ready = True
-            return True
-
-    # ──────────────────────────────────────────────────────────────────
-    def process_panorama_slices(
-        self, frame: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[List], Optional[Dict]]:
+    def process_panorama_slices(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[List], Optional[Dict]]:
         """
-        完整 GPU 推理流水线（每步均附有设备标注）：
-          ① CPU→GPU 帧上传
-          ② GPU 鱼眼展开（grid_sample）
-          ③ GPU→CPU（先在 GPU 转 uint8，带宽约为 float32 的 1/4）
-          ④ 裁剪 + 切片 + 构建 GPU 切片张量（OSNet 直接在 GPU crop）
-          ⑤ torch.no_grad() YOLO 批量推理
-          ⑥ merge_detections（slice_tensors_gpu 路径跳过 numpy→PIL→transform）
-          ⑦ 跟踪 + 绘制
-          ⑧ 角度计算
+        多切片处理
+        返回: panorama, yolo_only_image, final_image, tracked_detections, angle_info
         """
-        if not self._panorama_ready:
-            if not self._init_panorama_from_frame(frame):
-                return frame, frame, frame, None, None
-
-        t: dict = {}  # 各步时间戳
-        sync = (lambda: torch.cuda.synchronize()) if _CUDA else (lambda: None)
-
-        # ① CPU → GPU  [CPU→GPU]
-        t[0] = time.perf_counter()
-        if _CUDA:
-            frame_tensor = torch.from_numpy(frame).cuda().float() / 255.0
-            frame_tensor = frame_tensor.permute(2, 0, 1)   # HWC → CHW
-        t[1] = time.perf_counter()
-
-        # ② GPU 鱼眼展开  [GPU]
-        if _CUDA:
-            panorama_tensor = self.panorama_processor.apply_panorama_gpu(frame_tensor)
-            sync()
-        t[2] = time.perf_counter()
-
-        # ③ GPU → CPU  [GPU→CPU] — 先在 GPU 转 uint8（4× 节省带宽），再传输
-        if _CUDA:
-            panorama = (
-                (panorama_tensor * 255.0)
-                .clamp_(0, 255)
-                .to(torch.uint8)
-                .permute(1, 2, 0)
-                .contiguous()
-                .cpu()
-                .numpy()
-            )
-        else:
-            panorama = self.panorama_processor.apply_panorama(frame)
-        t[3] = time.perf_counter()
-
-        # ④ 裁剪 + 切片  [CPU] + 构建 GPU 切片张量
+        panorama = self.panorama_processor.apply_panorama(frame)
         original_panorama_height = panorama.shape[0]
-        self._sync_angle_calculator(frame)
+
+        if self.angle_calculator and self.panorama_processor.center is not None:
+            fp = self.panorama_processor
+            if (self.angle_calculator.fisheye_center != fp.center or
+                self.angle_calculator.fisheye_radius != fp.radius):
+                self.angle_calculator.set_fisheye_mapping(
+                    fp.center,
+                    fp.radius,
+                    getattr(fp, 'img_width', frame.shape[1]),
+                    getattr(fp, 'img_height', frame.shape[0])
+                )
+                if fp.map_x is not None and fp.map_y is not None:
+                    self.angle_calculator.set_panorama_maps(fp.map_x, fp.map_y)
 
         crop_height = 0
         if self.args.crop_divisor > 0:
             crop_height = original_panorama_height // self.args.crop_divisor
             panorama = panorama[crop_height:, :]
+
         if self.angle_calculator:
             self.angle_calculator.set_crop_offset(crop_height)
 
         slices, slice_infos = self.slicer.slice_panorama(panorama, num_slices=self.num_slices)
 
-        # 构建 RGB GPU 切片张量，供 OSNet 直接在 GPU 上 crop，跳过 numpy→PIL→transform（省 ~5ms）
-        slice_tensors_gpu = None
-        if self.feature_extractor and _CUDA:
-            # BGR→RGB 通道翻转 + crop_h 裁剪（均为内存视图/轻量运算，<0.1ms）
-            pano_rgb = panorama_tensor[[2, 1, 0], crop_height:, :]  # [3, H-crop_h, W] RGB float 0-1
-            pw = pano_rgb.shape[2]
-            slice_tensors_gpu = []
-            for info in slice_infos:
-                sx, ex = info['start_x'], info['end_x']
-                if info.get('wrap_around', False):
-                    if sx < 0:   # 左侧越界
-                        st = torch.cat([pano_rgb[:, :, sx:], pano_rgb[:, :, :ex]], dim=2)
-                    else:        # 右侧越界
-                        st = torch.cat([pano_rgb[:, :, sx:pw], pano_rgb[:, :, :ex - pw]], dim=2)
-                else:
-                    st = pano_rgb[:, :, sx:ex]
-                slice_tensors_gpu.append(st)
-        t[4] = time.perf_counter()
+        all_yolo_results = self.yolo_detector.detect_batch(slices)
 
-        # ⑤ 批量 YOLO 推理  [GPU]
-        with torch.no_grad():
-            all_yolo_results = self.yolo_detector.detect_batch(slices)
-        sync()
-        t[5] = time.perf_counter()
-
-        # ⑥ 合并 + 过滤  [CPU + GPU]
-        # slice_tensors_gpu 存在时走 GPU crop 路径，跳过 CPU numpy→PIL→transform（省 ~5ms）
         merged_detections = self.slicer.merge_detections(
             all_yolo_results,
             slice_infos,
             slice_images=slices,
-            slice_tensors=slice_tensors_gpu,
             feature_extractor=self.feature_extractor
         )
+
         filtered_detections = filter_cross_boundary_detections(merged_detections, panorama.shape)
         filtered_detections = self.slicer.filter_wide_detections(filtered_detections, panorama.shape[1])
-        t[6] = time.perf_counter()
 
-        # ⑦ 跟踪 + 绘制  [CPU]
+        detections_with_features = []
+        for det in filtered_detections:
+            det_with_feat = det.copy()
+            if 'feature' not in det_with_feat:
+                det_with_feat['feature'] = None
+            detections_with_features.append(det_with_feat)
+
         if self.use_deep_sort:
-            tracked_detections = self.deep_sort_tracker.update(filtered_detections)
+            tracked_detections = self.deep_sort_tracker.update(detections_with_features)
         else:
             tracked_detections = filtered_detections
             for i, det in enumerate(tracked_detections):
@@ -344,71 +246,26 @@ class FisheyePanoramaYOLOPose:
 
         yolo_only_image = draw_yolo_only(panorama, filtered_detections)
         annotated_panorama = draw_detections(panorama, tracked_detections, self.deep_sort_tracker)
-        t[7] = time.perf_counter()
 
-        # ⑧ 角度计算  [CPU]
         angle_info = None
         if tracked_detections and self.angle_calculator:
-            kpts_list = [np.array(d['keypoints']) for d in tracked_detections if d.get('keypoints')]
-            if kpts_list:
-                angle_info = self.angle_calculator.calculate_angles_from_keypoints(
-                    np.array(kpts_list)
-                )
-                draw_fn = (self.angle_calculator.draw_angle_overview if self.show_angle_overview
-                           else self.angle_calculator.draw_angles_on_image)
-                annotated_panorama = draw_fn(annotated_panorama, angle_info)
-        t[8] = time.perf_counter()
+            keypoints_list = []
+            for detection in tracked_detections:
+                if 'keypoints' in detection and detection['keypoints']:
+                    kpts = np.array(detection['keypoints'])
+                    keypoints_list.append(kpts)
 
-        # ── 每 30 帧打印一次各步耗时 ─────────────────────────────────
-        self._timing_counter += 1
-        if self._timing_counter % 30 == 1:
-            self._print_timing(t, len(filtered_detections))
+            if keypoints_list:
+                keypoints_array = np.array(keypoints_list)
+                angle_info = self.angle_calculator.calculate_angles_from_keypoints(keypoints_array)
 
-        # ── 每 200 帧清理一次显存碎片 ────────────────────────────────
-        if self._timing_counter % 200 == 0 and _CUDA:
-            torch.cuda.empty_cache()
+                if self.show_angle_overview:
+                    annotated_panorama = self.angle_calculator.draw_angle_overview(annotated_panorama, angle_info)
+                else:
+                    annotated_panorama = self.angle_calculator.draw_angles_on_image(annotated_panorama, angle_info)
 
         return panorama, yolo_only_image, annotated_panorama, tracked_detections, angle_info
 
-    # ──────────────────────────────────────────────────────────────────
-    def _sync_angle_calculator(self, frame: np.ndarray) -> None:
-        """同步 angle_calculator 的鱼眼映射参数（仅首次或参数变化时更新）"""
-        if not (self.angle_calculator
-                and hasattr(self.panorama_processor, 'center')
-                and self.panorama_processor.center is not None):
-            return
-        fp = self.panorama_processor
-        if (self.angle_calculator.fisheye_center != fp.center
-                or self.angle_calculator.fisheye_radius != fp.radius):
-            self.angle_calculator.set_fisheye_mapping(
-                fp.center, fp.radius,
-                getattr(fp, 'img_width', frame.shape[1]),
-                getattr(fp, 'img_height', frame.shape[0]),
-            )
-            if fp.map_x is not None and fp.map_y is not None:
-                self.angle_calculator.set_panorama_maps(fp.map_x, fp.map_y)
-
-    @staticmethod
-    def _print_timing(t: dict, n_det: int) -> None:
-        """打印各步耗时及设备标注（每 30 帧一次）"""
-        def ms(a, b):
-            return (t[b] - t[a]) * 1000
-        steps = [
-            ("①CPU→GPU",  "CPU→GPU", 0, 1),
-            ("②鱼眼展开", "GPU",     1, 2),
-            ("③GPU→CPU",  "GPU→CPU", 2, 3),
-            ("④裁剪切片", "CPU",     3, 4),
-            ("⑤YOLO推理", "GPU",     4, 5),
-            ("⑥合并过滤", "CPU+GPU", 5, 6),
-            ("⑦跟踪绘制", "CPU",     6, 7),
-            ("⑧角度计算", "CPU",     7, 8),
-        ]
-        total = (t[8] - t[0]) * 1000
-        parts = "  ".join(f"{name}[{dev}]={ms(a,b):.1f}ms"
-                          for name, dev, a, b in steps)
-        print(f"[总耗时 {total:.1f}ms | 检测 {n_det} 人]  {parts}")
-
-    # ──────────────────────────────────────────────────────────────────
     def _get_image_files(self, folder_path: str) -> List[str]:
         """获取文件夹中的所有图片文件"""
         image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif')
@@ -452,7 +309,6 @@ class FisheyePanoramaYOLOPose:
 
         print(f"  检测到 {len(detection_results) if detection_results else 0} 个人")
 
-    # ──────────────────────────────────────────────────────────────────
     def run(self):
         """运行主循环"""
         if self.args.folder_path:
@@ -507,7 +363,6 @@ class FisheyePanoramaYOLOPose:
 
             ret, test_frame = self.camera.get_frame()
             if ret:
-                # 第一帧：触发 GPU 全景处理器懒初始化
                 panorama, yolo_only_frame, annotated_frame, _, _ = self.process_panorama_slices(test_frame)
                 useful_area = self.panorama_processor.get_useful_area(test_frame)
 
@@ -569,9 +424,10 @@ class FisheyePanoramaYOLOPose:
             if not ret:
                 if is_video:
                     print("视频播放完毕")
+                     # 关键修改：如果是无界面模式，直接退出，不等待键盘
                     if hasattr(self, 'no_display') and self.no_display:
                         print("无界面模式：视频处理完成，程序退出。")
-                        return
+                        return  # 直接结束程序
                     print("按 'r' 键重新播放，按 'q' 键退出")
                     while True:
                         key = cv2.waitKey(0) & 0xFF
@@ -668,7 +524,6 @@ class FisheyePanoramaYOLOPose:
             if yolo_video_writer:
                 yolo_video_writer.release()
 
-    # ──────────────────────────────────────────────────────────────────
     def handle_keyboard(self, key: int, original_frame: np.ndarray,
                        panorama: np.ndarray, annotated_frame: np.ndarray,
                        output_dir: str) -> bool:
@@ -703,22 +558,24 @@ class FisheyePanoramaYOLOPose:
                 self.show_angles = False
                 self.show_angle_overview = False
                 print("角度显示已关闭")
+
         return False
 
-    # ──────────────────────────────────────────────────────────────────
     def cleanup(self):
         """清理资源"""
         print("\n清理资源...")
+
         if self.camera:
             self.camera.release()
         if self.display_manager:
             self.display_manager.destroy_windows()
+
         if self.use_deep_sort:
             print_assignment_stats()
 
 
-# ── 主函数 ─────────────────────────────────────────────────────────────
 def main():
+    """主函数"""
     args = config.parse_args()
     processor = FisheyePanoramaYOLOPose(args)
 

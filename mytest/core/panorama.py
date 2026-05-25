@@ -433,3 +433,11 @@ class FisheyePanoramaGPU:
         
         # 移除批次维度 [C, H_out, W_out]
         return panorama.squeeze(0)
+
+    def get_useful_area(self, img: np.ndarray) -> np.ndarray:
+        """提取圆形有效区域（与 CPU 版本接口一致，供显示布局使用）"""
+        if self.center is None or self.radius is None:
+            return img
+        mask = np.zeros_like(img)
+        cv2.circle(mask, self.center, self.radius, (255, 255, 255), -1)
+        return cv2.bitwise_and(img, mask)
