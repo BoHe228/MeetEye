@@ -72,6 +72,7 @@ class FisheyePanoramaYOLOPose:
             match_thresh=0.6,
             proximity_thresh=0.4,
             appearance_thresh=args.appearance_thresh,
+            reid_lost_thresh=args.reid_lost_thresh,
             frame_rate=30,
             feat_history=500,
             with_reid=True,

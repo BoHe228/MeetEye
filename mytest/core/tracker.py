@@ -155,20 +155,33 @@ class KalmanFilter:
             new_covs.append(c)
         return np.array(new_means), np.array(new_covs)
 
-    def project(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def project(self, mean: np.ndarray, covariance: np.ndarray,
+                noise_factor: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        noise_factor > 1 时放大测量噪声 R，使卡尔曼增益 K 减小，
+        更新后的状态更靠近预测（而非检测），适用于遮挡/近邻期间。
+        """
         std = [
-            self._std_weight_position * mean[2],
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[2],
-            self._std_weight_position * mean[3]]
+            noise_factor * self._std_weight_position * mean[2],
+            noise_factor * self._std_weight_position * mean[3],
+            noise_factor * self._std_weight_position * mean[2],
+            noise_factor * self._std_weight_position * mean[3]]
         innovation_cov = np.diag(np.square(std))
 
         mean = np.dot(self._update_mat, mean)
         covariance = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
         return mean, covariance + innovation_cov
 
-    def update(self, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        projected_mean, projected_cov = self.project(mean, covariance)
+    def update(self, mean: np.ndarray, covariance: np.ndarray,
+               measurement: np.ndarray,
+               noise_factor: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        noise_factor: 测量噪声放大倍数
+          1.0  → 正常更新
+          3.0  → 近邻（框有接触），适度信任预测
+          10.0 → 重叠（框IoU>0.3），强信任预测，保护速度向量
+        """
+        projected_mean, projected_cov = self.project(mean, covariance, noise_factor)
 
         # 使用简单的卡尔曼增益计算（避免scipy依赖）
         K = np.dot(covariance, self._update_mat.T) @ np.linalg.inv(projected_cov)
@@ -375,15 +388,13 @@ class STrack(BaseTrack):
         if detection.feature is not None:
             self.update_features(detection.feature, detection.score)
 
-    def update_features(self, feat, confidence=1.0):
+    def update_features(self, feat, confidence=1.0, near_other: bool = False):
         """
         核心：动态调整的指数移动平均更新特征
         smooth_feat = alpha * smooth_feat + (1 - alpha) * new_feat
 
-        针对全景边界穿越场景优化：
-        - 长时间未更新时更注重新特征
-        - 低置信度检测时更信任历史
-        - 新目标快速学习
+        near_other=True 表示当前检测框与其他活跃轨迹框空间接近（潜在遮挡/混合裁图），
+        此时高度保护历史特征，防止对方身体污染 smooth_feat 导致分离后 ID 互换。
         """
         feat = np.array(feat, dtype=np.float32).flatten()  # 强制 1D，避免 (1,512) 形状污染
         feat /= np.linalg.norm(feat) + 1e-6
@@ -393,8 +404,11 @@ class STrack(BaseTrack):
         if self.smooth_feat is None:
             alpha = 0.0  # 第一次直接使用
         else:
-            # 针对全景边界穿越场景优化
-            if self.time_since_update > 30:  # 长时间未更新（边界穿越后重新出现）
+            if near_other:
+                # 检测框与其他轨迹空间接近 → YOLO 裁图可能包含对方身体
+                # 用极高 alpha 冻结特征，防止污染；curr_feat 仍更新供调试用
+                alpha = 0.98
+            elif self.time_since_update > 30:  # 长时间未更新（边界穿越后重新出现）
                 alpha = 0.8  # 注重新特征，快速适应当前状态
             elif confidence < 0.7:  # 低置信度检测（多切片可能有低质量检测）
                 alpha = 0.93  # 更信任历史特征
@@ -444,12 +458,20 @@ class STrack(BaseTrack):
         self.frame_id = frame_id
         self.start_frame = frame_id
 
-    def re_activate(self, new_track: 'STrack', frame_id: int, new_id: bool = False):
+    def re_activate(self, new_track: 'STrack', frame_id: int, new_id: bool = False,
+                    freeze_feat: bool = False, near_other: bool = False):
+        # 遮挡/近邻时放大测量噪声 R → 卡尔曼增益 K 减小 → 状态更靠近预测而非检测
+        # 这样即使检测框因遮挡而位置偏移，速度向量也能得到保护
+        noise_factor = 10.0 if freeze_feat else (3.0 if near_other else 1.0)
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh)
+            self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh),
+            noise_factor=noise_factor
         )
-        if new_track.curr_feat is not None:
-            self.update_features(new_track.curr_feat, new_track.score)
+        # freeze_feat=True  → 完全跳过（重度遮挡）
+        # near_other=True   → alpha=0.98 高度保护（轻度接近）
+        if not freeze_feat and new_track.curr_feat is not None:
+            self.update_features(new_track.curr_feat, new_track.score,
+                                 near_other=near_other)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -463,17 +485,25 @@ class STrack(BaseTrack):
             self.keypoints = new_track.keypoints
         self.original_xyxy = new_track.original_xyxy.copy()
 
-    def update(self, new_track: 'STrack', frame_id: int):
+    def update(self, new_track: 'STrack', frame_id: int,
+               freeze_feat: bool = False, near_other: bool = False):
         self.frame_id = frame_id
         self.tracklet_len += 1
 
+        # 遮挡/近邻时放大测量噪声 R → 卡尔曼增益 K 减小 → 状态更靠近预测而非检测
+        # 这样即使检测框因遮挡而位置偏移，速度向量也能得到保护
+        noise_factor = 10.0 if freeze_feat else (3.0 if near_other else 1.0)
         new_tlwh = new_track.tlwh
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xywh(new_tlwh)
+            self.mean, self.covariance, self.tlwh_to_xywh(new_tlwh),
+            noise_factor=noise_factor
         )
 
-        if new_track.curr_feat is not None:
-            self.update_features(new_track.curr_feat, new_track.score)
+        # freeze_feat=True  → 完全跳过（重度遮挡，IoU > 0.3）
+        # near_other=True   → alpha=0.98 高度保护（轻度接近，框有接触）
+        if not freeze_feat and new_track.curr_feat is not None:
+            self.update_features(new_track.curr_feat, new_track.score,
+                                 near_other=near_other)
 
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -597,7 +627,8 @@ class BoT_SORTTracker:
                  track_buffer: int = 30,
                  match_thresh: float = 0.7,
                  proximity_thresh: float = 0.5,  # IoU阈值
-                 appearance_thresh: float = 0.5,  # 外观特征阈值
+                 appearance_thresh: float = 0.5,  # 第一阶段外观特征阈值（有IoU门控兜底）
+                 reid_lost_thresh: float = 0.25,  # 第三阶段纯ReID阈值（无IoU门控，需更严格）
                  frame_rate: int = 30,
                  feat_history: int = 50,
                  with_reid: bool = True,
@@ -632,6 +663,7 @@ class BoT_SORTTracker:
         self.match_thresh = match_thresh
         self.proximity_thresh = proximity_thresh
         self.appearance_thresh = appearance_thresh
+        self.reid_lost_thresh = reid_lost_thresh  # 第三阶段专用：无IoU门控，需比appearance_thresh更严
         self.with_reid = with_reid
         self.feat_history = feat_history
         self.use_hungarian = use_hungarian and LAP_AVAILABLE  # 只有lap可用时才使用
@@ -773,24 +805,54 @@ class BoT_SORTTracker:
 
         # 如果有ReID特征，融合外观距离
         if self.with_reid:
-            emb_dists = embedding_distance(strack_pool, detections_high)  # 余弦距离 [0,1]，不缩放
+            emb_dists = embedding_distance(strack_pool, detections_high)  # 余弦距离 [0,1]
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0  # IoU 不足时不信任 ReID
             dists = np.minimum(ious_dists, emb_dists)
+            # ⚠️ 注意：不做 reid_veto（用 ReID 强制封锁 IoU 支持的匹配）
+            # 原因：特征在近邻/遮挡期间会被污染，污染的 smooth_feat 会导致
+            # emb_dist(Track_A, Det_A) > appearance_thresh，触发错误否决，
+            # 把正确匹配封掉，反而造成 ID 互换。
+            # 应对近邻污染的手段是特征冻结（near_other / freeze_feat），而不是事后否决。
         else:
             dists = ious_dists
 
         # 线性分配
         matches, u_track, u_detection = linear_assignment(dists, thresh=self.match_thresh, use_hungarian=self.use_hungarian)
 
-        for itracked, idet in matches:
+        # ── 近邻检测：找出任意两个匹配框之间空间接近的对 ──────────────────
+        # 判断标准：IoU > 0 (框有重叠) 或 中心距离 < 均值框尺寸的 1.5 倍
+        # 两个层级：
+        #   near_other   (轻度接近, IoU > 0 或 距离较近) → alpha=0.98 保护特征
+        #   freeze_feat  (重度重叠, IoU > 0.3)          → 完全跳过特征更新
+        _FREEZE_IOU_THRESH = 0.3   # 重度：完全跳过特征更新
+        _NEAR_IOU_THRESH   = 0.1   # 轻度：IoU > 0.1 即视为框有接触
+        matched_dets = [detections_high[idet] for _, idet in matches]
+        freeze_det_indices: set = set()
+        near_det_indices:   set = set()
+        n_md = len(matched_dets)
+        for _a in range(n_md):
+            for _b in range(_a + 1, n_md):
+                _iou = box_iou(matched_dets[_a].tlbr, matched_dets[_b].tlbr)
+                if _iou > _FREEZE_IOU_THRESH:
+                    freeze_det_indices.add(_a)
+                    freeze_det_indices.add(_b)
+                elif _iou > _NEAR_IOU_THRESH:
+                    near_det_indices.add(_a)
+                    near_det_indices.add(_b)
+
+        for _mi, (itracked, idet) in enumerate(matches):
             track = strack_pool[itracked]
             det = detections_high[idet]
+            freeze_feat = (_mi in freeze_det_indices)
+            near_other  = (_mi in near_det_indices)
             if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
+                track.update(det, self.frame_id,
+                             freeze_feat=freeze_feat, near_other=near_other)
                 activated_stracks.append(track)
             else:
-                track.re_activate(det, self.frame_id, new_id=False)
+                track.re_activate(det, self.frame_id, new_id=False,
+                                  freeze_feat=freeze_feat, near_other=near_other)
                 refind_stracks.append(track)
 
         # 6. 按状态拆分第一阶段未匹配轨迹
@@ -842,14 +904,25 @@ class BoT_SORTTracker:
                 track.mark_lost()
                 lost_stracks.append(track)
 
-        # 第三阶段：纯 ReID 恢复 Lost 轨迹（无 IoU 门控）
-        # Lost 轨迹与新检测 IoU≈0，第一阶段无法匹配；此阶段仅凭外观相似度尝试 re-activate
+        # 第三阶段：纯 ReID 恢复 Lost 轨迹
+        #
+        # 为什么只用 ReID、不用 IoU：
+        #   能到这里的 Lost 轨迹，都是 Stage 1 的 IoU+ReID 已经失败的。
+        #   Stage 1 失败意味着 ious_dist ≥ match_thresh（IoU 彻底无效）。
+        #   在 Stage 3 里再加 IoU，min(无效IoU, ReID) 结果和纯 ReID 完全一样，
+        #   反而引入用错误 IoU 匹配的风险。
+        #
+        # Stage 3 的唯一价值：
+        #   Stage 1 里 IoU 门控（ious_dists_mask）会在 IoU 差时把 ReID 也封掉，
+        #   Stage 3 去掉这个门控，让 ReID 单独工作——专门应对：
+        #     · 出画面再进来（IoU=0，但 ReID 仍能识别）
+        #     · 长时间遮挡后重现（卡尔曼漂移，IoU=0）
         if self.with_reid and u_lost_stracks and u_detection:
             reid_dets = [detections_high[i] for i in u_detection]
             emb_dists_lost = embedding_distance(u_lost_stracks, reid_dets)
-            emb_dists_lost[emb_dists_lost > self.appearance_thresh] = 1.0
+            emb_dists_lost[emb_dists_lost > self.reid_lost_thresh] = 1.0
             stage3_matches, _, _ = linear_assignment(
-                emb_dists_lost, thresh=self.appearance_thresh, use_hungarian=self.use_hungarian)
+                emb_dists_lost, thresh=self.reid_lost_thresh, use_hungarian=self.use_hungarian)
             matched_det_local = set()
             for i_lost, i_det in stage3_matches:
                 track = u_lost_stracks[i_lost]

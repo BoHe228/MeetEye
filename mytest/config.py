@@ -8,16 +8,16 @@ def parse_args():
     解析命令行参数
     """
     parser = argparse.ArgumentParser(description='鱼眼展开与YOLO姿态检测系统')
-    
+
     # 输入源参数
     parser.add_argument('--cam-index', type=int, default=1, help='摄像头索引')
     parser.add_argument('--video-path', type=str, default=None, help='视频文件路径（如果提供则使用视频，否则使用摄像头）')
     parser.add_argument('--folder-path', type=str, default=None, help='图片文件夹路径（如果提供则处理文件夹中的所有图片）')
-    
+
     # 摄像头参数（当使用摄像头时有效）
     parser.add_argument('--cam-width', type=int, default=1920, help='摄像头宽度')
     parser.add_argument('--cam-height', type=int, default=1080, help='摄像头高度')
-    
+
     # 鱼眼展开参数
     parser.add_argument('--output-width', type=int, default=3840, help='输出宽度')
     parser.add_argument('--output-height', type=int, default=1080, help='输出高度')
@@ -25,9 +25,9 @@ def parse_args():
     parser.add_argument('--map-file', type=str, default=r'maps/3840_fisheye_maps_2026.5.18.npz', help='映射文件路径')
 
     # 全景切片参数
-    parser.add_argument('--num-slices', type=int, default=3, choices=[2, 3, 4, 5, 6,7],
+    parser.add_argument('--num-slices', type=int, default=3, choices=[2, 3, 4, 5, 6, 7],
                         help='全景图切片数量 (默认: 3)')
-    parser.add_argument('--slice-overlap', type=float, default=0.1,
+    parser.add_argument('--slice-overlap', type=float, default=0.05,
                         help='切片重叠比例 (默认: 0.1)')
 
     # 角度计算参数
@@ -35,16 +35,16 @@ def parse_args():
                         help='俯仰角计算使用的多项式次数 (4 或 5, 默认: 5)')
     parser.add_argument('--calib-yaml', type=str, default=r'mytest/fisheye_calib.yaml',
                         help='鱼眼标定YAML文件路径 (如果不提供则使用内置系数)')
-    
+
     # YOLO参数
     parser.add_argument('--model-path', type=str, default='./yolo26n-pose.engine', help='YOLO模型路径（.pt 或 .engine）')
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
-    
+
     # 显示参数
     parser.add_argument('--display-scale', type=float, default=0.5, help='显示缩放比例')
     parser.add_argument('--output-dir', type=str, default='yolo_pose_output', help='输出目录')
-    
+
     # 性能参数
     parser.add_argument('--save-frames', action='store_true', help='保存处理后的帧')
     parser.add_argument('--save-crops', action='store_true', help='保存每个检测框的内容（抠图）')
@@ -75,13 +75,21 @@ def parse_args():
                         help='是否使用BoT-SORT跟踪器（结合运动和外观特征），--no-use-deep-sort 禁用')
     parser.add_argument('--deep-sort-match-thresh', type=float, default=0.3,
                         help='BoT-SORT匹配阈值')
-    parser.add_argument('--appearance-thresh', type=float, default=0.4,
-                        help='BoT-SORT外观特征匹配阈值（余弦距离，越小越严格，建议 0.35-0.45）')
+    parser.add_argument('--appearance-thresh', type=float, default=0.2,
+                        help='BoT-SORT外观特征匹配阈值（余弦距离，第一阶段+IoU门控，越小越严格）')
+    parser.add_argument('--reid-lost-thresh', type=float, default=0.05,
+                        help='纯ReID恢复Lost轨迹的阈值（第三阶段，无IoU门控，须比appearance-thresh更严格）')
     parser.add_argument('--use-hungarian', action=argparse.BooleanOptionalAction, default=True,
                         help='是否使用匈牙利算法进行线性分配，--no-use-hungarian 改用贪心算法')
 
+    # JSON 结果保存参数（仅 WebUI 模式生效）
+    parser.add_argument('--save-json', action='store_true', default=False,
+                        help='将每帧推理结果追加保存为 JSONL 文件（每行一个 JSON，含角度/距离/特征）')
+    parser.add_argument('--json-output', type=str, default=None,
+                        help='JSONL 输出文件路径（默认：output_dir/视频名或camera_时间戳.jsonl）')
+
     # 是否使用外部UI
-    parser.add_argument('--webui',action='store_true',help='Run with local web UI (browser)')
+    parser.add_argument('--webui', action='store_true', help='Run with local web UI (browser)')
 
     return parser.parse_args()
 

@@ -162,6 +162,10 @@ def _notify_inference_waiters() -> None:
         loop.call_soon_threadsafe(_do)
 
 
+# ── JSON 结果持久化（--save-json 开启后每帧追加一行到 JSONL 文件）──────
+_json_file = None          # io.TextIOWrapper，由 main() 打开，finally 关闭
+_json_write_counter = 0    # 用于定期 flush
+
 # ── 推理函数（在 inference_executor 单线程中执行）─────────────────────
 _infer_log_counter = 0   # 控制全流程耗时日志频率（每 30 帧一次）
 
@@ -210,6 +214,14 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
     infer_json  = _build_inference_json(tracked, angle_info)   # JSON 序列化
     webrtc_vf   = _make_webrtc_frame(annotated)                # BGR→YUV420P
 
+    # ── JSONL 持久化（--save-json，每 30 帧 flush 一次，不影响推理耗时）──
+    global _json_file, _json_write_counter
+    if _json_file is not None:
+        _json_file.write(infer_json.decode() + '\n')
+        _json_write_counter += 1
+        if _json_write_counter % 30 == 0:
+            _json_file.flush()
+
     with ws.frame_lock:
         ws.latest_original_frame    = frame
         ws.latest_annotated_frame   = annotated
@@ -236,6 +248,83 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
     # GPU 显存碎片清理（每 200 帧一次，原在 _encode_worker 中，现移至此）
     if _infer_log_counter % 200 == 0 and torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+# ── 视频文件输入循环（绕开 WebSocket，直接把视频帧喂进 inference_executor）──
+_video_running = False   # 供 Ctrl+C 时停止循环
+
+
+def _video_loop(args) -> None:
+    """
+    以视频文件替代摄像头推流：
+      - 按视频原始 FPS 送帧（推理比视频慢时以推理速度为准，不积压队列）
+      - 视频播放完毕后循环重播（保持 WebUI 服务持续可用）
+      - 同时更新 state.latest_original_jpeg，使 /video/original MJPEG 端点正常工作
+    """
+    global _video_running
+    import os
+
+    path = args.video_path
+    if not os.path.exists(path):
+        print(f"[视频] 文件不存在: {path}")
+        return
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        print(f"[视频] 无法打开: {path}")
+        return
+
+    src_fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frm = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_interval = 1.0 / src_fps
+    encode_params  = [cv2.IMWRITE_JPEG_QUALITY, 90]
+
+    print(f"[视频] 已打开: {path}")
+    print(f"[视频] 分辨率: {int(cap.get(3))}×{int(cap.get(4))}"
+          f"  FPS={src_fps:.1f}  总帧数={total_frm}")
+
+    _video_running = True
+
+    while _video_running:
+        t0 = time.perf_counter()
+        ret, frame = cap.read()
+
+        if not ret:
+            # 视频结束 → 退出循环，触发程序关闭
+            print("[视频] 播放完毕，正在退出…")
+            break
+
+        # BGR → JPEG（与 camera_client.py 推流格式一致）
+        ok, buf = cv2.imencode('.jpg', frame, encode_params)
+        if not ok:
+            continue
+
+        jpeg_bytes = buf.tobytes()
+
+        # 更新原始帧缓冲，使 /video/original MJPEG 端点可用
+        with ws.frame_lock:
+            ws.latest_original_jpeg = jpeg_bytes
+
+        # 提交推理并等待完成（阻塞式，避免帧积压；推理慢时自动降帧率）
+        if ws.inference_fn is not None:
+            future = ws.inference_executor.submit(ws.inference_fn, jpeg_bytes)
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[视频] 推理异常: {type(e).__name__}: {e}")
+
+        # 按原始 FPS 限速（推理耗时已计入，若推理慢则不额外等待）
+        elapsed  = time.perf_counter() - t0
+        sleep_ms = frame_interval - elapsed
+        if sleep_ms > 0:
+            time.sleep(sleep_ms)
+
+    cap.release()
+    print("[视频] 播放线程已退出")
+
+    # 视频播完后向主进程发送 SIGINT，触发 uvicorn 优雅关闭和 finally 清理
+    import os, signal
+    os.kill(os.getpid(), signal.SIGINT)
 
 
 # ── 工具函数 ───────────────────────────────────────────────────────────
@@ -272,17 +361,42 @@ def main() -> None:
 
     port = _find_free_port()
     local_ip = _get_local_ip()
+
+    # 3. 视频文件模式：后台线程推帧，无需 camera_client 连接
+    video_thread = None
+    if getattr(args, 'video_path', None):
+        video_thread = threading.Thread(
+            target=_video_loop, args=(args,), daemon=True, name='VideoLoop')
+        video_thread.start()
+
+    # 4. JSONL 输出文件（--save-json）
+    global _json_file
+    if getattr(args, 'save_json', False):
+        import datetime, os
+        json_path = getattr(args, 'json_output', None)
+        if not json_path:
+            os.makedirs(args.output_dir, exist_ok=True)
+            ts  = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            src = os.path.splitext(os.path.basename(args.video_path))[0] \
+                  if getattr(args, 'video_path', None) else 'camera'
+            json_path = os.path.join(args.output_dir, f'{src}_{ts}.jsonl')
+        _json_file = open(json_path, 'w', encoding='utf-8', buffering=1)
+        print(f"[JSON] 推理结果将保存到: {json_path}")
+
     print()
     print("=" * 60)
     print("  WebUI 已启动")
     print(f"  本机访问:   http://localhost:{port}")
     print(f"  局域网访问: http://{local_ip}:{port}")
-    print(f"  推流命令:   python camera_client.py ws://{local_ip}:{port}/ws/camera")
+    if getattr(args, 'video_path', None):
+        print(f"  输入模式:   视频文件 → {args.video_path}")
+    else:
+        print(f"  推流命令:   python camera_client.py ws://{local_ip}:{port}/ws/camera")
     print("  Ctrl+C 停止")
     print("=" * 60)
     print()
 
-    # 3. 启动 FastAPI 服务（禁用 WebSocket ping 防止并发写冲突）
+    # 5. 启动 FastAPI 服务（禁用 WebSocket ping 防止并发写冲突）
     try:
         uvicorn.run(
             app,
@@ -295,6 +409,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n程序被用户中断")
     finally:
+        global _video_running
+        _video_running = False          # 通知视频线程退出
+        if _json_file is not None:
+            _json_file.flush()
+            _json_file.close()
+            print(f"[JSON] 文件已保存: {_json_file.name}")
         ws.processor.cleanup()
         ws.inference_executor.shutdown(wait=False)
         print("程序结束")
