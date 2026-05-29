@@ -198,10 +198,10 @@ def draw_detections(image: np.ndarray, detections: List[Dict],
     返回:
         绘制后的图像
     """
-    if tracker is not None and hasattr(tracker, 'enable_boundary_matching') and tracker.enable_boundary_matching:
-        annotated = tracker.draw_boundary_regions(image)
-    else:
-        annotated = image.copy()
+    # if tracker is not None and hasattr(tracker, 'enable_boundary_matching') and tracker.enable_boundary_matching:
+    #     annotated = tracker.draw_boundary_regions(image)
+    # else:
+    annotated = image.copy()
 
     annotated = draw_bounding_boxes(annotated, detections)
     annotated = draw_keypoints(annotated, detections)

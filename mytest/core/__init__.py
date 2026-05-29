@@ -8,7 +8,7 @@ from .detector import YOLOPoseDetector
 from .slicer import PanoramaSlicer
 from .angle_calculator import AngleCalculator
 from .boundary_matcher import BoundaryIDMatcher, BoundaryCrossingTracker
-from .tracker import BoT_SORTTracker, print_assignment_stats
+from .tracker import BoT_SORTTracker, HybridSortTracker, print_assignment_stats
 
 __all__ = [
     'CameraProcessor',
@@ -20,5 +20,6 @@ __all__ = [
     'BoundaryIDMatcher',
     'BoundaryCrossingTracker',
     'BoT_SORTTracker',
+    'HybridSortTracker',
     'print_assignment_stats',
 ]

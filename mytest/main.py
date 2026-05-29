@@ -30,6 +30,7 @@ from core import (
     PanoramaSlicer,
     AngleCalculator,
     BoT_SORTTracker,
+    HybridSortTracker,
     print_assignment_stats,
 )
 
@@ -63,7 +64,7 @@ class FisheyePanoramaYOLOPose:
         self.show_angle_overview = False
         self.num_slices = getattr(args, 'num_slices', 3)
         self.slice_overlap = getattr(args, 'slice_overlap', 0.05)
-        self.use_deep_sort = args.use_deep_sort
+        self.use_tracker = (args.tracker != 'none')
         self.image_files = []
         self.current_image_index = 0
         self.no_display = args.no_display
@@ -82,36 +83,72 @@ class FisheyePanoramaYOLOPose:
                 reid_similarity_threshold=0.7
             )
 
-        self.deep_sort_tracker = BoT_SORTTracker(
-            track_high_thresh=0.5,
-            track_low_thresh=0.1,
-            new_track_thresh=0.5,
-            track_buffer=500,
-            match_thresh=0.3,
-            proximity_thresh=0.4,
-            appearance_thresh=args.appearance_thresh,
-            reid_lost_thresh=args.reid_lost_thresh,
-            frame_rate=30,
-            feat_history=500,
-            with_reid=True,
-            use_hungarian=args.use_hungarian,
+        # 边界匹配公共参数（两种 tracker 共用）
+        _boundary_kwargs = dict(
             enable_boundary_matching=True,
             frame_width=3840,
             frame_height=1080,
-            boundary_margin=0.1,
+            boundary_margin=0.04,
             boundary_time_window=90,
             boundary_similarity_thresh=0.3,
             boundary_debug=False,
             enable_top_boundary=False,
             enable_bottom_boundary=False,
             enable_left_boundary=True,
-            enable_right_boundary=True
+            enable_right_boundary=True,
         )
 
+        if args.tracker == 'botsort':
+            self.tracker = BoT_SORTTracker(
+                track_high_thresh=0.5,
+                track_low_thresh=0.1,
+                new_track_thresh=0.5,
+                track_buffer=500,
+                frame_rate=30,
+                match_thresh=args.botsort_match_thresh,
+                appearance_thresh=args.appearance_thresh,
+                reid_lost_thresh=args.reid_lost_thresh,
+                with_reid=True,
+                use_hungarian=args.use_hungarian,
+                **_boundary_kwargs,
+            )
+        elif args.tracker == 'hybridsort':
+            self.tracker = HybridSortTracker(
+                # ── 置信度阈值 ──────────────────────────────────────────────
+                track_high_thresh=0.5,
+                track_low_thresh=0.1,
+                new_track_thresh=0.5,
+                # ── 轨迹生命周期 ────────────────────────────────────────────
+                track_buffer=150,
+                frame_rate=30,
+                # ── 关联阈值 ────────────────────────────────────────────────
+                match_thresh=0.2,
+                # ── Hybrid-SORT 专有参数 ─────────────────────────────────────
+                inertia=0.4,
+                delta_t=3,
+                use_byte=True,
+                tcm_first_step=True,
+                tcm_first_step_weight=1,
+                tcm_byte_step=True,
+                tcm_byte_step_weight=1,
+                asso_func="iou",
+                min_hits=1,
+                # ── ReID ────────────────────────────────────────────────────
+                with_reid=args.use_reid,
+                reid_emb_weight_high=args.reid_emb_weight_high,
+                reid_emb_weight_low=args.reid_emb_weight_low,
+                # ── 全景图尺寸 ───────────────────────────────────────────────
+                panorama_width=3840,
+                panorama_height=1080,
+                **_boundary_kwargs,
+            )
+        else:
+            self.tracker = None
+
         self.feature_extractor = None
-        self.model_path = "imagenet.pyth/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth"
-        if not os.path.exists(self.model_path):
-            self.model_path = None
+        _osnet_path = config.OSNET_WEIGHT_MAP.get(args.osnet_model, '')
+        self.osnet_model_name = args.osnet_model
+        self.osnet_model_path = _osnet_path if os.path.exists(_osnet_path) else None
 
     # ──────────────────────────────────────────────────────────────────
     def initialize(self) -> bool:
@@ -175,11 +212,11 @@ class FisheyePanoramaYOLOPose:
         )
 
         # ── OSNet 特征提取器 ─────────────────────────────────────────
-        print("初始化OSNet特征提取器...")
+        print(f"初始化OSNet特征提取器 ({self.osnet_model_name})...")
         try:
             self.feature_extractor = FeatureExtractor(
-                model_name='osnet_x0_25',
-                model_path=self.model_path
+                model_name=self.osnet_model_name,
+                model_path=self.osnet_model_path
             )
             if _CUDA:
                 self.feature_extractor.extractor.model.to('cuda')
@@ -227,8 +264,9 @@ class FisheyePanoramaYOLOPose:
                 yaml_file=getattr(self.args, 'calib_yaml', None)
             )
 
-            if self.deep_sort_tracker.enable_boundary_matching:
-                self.deep_sort_tracker.set_boundary_frame_size(out_w, out_h)
+            if (self.tracker is not None
+                    and self.tracker.enable_boundary_matching):
+                self.tracker.set_boundary_frame_size(out_w, out_h)
                 print(f"边界匹配器初始化：画面={out_w}×{out_h}")
 
             self._panorama_ready = True
@@ -336,15 +374,15 @@ class FisheyePanoramaYOLOPose:
         t[6] = time.perf_counter()
 
         # ⑦ 跟踪 + 绘制  [CPU]
-        if self.use_deep_sort:
-            tracked_detections = self.deep_sort_tracker.update(filtered_detections)
+        if self.use_tracker:
+            tracked_detections = self.tracker.update(filtered_detections)
         else:
             tracked_detections = filtered_detections
             for i, det in enumerate(tracked_detections):
                 det['track_id'] = i + 1
 
         yolo_only_image = draw_yolo_only(panorama, filtered_detections)
-        annotated_panorama = draw_detections(panorama, tracked_detections, self.deep_sort_tracker)
+        annotated_panorama = draw_detections(panorama, tracked_detections, self.tracker)
         t[7] = time.perf_counter()
 
         # ⑧ 角度计算  [CPU]
@@ -714,7 +752,7 @@ class FisheyePanoramaYOLOPose:
             self.camera.release()
         if self.display_manager:
             self.display_manager.destroy_windows()
-        if self.use_deep_sort:
+        if self.use_tracker:
             print_assignment_stats()
 
 

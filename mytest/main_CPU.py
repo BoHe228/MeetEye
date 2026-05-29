@@ -52,7 +52,7 @@ class FisheyePanoramaYOLOPose:
         self.show_angle_overview = False
         self.num_slices = getattr(args, 'num_slices', 3)
         self.slice_overlap = getattr(args, 'slice_overlap', 0.05)
-        self.use_deep_sort = args.use_deep_sort
+        self.use_tracker = (args.tracker != 'none')
         self.image_files = []
         self.current_image_index = 0
         self.no_display = args.no_display
@@ -64,7 +64,7 @@ class FisheyePanoramaYOLOPose:
                 reid_similarity_threshold=0.7
             )
 
-        self.deep_sort_tracker = BoT_SORTTracker(
+        self.tracker = BoT_SORTTracker(
             track_high_thresh=0.5,
             track_low_thresh=0.1,
             new_track_thresh=0.5,
@@ -156,8 +156,8 @@ class FisheyePanoramaYOLOPose:
                 yaml_file=getattr(self.args, 'calib_yaml', None)
             )
 
-            if self.deep_sort_tracker.enable_boundary_matching:
-                self.deep_sort_tracker.set_boundary_frame_size(output_width, output_height)
+            if self.tracker.enable_boundary_matching:
+                self.tracker.set_boundary_frame_size(output_width, output_height)
                 print(f"边界匹配器初始化：画面={output_width}x{output_height}")
 
         if not os.path.exists(self.args.model_path):
@@ -238,15 +238,15 @@ class FisheyePanoramaYOLOPose:
                 det_with_feat['feature'] = None
             detections_with_features.append(det_with_feat)
 
-        if self.use_deep_sort:
-            tracked_detections = self.deep_sort_tracker.update(detections_with_features)
+        if self.use_tracker:
+            tracked_detections = self.tracker.update(detections_with_features)
         else:
             tracked_detections = filtered_detections
             for i, det in enumerate(tracked_detections):
                 det['track_id'] = i + 1
 
         yolo_only_image = draw_yolo_only(panorama, filtered_detections)
-        annotated_panorama = draw_detections(panorama, tracked_detections, self.deep_sort_tracker)
+        annotated_panorama = draw_detections(panorama, tracked_detections, self.tracker)
 
         angle_info = None
         if tracked_detections and self.angle_calculator:
@@ -571,7 +571,7 @@ class FisheyePanoramaYOLOPose:
         if self.display_manager:
             self.display_manager.destroy_windows()
 
-        if self.use_deep_sort:
+        if self.use_tracker:
             print_assignment_stats()
 
 

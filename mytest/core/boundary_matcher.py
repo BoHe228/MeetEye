@@ -276,7 +276,8 @@ class BoundaryIDMatcher:
     def find_matching_id(self,
                          bbox: List[float],
                          feature: np.ndarray,
-                         frame_id: int) -> Optional[int]:
+                         frame_id: int,
+                         exclude_ids: set = None) -> Optional[int]:
         """
         为新出现的目标寻找匹配的消失目标ID
 
@@ -376,6 +377,10 @@ class BoundaryIDMatcher:
 
                 if self.debug:
                     print(f"    [比较] ID={target.track_id}, 相似度={similarity:.3f}, 速度检查={velocity_ok}")
+
+                # 跳过本帧已被其他新轨迹认领的旧 ID
+                if exclude_ids and target.track_id in exclude_ids:
+                    continue
 
                 # 记录最佳匹配
                 if velocity_ok and similarity > max(self.similarity_threshold, best_similarity):
@@ -570,6 +575,9 @@ class BoundaryCrossingTracker:
         # 下一帧要强制复用的ID
         self.pending_remaps: Dict[int, int] = {}  # temp_id -> original_id
 
+        # 本帧内已被认领的旧 ID 集合，防止同一旧 ID 被多条新轨迹重复认领
+        self._claimed_this_frame: set = set()
+
     def set_frame_size(self, width: int, height: int):
         """设置画面尺寸"""
         self.matcher.set_frame_size(width, height)
@@ -582,6 +590,7 @@ class BoundaryCrossingTracker:
             frame_id: 当前帧号
         """
         self.matcher.cleanup_old_targets(frame_id)
+        self._claimed_this_frame.clear()
 
     def process_lost_track(self,
                            track_id: int,
@@ -634,10 +643,13 @@ class BoundaryCrossingTracker:
         Returns:
             匹配到的原始ID，如果没有匹配返回None
         """
-        matched_id = self.matcher.find_matching_id(bbox, feature, frame_id)
+        matched_id = self.matcher.find_matching_id(
+            bbox, feature, frame_id,
+            exclude_ids=self._claimed_this_frame,
+        )
 
         if matched_id is not None:
-            # 记录ID映射
+            self._claimed_this_frame.add(matched_id)
             self.pending_remaps[temp_id] = matched_id
             self.id_remap[temp_id] = matched_id
 
@@ -702,6 +714,7 @@ class BoundaryCrossingTracker:
         self.prev_tracks.clear()
         self.id_remap.clear()
         self.pending_remaps.clear()
+        self._claimed_this_frame.clear()
 
     def draw_boundary_regions(self, image: np.ndarray) -> np.ndarray:
         """在图像上绘制边界区域（用于调试）"""

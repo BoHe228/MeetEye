@@ -3,6 +3,13 @@
 """
 import argparse
 
+OSNET_WEIGHT_MAP = {
+    'osnet_ain_x1_0': 'imagenet.pyth/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth',
+    'osnet_x0_25':    'imagenet.pyth/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth',
+    'osnet_ain_x1_0_D': 'imagenet.pyth/osnet_ain_x1_0_dukemtmcreid_256x128_amsgrad_ep90_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth',
+}
+
+
 def parse_args():
     """
     解析命令行参数
@@ -41,6 +48,11 @@ def parse_args():
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
 
+    # OSNet ReID 模型选择
+    parser.add_argument('--osnet-model', type=str, default='osnet_ain_x1_0',
+                        choices=list(OSNET_WEIGHT_MAP.keys()),
+                        help='OSNet ReID 模型选型（默认: osnet_ain_x1_0）')
+
     # 显示参数
     parser.add_argument('--display-scale', type=float, default=0.5, help='显示缩放比例')
     parser.add_argument('--output-dir', type=str, default='yolo_pose_output', help='输出目录')
@@ -70,10 +82,13 @@ def parse_args():
     parser.add_argument('--crop-divisor', type=int, default=3,
                         help='裁剪全景图正上方区域的分母，0表示不裁剪，3表示裁剪1/3，以此类推 (默认: 0)')
 
-    # BoT-SORT跟踪器参数
-    parser.add_argument('--use-deep-sort', action=argparse.BooleanOptionalAction, default=True,
-                        help='是否使用BoT-SORT跟踪器（结合运动和外观特征），--no-use-deep-sort 禁用')
-    parser.add_argument('--deep-sort-match-thresh', type=float, default=0.3,
+    # 跟踪器选择
+    parser.add_argument('--tracker', type=str, default='hybridsort',
+                        choices=['none', 'botsort', 'hybridsort'],
+                        help='跟踪器类型：none=不使用跟踪，botsort=BoT-SORT，hybridsort=Hybrid-SORT (默认: hybridsort)')
+
+    # BoT-SORT 跟踪器参数（--tracker botsort 时生效）
+    parser.add_argument('--botsort-match-thresh', type=float, default=0.3,
                         help='BoT-SORT匹配阈值')
     parser.add_argument('--appearance-thresh', type=float, default=0.2,
                         help='BoT-SORT外观特征匹配阈值（余弦距离，第一阶段+IoU门控，越小越严格）')
@@ -81,6 +96,14 @@ def parse_args():
                         help='纯ReID恢复Lost轨迹的阈值（第三阶段，无IoU门控，须比appearance-thresh更严格）')
     parser.add_argument('--use-hungarian', action=argparse.BooleanOptionalAction, default=True,
                         help='是否使用匈牙利算法进行线性分配，--no-use-hungarian 改用贪心算法')
+
+    # ReID 参数（--tracker hybridsort 时生效）
+    parser.add_argument('--use-reid', action=argparse.BooleanOptionalAction, default=True,
+                        help='HybridSort 是否启用 ReID 外观特征参与关联，--no-use-reid 禁用 (默认: True)')
+    parser.add_argument('--reid-emb-weight-high', type=float, default=0.3,
+                        help='HybridSort ReID 第一轮关联外观代价权重（0=纯IoU+VDC，越大越依赖外观，默认: 0.3）')
+    parser.add_argument('--reid-emb-weight-low', type=float, default=0.0,
+                        help='HybridSort ReID BYTE第二轮关联外观代价权重（默认: 0.0）')
 
     # JSON 结果保存参数（仅 WebUI 模式生效）
     parser.add_argument('--save-json', action='store_true', default=False,

@@ -1,17 +1,20 @@
 """
-BoT-SORT多目标跟踪器
-整合ByteTrack和DeepSORT的优势：
-1. 高/低置信度检测分离（ByteTrack策略）
-2. IoU + ReID特征融合（DeepSORT优势）
-3. 平滑特征更新（指数移动平均）
-4. 支持相机运动补偿（GMC）- 可选
-5. 边界穿越ID连续性匹配（新增）
+多目标跟踪器模块
+包含：
+  BoT_SORTTracker  —— 原有跟踪器（ByteTrack + DeepSORT 融合）
+  HybridSortTracker —— 基于 Hybrid-SORT 的替换实现
+                       （IoU + 四角点速度方向 VDC + 置信度 TCM）
+两者均保留 BoundaryCrossingTracker 环绕边界去重逻辑；
+跨切片去重由上游 PanoramaSlicer 完成，本模块不涉及。
 """
 import time
 import threading
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 from collections import deque, OrderedDict
+
+import sys
+import os
 
 try:
     from .boundary_matcher import BoundaryCrossingTracker
@@ -25,6 +28,31 @@ try:
     LAP_AVAILABLE = True
 except ImportError:
     LAP_AVAILABLE = False
+
+# ────────────────────────────────────────────────────────────────────────────
+# HybridSORT 导入（可选，失败时 HybridSortTracker 不可用）
+# ────────────────────────────────────────────────────────────────────────────
+_HYBRID_SORT_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'HybridSORT')
+if _HYBRID_SORT_PATH not in sys.path:
+    sys.path.insert(0, _HYBRID_SORT_PATH)
+
+try:
+    from trackers.hybrid_sort_tracker.hybrid_sort import (
+        Hybrid_Sort,
+        KalmanBoxTracker as _HybridKalmanBoxTracker,
+    )
+    from trackers.hybrid_sort_tracker.hybrid_sort_reid import (
+        Hybrid_Sort_ReID,
+        KalmanBoxTracker as _HybridReIDKalmanBoxTracker,
+    )
+    HYBRID_SORT_AVAILABLE = True
+except ImportError as _hybrid_err:
+    HYBRID_SORT_AVAILABLE = False
+    Hybrid_Sort = None
+    Hybrid_Sort_ReID = None
+    _HybridKalmanBoxTracker = None
+    _HybridReIDKalmanBoxTracker = None
+    print(f"[HybridSORT] 导入失败，HybridSortTracker 不可用: {_hybrid_err}")
 
 # 用于跟踪算法是否已经输出过
 ALGORITHM_LOGGED = False
@@ -46,8 +74,6 @@ class TrackState:
     Removed = 3
 
 
-import sys
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utils import cosine_similarity, box_iou
 
@@ -1103,3 +1129,452 @@ def reset_assignment_stats():
         PERF_STATS['hungarian_total_time'] = 0.0
         PERF_STATS['greedy_calls'] = 0
         PERF_STATS['greedy_total_time'] = 0.0
+
+
+# ============================================================================
+# HybridSortTracker — 基于 Hybrid-SORT 的多目标跟踪器
+# ============================================================================
+
+class HybridSortTracker:
+    """
+    基于 Hybrid-SORT（AAAI 2024）的多目标跟踪器，替代 BoT_SORTTracker。
+
+    核心关联逻辑（由 Hybrid_Sort 内部完成）：
+      1. 高/低置信度检测两阶段关联（BYTE 策略）
+      2. IoU + 四角点速度方向一致性代价（VDC，4-point velocity direction consistency）
+      3. 置信度状态调制惩罚（TCM，trajectory confidence modulation）
+      4. OC-SORT 风格的第三轮基于最后真实观测框的重关联
+
+    保留的原有逻辑：
+      · 环绕边界去重：BoundaryCrossingTracker（与 BoT_SORTTracker 完全相同）
+      · 跨切片去重：由上游 PanoramaSlicer.merge_detections() 完成，本类不涉及
+
+    接口与 BoT_SORTTracker 完全兼容：
+      · 构造函数参数向后兼容（BoT-SORT 专用参数静默忽略）
+      · update(List[Dict]) → List[Dict]，字段含义相同
+      · reset() / reset_id() / set_boundary_frame_size() / get_boundary_stats() /
+        draw_boundary_regions() 均有实现
+    """
+
+    def __init__(
+        self,
+        # ── 置信度阈值（与 BoT_SORTTracker 同名） ──
+        track_high_thresh: float = 0.5,
+        track_low_thresh: float = 0.1,
+        new_track_thresh: float = 0.5,
+        # ── 轨迹生命周期 ──
+        track_buffer: int = 30,
+        frame_rate: int = 30,
+        # ── 关联阈值 ──
+        match_thresh: float = 0.3,
+        # ── BoT-SORT 兼容参数（静默忽略，保留以兼容调用方） ──
+        proximity_thresh: float = 0.5,
+        appearance_thresh: float = 0.5,
+        reid_lost_thresh: float = 0.25,
+        feat_history: int = 50,
+        use_hungarian: bool = False,
+        # ── ReID 开关与参数 ──
+        with_reid: bool = False,            # True → 使用 Hybrid_Sort_ReID（外观特征参与关联）
+        reid_emb_weight_high: float = 0.1, # 第一轮关联中外观代价的权重（0=纯 IoU+VDC）
+        reid_emb_weight_low: float = 0.0,  # BYTE 第二轮关联中外观代价的权重
+        reid_alpha: float = 0.8,           # smooth_feat EMA 动量（α·old + (1-α)·new）
+        reid_longterm_bank: int = 30,      # 每条轨迹保留的历史特征帧数
+        reid_adapfs: bool = False,         # 自适应特征平滑（依赖检测置信度加权）
+        reid_high_score_thresh: float = 0.8,  # 外观匹配的最低相似度阈值
+        # ── Hybrid-SORT 专有参数 ──
+        inertia: float = 0.2,
+        delta_t: int = 3,
+        use_byte: bool = True,
+        tcm_first_step: bool = True,
+        tcm_first_step_weight: float = 1.0,
+        tcm_byte_step: bool = True,
+        tcm_byte_step_weight: float = 1.0,
+        asso_func: str = "iou",
+        min_hits: int = 1,
+        # ── 全景图尺寸 ──
+        panorama_width: int = 3840,
+        panorama_height: int = 1080,
+        # ── 环绕边界匹配参数 ──
+        enable_boundary_matching: bool = False,
+        frame_width: int = 3840,
+        frame_height: int = 1080,
+        boundary_margin: float = 0.1,
+        boundary_time_window: int = 30,
+        boundary_similarity_thresh: float = 0.6,
+        boundary_debug: bool = True,
+        enable_top_boundary: bool = False,
+        enable_bottom_boundary: bool = True,
+        enable_left_boundary: bool = True,
+        enable_right_boundary: bool = True,
+    ):
+        if not HYBRID_SORT_AVAILABLE:
+            raise RuntimeError(
+                "HybridSORT 未能导入，请确认 HybridSORT/ 目录存在且依赖已安装。\n"
+                f"  期望路径：{_HYBRID_SORT_PATH}"
+            )
+
+        import argparse
+
+        # ── 记录参数 ──────────────────────────────────────────────────────────
+        self.track_high_thresh = track_high_thresh
+        self.track_low_thresh = track_low_thresh
+        self.new_track_thresh = new_track_thresh
+        self.panorama_width = panorama_width
+        self.panorama_height = panorama_height
+        self._max_age = int(frame_rate / 30.0 * track_buffer)
+        self._min_hits = min_hits
+        self._match_thresh = match_thresh
+        self._inertia = inertia
+        self._delta_t = delta_t
+        self._asso_func = asso_func
+        self._use_byte = use_byte
+        self._with_reid = with_reid and (Hybrid_Sort_ReID is not None)
+
+        # Hybrid_Sort / Hybrid_Sort_ReID 共用的 args namespace
+        # Hybrid_Sort_ReID 需要额外的 ReID 相关字段
+        self.hs_args = argparse.Namespace(
+            # 基础阈值
+            track_thresh=track_high_thresh,
+            low_thresh=track_low_thresh,
+            # TCM
+            TCM_first_step=tcm_first_step,
+            TCM_first_step_weight=tcm_first_step_weight,
+            TCM_byte_step=tcm_byte_step,
+            TCM_byte_step_weight=tcm_byte_step_weight,
+            # BYTE
+            use_byte=use_byte,
+            # ReID（Hybrid_Sort_ReID 专用，Hybrid_Sort 忽略）
+            EG_weight_high_score=reid_emb_weight_high,
+            EG_weight_low_score=reid_emb_weight_low,
+            high_score_matching_thresh=reid_high_score_thresh,
+            alpha=reid_alpha,
+            adapfs=reid_adapfs,
+            longterm_bank_length=reid_longterm_bank,
+            with_longterm_reid=False,
+            longterm_reid_weight=0.0,
+            with_longterm_reid_correction=False,
+            longterm_reid_correction_thresh=1.0,
+            longterm_reid_correction_thresh_low=1.0,
+            dataset="dancetrack",
+            ECC=False,
+        )
+
+        # ── 创建核心 Hybrid_Sort 实例 ────────────────────────────────────────
+        self._inner: Hybrid_Sort = self._make_inner()
+
+        self.frame_id = 0
+
+        # ── 特征 EMA 缓存（模拟 STrack.smooth_feat，供边界匹配使用） ────────
+        # alpha=0.9 固定值；如需动态调整可参考 STrack.update_features()
+        self._feat_cache: Dict[int, np.ndarray] = {}
+        self._feat_alpha = 0.9
+
+        # ── 检测元数据缓存（class_id / class_name / keypoints / confidence） ─
+        # 每帧通过 IoU 反查，将输出 bbox 对应到输入 detection，更新此缓存
+        self._meta_cache: Dict[int, Dict] = {}
+
+        # ── 上一帧状态（用于检测新出现/消失轨迹） ───────────────────────────
+        self._prev_active_ids: set = set()
+        # track_id → 上一帧该轨迹的 bbox [x1,y1,x2,y2]
+        self._prev_bbox: Dict[int, List] = {}
+
+        # ── 环绕边界匹配（与 BoT_SORTTracker 逻辑完全相同） ─────────────────
+        self.enable_boundary_matching = enable_boundary_matching and BOUNDARY_MATCHER_AVAILABLE
+        self.boundary_tracker = None
+        if self.enable_boundary_matching:
+            self.boundary_tracker = BoundaryCrossingTracker(
+                frame_width=frame_width,
+                frame_height=frame_height,
+                boundary_margin=boundary_margin,
+                time_window=boundary_time_window,
+                similarity_threshold=boundary_similarity_thresh,
+                debug=boundary_debug,
+                enable_top_boundary=enable_top_boundary,
+                enable_bottom_boundary=enable_bottom_boundary,
+                enable_left_boundary=enable_left_boundary,
+                enable_right_boundary=enable_right_boundary,
+            )
+
+        # 临时 ID 映射（边界匹配后将新 track_id 重映射到旧 track_id，跨帧持久）
+        self.prev_track_info: Dict[int, Dict] = {}
+        self.temp_id_map: Dict[int, int] = {}
+
+    # ── 内部工具 ─────────────────────────────────────────────────────────────
+
+    def _make_inner(self):
+        """创建（或重建）内部跟踪器实例，同时重置 KalmanBoxTracker.count。"""
+        common = dict(
+            args=self.hs_args,
+            det_thresh=self.track_high_thresh,
+            max_age=self._max_age,
+            min_hits=self._min_hits,
+            iou_threshold=self._match_thresh,
+            delta_t=self._delta_t,
+            asso_func=self._asso_func,
+            inertia=self._inertia,
+        )
+        if self._with_reid:
+            return Hybrid_Sort_ReID(**common)
+        else:
+            return Hybrid_Sort(**common, use_byte=self._use_byte, low_thresh=self.track_low_thresh)
+
+    # ── 公共接口（与 BoT_SORTTracker 完全相同） ──────────────────────────────
+
+    def reset_id(self):
+        """重置 track_id 计数器（兼容 BoT_SORTTracker 接口）。"""
+        if self._with_reid:
+            if _HybridReIDKalmanBoxTracker is not None:
+                _HybridReIDKalmanBoxTracker.count = 0
+        else:
+            if _HybridKalmanBoxTracker is not None:
+                _HybridKalmanBoxTracker.count = 0
+
+    def reset(self):
+        """重置跟踪器全部状态（等价于重新实例化）。"""
+        self._inner = self._make_inner()
+        self.frame_id = 0
+        self._feat_cache.clear()
+        self._meta_cache.clear()
+        self._prev_active_ids.clear()
+        self._prev_bbox.clear()
+        self.temp_id_map.clear()
+        self.prev_track_info.clear()
+        if self.boundary_tracker is not None:
+            self.boundary_tracker.reset()
+
+    def set_boundary_frame_size(self, width: int, height: int):
+        """设置边界匹配器的画面尺寸（兼容 BoT_SORTTracker 接口）。"""
+        if self.boundary_tracker is not None:
+            self.boundary_tracker.set_frame_size(width, height)
+
+    def get_boundary_stats(self) -> Dict[str, Any]:
+        """获取边界匹配统计信息（兼容 BoT_SORTTracker 接口）。"""
+        if self.boundary_tracker is not None:
+            return self.boundary_tracker.get_stats()
+        return {'enabled': False}
+
+    def draw_boundary_regions(self, image: np.ndarray) -> np.ndarray:
+        """在图像上绘制边界区域（用于调试，兼容 BoT_SORTTracker 接口）。"""
+        if self.boundary_tracker is not None:
+            return self.boundary_tracker.draw_boundary_regions(image)
+        return image
+
+    # ── 核心更新逻辑 ──────────────────────────────────────────────────────────
+
+    def update(self, detections: List[Dict]) -> List[Dict]:
+        """
+        每帧调用一次，更新跟踪状态并返回带稳定 track_id 的检测结果。
+
+        Args:
+            detections: 检测列表，格式与 BoT_SORTTracker 完全相同：
+                [{'bbox': [x1,y1,x2,y2], 'confidence': float,
+                  'class_id': int, 'class_name': str,
+                  'keypoints': list, 'feature': np.ndarray | None}, ...]
+
+        Returns:
+            同格式的检测列表，每项包含稳定的 'track_id'。
+        """
+        self.frame_id += 1
+
+        # ① 边界匹配帧头预处理 ────────────────────────────────────────────────
+        if self.enable_boundary_matching and self.boundary_tracker is not None:
+            self.boundary_tracker.pre_process(self.frame_id)
+
+        # ② 构造输入数组 [N, 5] = [x1,y1,x2,y2,score]，以及 ReID 特征矩阵 ───
+        if detections:
+            dets_np = np.array(
+                [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3], d['confidence']]
+                 for d in detections],
+                dtype=np.float32,
+            )
+        else:
+            dets_np = np.empty((0, 5), dtype=np.float32)
+
+        # img_info == img_size → scale = 1.0，坐标不做缩放
+        img_info = [self.panorama_height, self.panorama_width]
+        img_size = [self.panorama_height, self.panorama_width]
+
+        # ③ 调用核心跟踪器 ───────────────────────────────────────────────────
+        if self._with_reid:
+            # Hybrid_Sort_ReID 必须始终收到 id_feature（不能为 None），
+            # 空帧时传 shape=(0, feat_dim) 的空矩阵，让内部逻辑正常走完
+            feat_dim = 512
+            if detections:
+                for d in detections:
+                    f = d.get('feature')
+                    if f is not None:
+                        feat_dim = int(np.asarray(f).size)
+                        break
+            id_feature_np = np.zeros((len(detections), feat_dim), dtype=np.float32)
+            for i, d in enumerate(detections):
+                feat = d.get('feature')
+                if feat is not None:
+                    f = np.asarray(feat, dtype=np.float32).flatten()
+                    if f.shape[0] == feat_dim:
+                        norm = np.linalg.norm(f)
+                        if norm > 1e-6:
+                            id_feature_np[i] = f / norm
+            online_targets = self._inner.update(dets_np, img_info, img_size,
+                                                 id_feature=id_feature_np)
+        else:
+            online_targets = self._inner.update(dets_np, img_info, img_size)
+
+        # ③-后：ReID 模式下，从内部 KalmanBoxTracker 同步 smooth_feat 到 _feat_cache
+        # 内部跟踪器维护自己的 EMA（smooth_feat），比外部 EMA 更准确（含自适应平滑）
+        if self._with_reid:
+            for trk in self._inner.trackers:
+                if trk.smooth_feat is not None:
+                    self._feat_cache[trk.id + 1] = trk.smooth_feat
+
+        # ④ 本帧活跃 track_id 集合 ────────────────────────────────────────────
+        current_active_ids: set = (
+            {int(row[4]) for row in online_targets}
+            if len(online_targets) > 0
+            else set()
+        )
+
+        # ⑤ 处理消失轨迹 → 注册到边界匹配器 ─────────────────────────────────
+        #    消失轨迹 = 上帧活跃、本帧不活跃的轨迹
+        lost_ids = self._prev_active_ids - current_active_ids
+        if self.enable_boundary_matching and self.boundary_tracker is not None:
+            for lost_id in lost_ids:
+                smooth_feat = self._feat_cache.get(lost_id)
+                if smooth_feat is None:
+                    continue
+                last_bbox = self._prev_bbox.get(lost_id, [0, 0, 1, 1])
+                self.boundary_tracker.process_lost_track(
+                    track_id=lost_id,
+                    bbox=last_bbox,
+                    feature=smooth_feat,
+                    frame_id=self.frame_id,
+                    smooth_feat=smooth_feat,
+                    prev_bbox=self._prev_bbox.get(lost_id),
+                )
+
+        # ⑥-a. 双射 IoU 反查：将每条输出轨迹唯一对应一个输入 detection ─────
+        # Hybrid_Sort 输出的是 last_observation（原始检测框），IoU 通常精确为 1.0。
+        # 按 IoU 降序贪心分配，避免两条轨迹争抢同一个 detection。
+        track_to_det_idx: Dict[int, int] = {}
+        if detections and len(online_targets) > 0:
+            pairs: List[Tuple[float, int, int]] = []
+            for ti, row in enumerate(online_targets):
+                out_bbox = [float(row[0]), float(row[1]), float(row[2]), float(row[3])]
+                for di, det in enumerate(detections):
+                    iou = box_iou(out_bbox, det['bbox'])
+                    if iou > 0.3:
+                        pairs.append((iou, ti, di))
+            pairs.sort(key=lambda x: -x[0])
+            used_trk_set: set = set()
+            used_det_set: set = set()
+            for _iou, ti, di in pairs:
+                if ti not in used_trk_set and di not in used_det_set:
+                    track_to_det_idx[ti] = di
+                    used_trk_set.add(ti)
+                    used_det_set.add(di)
+
+        # ⑥ 逐轨迹后处理：更新元数据 / 特征 EMA / 注册边界新轨迹 ───────────
+        new_ids = current_active_ids - self._prev_active_ids  # 本帧首次出现的轨迹
+        output_detections: List[Dict] = []
+
+        for ti, row in enumerate(online_targets):
+            x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            track_id = int(row[4])
+            out_bbox = [x1, y1, x2, y2]
+            best_det: Optional[Dict] = (
+                detections[track_to_det_idx[ti]] if ti in track_to_det_idx else None
+            )
+
+            # ── b. 更新元数据缓存 ─────────────────────────────────────────────
+            if best_det is not None:
+                self._meta_cache[track_id] = {
+                    'confidence': best_det.get('confidence', 0.5),
+                    'class_id':   best_det.get('class_id', 0),
+                    'class_name': best_det.get('class_name', 'person'),
+                    'keypoints':  best_det.get('keypoints', []),
+                }
+            meta = self._meta_cache.get(track_id) or {}
+
+            # ── c. 更新特征 EMA ───────────────────────────────────────────────
+            # with_reid=True：smooth_feat 由内部 KalmanBoxTracker 管理，
+            #                 已在步骤③-后同步到 _feat_cache，此处直接读取
+            # with_reid=False：由外部 EMA 维护（α=0.9）
+            if not self._with_reid:
+                curr_feat = best_det.get('feature') if best_det is not None else None
+                if curr_feat is not None:
+                    feat_arr = np.asarray(curr_feat, dtype=np.float32).flatten()
+                    norm = np.linalg.norm(feat_arr)
+                    if norm > 1e-6:
+                        feat_arr /= norm
+                        if track_id in self._feat_cache:
+                            self._feat_cache[track_id] = (
+                                self._feat_alpha * self._feat_cache[track_id]
+                                + (1 - self._feat_alpha) * feat_arr
+                            )
+                            n2 = np.linalg.norm(self._feat_cache[track_id])
+                            if n2 > 1e-6:
+                                self._feat_cache[track_id] /= n2
+                        else:
+                            self._feat_cache[track_id] = feat_arr
+            smooth_feat = self._feat_cache.get(track_id)
+
+            # ── d. 边界匹配：仅对本帧首次出现的轨迹检查是否与消失轨迹吻合 ───
+            # 用 track_id（Hybrid_Sort 内部 ID）作为 temp_id，使得：
+            #   · pending_remaps[track_id] = matched_id → post_process() 可直接重映射
+            #   · id_remap[track_id] = matched_id → 该轨迹消失时 process_lost_track 能
+            #     追溯到正确的 matched_id，保持边界匹配链的一致性
+            # temp_id_map 跨帧持久保存映射，确保连续帧都输出正确的 final_track_id。
+            is_new_track = track_id in new_ids
+            if (is_new_track
+                    and self.enable_boundary_matching
+                    and self.boundary_tracker is not None
+                    and smooth_feat is not None):
+                matched_id = self.boundary_tracker.check_new_track(
+                    bbox=out_bbox,
+                    feature=smooth_feat,
+                    frame_id=self.frame_id,
+                    temp_id=track_id,
+                )
+                if matched_id is not None:
+                    self.temp_id_map[track_id] = matched_id
+
+            # temp_id_map 持久映射（post_process 仅负责首帧的 pending_remap 重映射）
+            if track_id in self.temp_id_map:
+                final_track_id = self.temp_id_map[track_id]
+                boundary_matched = True
+            else:
+                final_track_id = track_id
+                boundary_matched = False
+
+            # ── e. 构建输出 dict（字段与 BoT_SORTTracker 完全相同） ──────────
+            out_feat = smooth_feat[np.newaxis, :] if smooth_feat is not None else None
+            det_out = {
+                'bbox':              out_bbox,
+                'confidence':        meta.get('confidence', 0.5),
+                'class_id':          meta.get('class_id', 0),
+                'class_name':        meta.get('class_name', 'person'),
+                'keypoints':         meta.get('keypoints', []),
+                'track_id':          final_track_id,
+                'feature':           out_feat,
+                '_feature_count':    1 if smooth_feat is not None else 0,
+                '_boundary_matched': boundary_matched,
+            }
+            output_detections.append(det_out)
+
+        # ⑦ 边界匹配帧尾后处理：对本帧首次出现的轨迹应用 pending_remaps ─────
+        # post_process() 通过 pending_remaps[track_id] 完成首帧映射（与 temp_id_map 一致），
+        # 并更新 boundary_tracker 的 prev_tracks（供下一帧的消失检测使用）。
+        if self.enable_boundary_matching and self.boundary_tracker is not None:
+            output_detections = self.boundary_tracker.post_process(output_detections)
+
+        # ⑧ 更新帧间状态（_prev_active_ids / _prev_bbox 使用 Hybrid_Sort 内部 ID） ──
+        self._prev_active_ids = current_active_ids
+        self._prev_bbox = {
+            int(row[4]): [float(row[0]), float(row[1]), float(row[2]), float(row[3])]
+            for row in online_targets
+        }
+        self.prev_track_info = {
+            det['track_id']: {'bbox': det['bbox'], 'track_id': det['track_id']}
+            for det in output_detections
+        }
+
+        return output_detections

@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+import config as _config
+
 import numpy as np
 import torch
 
@@ -16,6 +18,7 @@ from core import (
     PanoramaSlicer,
     AngleCalculator,
     BoT_SORTTracker,
+    HybridSortTracker,
     print_assignment_stats,
 )
 from utils import (
@@ -43,7 +46,7 @@ class FisheyePanoramaYOLOPose:
         self.show_angle_overview = False
         self.num_slices: int = getattr(args, 'num_slices', 3)
         self.slice_overlap: float = getattr(args, 'slice_overlap', 0.05)
-        self.use_deep_sort: bool = args.use_deep_sort
+        self.use_tracker: bool = (args.tracker != 'none')
         self.no_display: bool = args.no_display
 
         self._panorama_ready = False
@@ -56,19 +59,7 @@ class FisheyePanoramaYOLOPose:
             reid_similarity_threshold=0.7,
         )
 
-        self.tracker = BoT_SORTTracker(
-            track_high_thresh=0.5,
-            track_low_thresh=0.1,
-            new_track_thresh=0.5,
-            track_buffer=500,
-            match_thresh=0.3,
-            proximity_thresh=0.4,
-            appearance_thresh=args.appearance_thresh,
-            reid_lost_thresh=args.reid_lost_thresh,
-            frame_rate=30,
-            feat_history=500,
-            with_reid=True,
-            use_hungarian=args.use_hungarian,
+        _boundary_kwargs = dict(
             enable_boundary_matching=True,
             frame_width=3840,
             frame_height=1080,
@@ -82,13 +73,50 @@ class FisheyePanoramaYOLOPose:
             enable_right_boundary=True,
         )
 
-        self._osnet_model_path = (
-            "imagenet.pyth/osnet_x0_25_msmt17_combineall_256x128_amsgrad"
-            "_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth"
-        )
-        if not os.path.exists(self._osnet_model_path):
-            print(f"[OSNet] 自定义权重不存在，将使用预训练权重: {self._osnet_model_path}")
-            self._osnet_model_path = None
+        if args.tracker == 'botsort':
+            self.tracker = BoT_SORTTracker(
+                track_high_thresh=0.5,
+                track_low_thresh=0.1,
+                new_track_thresh=0.5,
+                track_buffer=500,
+                frame_rate=30,
+                match_thresh=args.botsort_match_thresh,
+                appearance_thresh=args.appearance_thresh,
+                reid_lost_thresh=args.reid_lost_thresh,
+                with_reid=True,
+                use_hungarian=args.use_hungarian,
+                **_boundary_kwargs,
+            )
+        elif args.tracker == 'hybridsort':
+            self.tracker = HybridSortTracker(
+                track_high_thresh=0.5,
+                track_low_thresh=0.1,
+                new_track_thresh=0.5,
+                track_buffer=500,
+                frame_rate=30,
+                match_thresh=0.4,
+                inertia=0.4,
+                delta_t=3,
+                use_byte=True,
+                tcm_first_step=True,
+                tcm_first_step_weight=1.0,
+                tcm_byte_step=True,
+                tcm_byte_step_weight=1.0,
+                asso_func="iou",
+                min_hits=1,
+                with_reid=args.use_reid,
+                reid_emb_weight_high=args.reid_emb_weight_high,
+                reid_emb_weight_low=args.reid_emb_weight_low,
+                panorama_width=3840,
+                panorama_height=1080,
+                **_boundary_kwargs,
+            )
+        else:
+            self.tracker = None
+
+        _osnet_path = _config.OSNET_WEIGHT_MAP.get(args.osnet_model, '')
+        self._osnet_model_name = args.osnet_model
+        self._osnet_model_path = _osnet_path if os.path.exists(_osnet_path) else None
 
     # ──────────────────────────────────────────────────────────────────
     def initialize(self) -> bool:
@@ -124,10 +152,10 @@ class FisheyePanoramaYOLOPose:
             no_display=self.no_display,
         )
 
-        print("初始化 OSNet 特征提取器...")
+        print(f"初始化 OSNet 特征提取器 ({self._osnet_model_name})...")
         try:
             self.feature_extractor = FeatureExtractor(
-                model_name='osnet_x0_25',
+                model_name=self._osnet_model_name,
                 model_path=self._osnet_model_path,
             )
             if _CUDA:
@@ -173,7 +201,8 @@ class FisheyePanoramaYOLOPose:
                 yaml_file=getattr(self.args, 'calib_yaml', None),
             )
 
-            if self.tracker.enable_boundary_matching:
+            if (self.tracker is not None
+                    and self.tracker.enable_boundary_matching):
                 self.tracker.set_boundary_frame_size(out_w, out_h)
 
             self._panorama_ready = True
@@ -276,7 +305,7 @@ class FisheyePanoramaYOLOPose:
         t[7] = time.perf_counter()
 
         # ⑧ 跟踪 + 绘制  [CPU]
-        if self.use_deep_sort:
+        if self.use_tracker:
             tracked = self.tracker.update(dets_with_feat)
         else:
             tracked = filtered
@@ -349,5 +378,5 @@ class FisheyePanoramaYOLOPose:
         print("\n清理资源...")
         if self.display_manager:
             self.display_manager.destroy_windows()
-        if self.use_deep_sort:
+        if self.use_tracker:
             print_assignment_stats()
