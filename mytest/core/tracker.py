@@ -1390,6 +1390,18 @@ class HybridSortTracker:
         else:
             dets_np = np.empty((0, 5), dtype=np.float32)
 
+        # 预计算重叠检测框集合：IoU > 0.1 则裁图包含邻近人体，特征会被污染
+        # with_reid 路径：置零 id_feature_np → KalmanBoxTracker.update_features() norm<1e-6 → 跳过
+        # 无reid 路径：跳过外部 EMA 更新，保护 _feat_cache
+        _OVERLAP_IOU_THRESH = 0.1
+        _contaminated_det_indices: set = set()
+        if len(dets_np) > 1:
+            for _a in range(len(dets_np)):
+                for _b in range(_a + 1, len(dets_np)):
+                    if box_iou(dets_np[_a, :4], dets_np[_b, :4]) > _OVERLAP_IOU_THRESH:
+                        _contaminated_det_indices.add(_a)
+                        _contaminated_det_indices.add(_b)
+
         # img_info == img_size → scale = 1.0，坐标不做缩放
         img_info = [self.panorama_height, self.panorama_width]
         img_size = [self.panorama_height, self.panorama_width]
@@ -1414,6 +1426,10 @@ class HybridSortTracker:
                         norm = np.linalg.norm(f)
                         if norm > 1e-6:
                             id_feature_np[i] = f / norm
+            # freeze_feat：重叠检测框置零 → KalmanBoxTracker.update_features() 跳过，保护 smooth_feat
+            for _idx in _contaminated_det_indices:
+                if _idx < len(id_feature_np):
+                    id_feature_np[_idx] = 0.0
             online_targets = self._inner.update(dets_np, img_info, img_size,
                                                  id_feature=id_feature_np)
         else:
@@ -1500,7 +1516,10 @@ class HybridSortTracker:
             # with_reid=False：由外部 EMA 维护（α=0.9）
             if not self._with_reid:
                 curr_feat = best_det.get('feature') if best_det is not None else None
-                if curr_feat is not None:
+                _det_idx_for_feat = track_to_det_idx.get(ti)
+                _feat_contaminated = (_det_idx_for_feat is not None
+                                      and _det_idx_for_feat in _contaminated_det_indices)
+                if curr_feat is not None and not _feat_contaminated:
                     feat_arr = np.asarray(curr_feat, dtype=np.float32).flatten()
                     norm = np.linalg.norm(feat_arr)
                     if norm > 1e-6:
