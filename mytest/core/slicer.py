@@ -19,8 +19,10 @@ class PanoramaSlicer:
     """
 
     def __init__(self, overlap_ratio: float = 0.2, iou_threshold: float = 0.3,
+                 nms_iou_thresh: float = 0.6,
                  confidence_threshold: float = 0.5,
                  reid_similarity_threshold: float = 0.7,
+                 wrap_reid_threshold: float = 0.5,
                  max_width_ratio: float = 0.6,
                  verbose: bool = False):
         """
@@ -28,17 +30,25 @@ class PanoramaSlicer:
 
         Args:
             overlap_ratio: 切片之间的重叠比例 (0-1)
-            iou_threshold: 合并检测框时的NMS IoU阈值
+            iou_threshold: 跨切片去重（Step 3）的 IoU 阈值，需较低以捕获重叠区域重复检测
+            nms_iou_thresh: 最终 NMS（Step 4）的 IoU 阈值，须高于 iou_threshold，
+                            避免将物理上接近或被包裹的不同目标误判为重复检测。
             confidence_threshold: 置信度阈值
-            reid_similarity_threshold: ReID特征相似度阈值，超过此值认为是同一目标
+            reid_similarity_threshold: 相邻切片对（slice0/1、slice1/2）去重的 ReID 阈值，
+                                       这两对有 IoU 前置门控，可以使用较严格的值
+            wrap_reid_threshold: 环绕切片对（slice0 & slice2）专用阈值，须低于
+                                 reid_similarity_threshold。环绕对没有位置门控，
+                                 且两侧裁图上下文不同会导致特征略有偏差，需要宽松判断。
             max_width_ratio: 检测框最大允许宽度占全景图宽度的比例（过滤横跨边界的无效框）
             verbose: 是否打印去重/过滤调试日志（默认关闭）
         """
         self.overlap_ratio = overlap_ratio
         self.iou_threshold = iou_threshold
+        self.nms_iou_thresh = nms_iou_thresh
         self.confidence_threshold = confidence_threshold
-        self.reid_similarity_threshold = reid_similarity_threshold  # 关键：ReID相似度阈值
-        self.max_width_ratio = max_width_ratio  # 过滤超宽检测框
+        self.reid_similarity_threshold = reid_similarity_threshold
+        self.wrap_reid_threshold = wrap_reid_threshold
+        self.max_width_ratio = max_width_ratio
         self.verbose = verbose
 
     def slice_panorama(self, panorama: np.ndarray, num_slices: int = 3) -> Tuple[List[np.ndarray], List[dict]]:
@@ -305,26 +315,34 @@ class PanoramaSlicer:
                 # 环绕边界对：只要特征相似就去重，不限制位置
                 # 相邻边界对：需要在边界重叠区域才去重
                 if is_wrap_around_pair:
-                    # 环绕边界处理：优先用ReID特征，不要求位置重叠
+                    # 环绕边界对（slice0 & slice2）：无位置门控，用专用宽松阈值
                     feat1 = all_features[i]
                     feat2 = all_features[j]
 
                     is_same_target = False
 
                     if feat1 is not None and feat2 is not None:
-                        # 有ReID特征：基于特征相似度判断
                         similarity = cosine_similarity(feat1, feat2)
-                        if similarity >= self.reid_similarity_threshold:
+                        if similarity >= self.wrap_reid_threshold:
                             is_same_target = True
                             if self.verbose:
                                 print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：特征相似度={similarity:.3f} → 同一目标，去重")
                     else:
-                        # 没有ReID特征：回退到基于IoU
-                        iou = self._calculate_wrap_around_iou(all_boxes[i], all_boxes[j], panorama_width)
-                        if iou > self.iou_threshold:
+                        # 无特征时：用全景坐标下的环绕近邻距离代替 IoU
+                        # 环绕对的框经过坐标转换后可能一个在 x≈0、一个在 x≈W，
+                        # 正常 IoU 永远为 0，改用全景最短距离判断是否同一区域
+                        b1 = all_boxes[i]
+                        b2 = all_boxes[j]
+                        cx1 = (b1[0] + b1[2]) / 2
+                        cx2 = (b2[0] + b2[2]) / 2
+                        cy1 = (b1[1] + b1[3]) / 2
+                        cy2 = (b2[1] + b2[3]) / 2
+                        wrap_dx = min(abs(cx1 - cx2), panorama_width - abs(cx1 - cx2))
+                        box_w = max((b1[2] - b1[0] + b2[2] - b2[0]) / 2, 1)
+                        if wrap_dx < box_w * 1.5 and abs(cy1 - cy2) < box_w:
                             is_same_target = True
                             if self.verbose:
-                                print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：环绕IoU={iou:.3f} → 同一目标，去重")
+                                print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：无特征，环绕中心距={wrap_dx:.1f} → 同一目标，去重")
 
                     if is_same_target:
                         if all_scores[i] >= all_scores[j]:
@@ -530,7 +548,10 @@ class PanoramaSlicer:
             other_boxes = boxes[sorted_indices[1:]]
 
             ious = box_iou_batch(current_box, other_boxes)
-            keep_indices = np.where(ious < self.iou_threshold)[0]
+            # 使用 nms_iou_thresh 而非 iou_threshold：
+            # Step 3 已处理跨切片重复，到达这里的检测若仍重叠极大概率才是同一目标。
+            # 较高阈值防止将"大框包裹小框"的不同人物误压制（IoU = 小框面积/大框面积）。
+            keep_indices = np.where(ious < self.nms_iou_thresh)[0]
             sorted_indices = sorted_indices[keep_indices + 1]
 
         return keep

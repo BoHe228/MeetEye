@@ -49,36 +49,6 @@ from utils.feature_extractor import FeatureExtractor
 _CUDA = torch.cuda.is_available()
 
 
-def _append_wrap_strips(frame: np.ndarray, overlap_width: int) -> np.ndarray:
-    """
-    在显示帧左右各拼接一条环绕重叠区域副本（调试用）。
-      左侧条带 = 全景图右端 overlap_width 像素（slice0 左侧延伸的内容来源）
-      右侧条带 = 全景图左端 overlap_width 像素（slice2 右侧延伸的内容来源）
-    两条带均叠加半透明青色遮罩，并在内侧边缘画竖线标记边界。
-    """
-    h, w = frame.shape[:2]
-    if overlap_width <= 0 or overlap_width >= w:
-        return frame
-
-    left_strip  = frame[:, w - overlap_width : w].copy()   # 右端内容 → 放到最左边
-    right_strip = frame[:, 0 : overlap_width].copy()        # 左端内容 → 放到最右边
-
-    tint = np.full_like(left_strip, (200, 200, 0), dtype=np.uint8)  # 青色 (BGR)
-    cv2.addWeighted(left_strip,  0.72, tint, 0.28, 0, left_strip)
-    cv2.addWeighted(right_strip, 0.72, tint, 0.28, 0, right_strip)
-
-    # 内侧边界分隔线
-    cv2.line(left_strip,  (overlap_width - 1, 0), (overlap_width - 1, h - 1), (0, 255, 255), 2)
-    cv2.line(right_strip, (0, 0),                 (0, h - 1),                 (0, 255, 255), 2)
-
-    # 标注文字
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(left_strip,  'R-edge', (2, 18), font, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(right_strip, 'L-edge', (2, 18), font, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-
-    return np.concatenate([left_strip, frame, right_strip], axis=1)
-
-
 class FisheyePanoramaYOLOPose:
     """鱼眼全景YOLO姿态检测主类（GPU 优化版）"""
 
@@ -154,7 +124,7 @@ class FisheyePanoramaYOLOPose:
                 # ── 关联阈值 ────────────────────────────────────────────────
                 match_thresh=0.2,
                 # ── Hybrid-SORT 专有参数 ─────────────────────────────────────
-                inertia=0.2,
+                inertia=0.4,
                 delta_t=3,
                 use_byte=True,
                 tcm_first_step=True,
@@ -170,9 +140,6 @@ class FisheyePanoramaYOLOPose:
                 # ── 全景图尺寸 ───────────────────────────────────────────────
                 panorama_width=3840,
                 panorama_height=1080,
-                # ── 框平滑 ──────────────────────────────────────────────────
-                smooth_bbox=getattr(args, 'smooth_bbox', False),
-                smooth_bbox_alpha=getattr(args, 'smooth_bbox_alpha', 0.5),
                 **_boundary_kwargs,
             )
         else:
@@ -180,9 +147,7 @@ class FisheyePanoramaYOLOPose:
 
         self.feature_extractor = None
         _osnet_path = config.OSNET_WEIGHT_MAP.get(args.osnet_model, '')
-        # OSNET_ARCH_MAP 将用户选项（如 osnet_ain_x1_0_D）映射到 torchreid 实际识别的架构名
-        # 不同数据集预训练的变体底层架构相同，直接传用户 key 会导致 torchreid 报错
-        self.osnet_model_name = config.OSNET_ARCH_MAP.get(args.osnet_model, args.osnet_model)
+        self.osnet_model_name = args.osnet_model
         self.osnet_model_path = _osnet_path if os.path.exists(_osnet_path) else None
 
     # ──────────────────────────────────────────────────────────────────
@@ -441,11 +406,6 @@ class FisheyePanoramaYOLOPose:
         # ── 每 200 帧清理一次显存碎片 ────────────────────────────────
         if self._timing_counter % 200 == 0 and _CUDA:
             torch.cuda.empty_cache()
-
-        # ── 环绕重叠可视化（--show-wrap-overlap）────────────────────
-        if getattr(self.args, 'show_wrap_overlap', False):
-            _ow = int((panorama.shape[1] // self.num_slices) * self.slice_overlap)
-            annotated_panorama = _append_wrap_strips(annotated_panorama, _ow)
 
         return panorama, yolo_only_image, annotated_panorama, tracked_detections, angle_info
 

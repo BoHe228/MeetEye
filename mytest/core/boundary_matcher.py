@@ -392,10 +392,7 @@ class BoundaryIDMatcher:
 
         if best_match_id is not None:
             self.stats['matched_count'] += 1
-            # === 注意：不立即从缓存中移除已匹配的目标 ===
-            # 原因：目标可能在边界附近反复出现（检测抖动）
-            # 让时间窗口自动清理过期目标
-            # self._remove_matched_target(best_match_id)
+            # 移除操作由上层 BoundaryCrossingTracker.check_new_track() 在认领成功后统一调用
             if self.debug:
                 print(f"  [匹配成功] 新目标匹配到ID={best_match_id}, 相似度={best_similarity:.2f}")
         else:
@@ -652,6 +649,10 @@ class BoundaryCrossingTracker:
             self._claimed_this_frame.add(matched_id)
             self.pending_remaps[temp_id] = matched_id
             self.id_remap[temp_id] = matched_id
+            # 从缓存中移除已认领的旧目标，防止后续帧的新轨迹再次认领同一 ID
+            # 注：不影响抖动场景——HybridSORT 的 track_buffer 会保持同一轨迹存活，
+            # 不会因 1-2 帧丢检而产生新 track_id；真正丢失后重现会重新走 process_lost_track
+            self.matcher._remove_matched_target(matched_id)
 
         return matched_id
 

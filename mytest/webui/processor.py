@@ -1,6 +1,13 @@
 """
-FisheyePanoramaYOLOPose — 核心 GPU 推理处理类
+FisheyePanoramaYOLOPose — 核心 GPU 推理处理类（WebUI 版）
 包含逐步耗时打印（每 30 帧一次），方便定位性能瓶颈。
+
+与 main.py 的差异（刻意保留的，非遗漏）：
+  · 不初始化摄像头（摄像头由 camera_client.py 远程推流）
+  · 不调用 draw_yolo_only（WebUI 不需要纯检测流，节省 ~3ms/帧）
+  · 假设 CUDA 始终可用（实时 GPU 服务器）
+
+跟踪参数与 main.py 保持对齐，需修改时两处同步更新。
 """
 import os
 import threading
@@ -51,7 +58,7 @@ class FisheyePanoramaYOLOPose:
 
         self._panorama_ready = False
         self._panorama_init_lock = threading.Lock()
-        self._timing_counter = 0  # 控制耗时日志频率
+        self._timing_counter = 0
 
         self.slicer = PanoramaSlicer(
             overlap_ratio=self.slice_overlap,
@@ -59,11 +66,12 @@ class FisheyePanoramaYOLOPose:
             reid_similarity_threshold=0.7,
         )
 
+        # ── 边界匹配公共参数（与 main.py 保持对齐）──────────────────────
         _boundary_kwargs = dict(
             enable_boundary_matching=True,
             frame_width=3840,
             frame_height=1080,
-            boundary_margin=0.1,
+            boundary_margin=0.04,
             boundary_time_window=90,
             boundary_similarity_thresh=0.3,
             boundary_debug=False,
@@ -89,38 +97,47 @@ class FisheyePanoramaYOLOPose:
             )
         elif args.tracker == 'hybridsort':
             self.tracker = HybridSortTracker(
+                # ── 置信度阈值（与 main.py 对齐）──────────────────────────
                 track_high_thresh=0.5,
                 track_low_thresh=0.1,
                 new_track_thresh=0.5,
-                track_buffer=500,
+                # ── 轨迹生命周期 ──────────────────────────────────────────
+                track_buffer=500,          # WebUI 长时运行，保留更多历史
                 frame_rate=30,
-                match_thresh=0.4,
-                inertia=0.4,
+                # ── 关联阈值（与 main.py 对齐）────────────────────────────
+                match_thresh=0.2,
+                # ── Hybrid-SORT 专有参数（与 main.py 对齐）───────────────
+                inertia=0.2,
                 delta_t=3,
                 use_byte=True,
                 tcm_first_step=True,
-                tcm_first_step_weight=1.0,
+                tcm_first_step_weight=1,
                 tcm_byte_step=True,
-                tcm_byte_step_weight=1.0,
+                tcm_byte_step_weight=1,
                 asso_func="iou",
                 min_hits=1,
+                # ── ReID ──────────────────────────────────────────────────
                 with_reid=args.use_reid,
                 reid_emb_weight_high=args.reid_emb_weight_high,
                 reid_emb_weight_low=args.reid_emb_weight_low,
+                # ── 全景图尺寸 ─────────────────────────────────────────────
                 panorama_width=3840,
                 panorama_height=1080,
+                # ── 框平滑 ─────────────────────────────────────────────────
+                smooth_bbox=getattr(args, 'smooth_bbox', True),
+                smooth_bbox_alpha=getattr(args, 'smooth_bbox_alpha', 0.5),
                 **_boundary_kwargs,
             )
         else:
             self.tracker = None
 
         _osnet_path = _config.OSNET_WEIGHT_MAP.get(args.osnet_model, '')
-        self._osnet_model_name = args.osnet_model
+        self._osnet_model_name = _config.OSNET_ARCH_MAP.get(args.osnet_model, args.osnet_model)
         self._osnet_model_path = _osnet_path if os.path.exists(_osnet_path) else None
 
     # ──────────────────────────────────────────────────────────────────
     def initialize(self) -> bool:
-        """加载 YOLO 和 OSNet 模型"""
+        """加载 YOLO 和 OSNet 模型（不初始化摄像头，摄像头由远端推流）"""
         print("初始化模型（YOLO + OSNet）...")
         os.makedirs(self.args.output_dir, exist_ok=True)
         os.makedirs("screenshots", exist_ok=True)
@@ -134,11 +151,8 @@ class FisheyePanoramaYOLOPose:
             conf_threshold=self.args.conf_threshold,
             iou_threshold=self.args.iou_threshold,
         )
-
         if _CUDA:
             print(f"GPU 已就绪: {torch.cuda.get_device_name(0)}")
-            # TensorRT .engine 文件在导出时已绑定 GPU，不支持 .to()；
-            # PyTorch .pt 文件需要手动移至 GPU。
             if not self.args.model_path.endswith('.engine'):
                 self.yolo_detector.model.to('cuda')
                 print("YOLO 已移至 GPU（FP16 由推理时 half=True 控制）")
@@ -219,12 +233,13 @@ class FisheyePanoramaYOLOPose:
           →  CPU 裁剪切片  →  GPU YOLO批量推理
           →  CPU 合并过滤  →  GPU OSNet特征提取
           →  CPU 跟踪绘制  →  CPU 角度计算
+        第二返回值固定 None（WebUI 不需要纯检测流）。
         """
         if not self._panorama_ready:
             if not self._init_panorama_from_frame(frame):
                 return None, None, None, None, None
 
-        t = {}  # 时间戳字典，用于打印各步耗时
+        t = {}
         sync = (lambda: torch.cuda.synchronize()) if _CUDA else (lambda: None)
 
         # ① CPU → GPU  [CPU→GPU]
@@ -238,7 +253,7 @@ class FisheyePanoramaYOLOPose:
         sync()
         t[2] = time.perf_counter()
 
-        # ③ GPU → CPU  [GPU→CPU] — 先在GPU上转uint8（12MB vs 50MB），再传输
+        # ③ GPU → CPU  [GPU→CPU]
         panorama = (
             (panorama_tensor * 255.0)
             .clamp_(0, 255)
@@ -261,20 +276,17 @@ class FisheyePanoramaYOLOPose:
             self.angle_calculator.set_crop_offset(crop_h)
         slices, slice_infos = self.slicer.slice_panorama(panorama, num_slices=self.num_slices)
 
-        # panorama_tensor 仍在 GPU（步骤③只做了 numpy 拷贝未释放张量）
-        # 构建 RGB GPU 切片张量供 OSNet 直接在 GPU 上裁切，跳过 numpy→PIL→transform
         slice_tensors_gpu = None
         if self.feature_extractor and _CUDA:
-            # BGR→RGB channel flip + crop_h 裁剪（都是内存视图/小量运算，<0.1ms）
-            pano_rgb = panorama_tensor[[2, 1, 0], crop_h:, :]  # [3, H-crop_h, W] RGB float 0-1
+            pano_rgb = panorama_tensor[[2, 1, 0], crop_h:, :]
             pw = pano_rgb.shape[2]
             slice_tensors_gpu = []
             for info in slice_infos:
                 sx, ex = info['start_x'], info['end_x']
                 if info['wrap_around']:
-                    if sx < 0:   # 左侧越界
+                    if sx < 0:
                         st = torch.cat([pano_rgb[:, :, sx:], pano_rgb[:, :, :ex]], dim=2)
-                    else:        # 右侧越界
+                    else:
                         st = torch.cat([pano_rgb[:, :, sx:pw], pano_rgb[:, :, :ex - pw]], dim=2)
                 else:
                     st = pano_rgb[:, :, sx:ex]
@@ -288,7 +300,6 @@ class FisheyePanoramaYOLOPose:
         t[5] = time.perf_counter()
 
         # ⑥ 合并 + 过滤  [CPU + GPU]
-        # slice_tensors_gpu 存在时走 GPU crop 路径，跳过 CPU numpy→PIL→transform（省 ~5ms）
         merged = self.slicer.merge_detections(
             all_yolo_results, slice_infos,
             slice_images=slices,
@@ -299,23 +310,18 @@ class FisheyePanoramaYOLOPose:
         filtered = self.slicer.filter_wide_detections(filtered, panorama.shape[1])
         t[6] = time.perf_counter()
 
-        # ⑦ OSNet 特征已在步骤⑥ merge_detections 内批量提取（切片坐标 crop），
-        #    此处直接复用，不重复提取，节省 ~15ms
-        dets_with_feat = filtered  # 特征已挂在 det['feature'] 上（numpy [1,feat_dim] 或 None）
-        t[7] = time.perf_counter()
-
-        # ⑧ 跟踪 + 绘制  [CPU]
+        # ⑦ 跟踪 + 绘制  [CPU]
         if self.use_tracker:
-            tracked = self.tracker.update(dets_with_feat)
+            tracked = self.tracker.update(filtered)
         else:
             tracked = filtered
             for i, d in enumerate(tracked):
                 d['track_id'] = i + 1
 
         annotated = draw_detections(panorama, tracked, self.tracker)
-        t[8] = time.perf_counter()
+        t[7] = time.perf_counter()
 
-        # ⑨ 角度计算  [CPU]
+        # ⑧ 角度计算  [CPU]
         angle_info = None
         if tracked and self.angle_calculator:
             kpts_list = [np.array(d['keypoints']) for d in tracked if d.get('keypoints')]
@@ -326,9 +332,8 @@ class FisheyePanoramaYOLOPose:
                 draw_fn = (self.angle_calculator.draw_angle_overview if self.show_angle_overview
                            else self.angle_calculator.draw_angles_on_image)
                 annotated = draw_fn(annotated, angle_info)
-        t[9] = time.perf_counter()
+        t[8] = time.perf_counter()
 
-        # ─── 每 30 帧打印一次各步耗时 ────────────────────────────────
         self._timing_counter += 1
         if self._timing_counter % 30 == 1:
             self._print_timing(t, len(filtered))
@@ -337,7 +342,6 @@ class FisheyePanoramaYOLOPose:
 
     # ──────────────────────────────────────────────────────────────────
     def _sync_angle_calculator(self, frame: np.ndarray) -> None:
-        """同步 angle_calculator 的鱼眼映射参数（仅首次或参数变化时）"""
         if not (self.angle_calculator
                 and hasattr(self.panorama_processor, 'center')
                 and self.panorama_processor.center is not None):
@@ -355,20 +359,18 @@ class FisheyePanoramaYOLOPose:
 
     @staticmethod
     def _print_timing(t: dict, n_det: int) -> None:
-        """打印各步耗时及设备标注"""
         ms = lambda a, b: (t[b] - t[a]) * 1000
         steps = [
-            ("①CPU→GPU",   "CPU→GPU", 0, 1),
-            ("②鱼眼展开",  "GPU",     1, 2),
-            ("③GPU→CPU",   "GPU→CPU", 2, 3),
-            ("④裁剪切片",  "CPU",     3, 4),
-            ("⑤YOLO推理",  "GPU",     4, 5),
-            ("⑥合并过滤",  "CPU",     5, 6),
-            ("⑦特征复用",   "CPU",     6, 7),
-            ("⑧跟踪绘制",  "CPU",     7, 8),
-            ("⑨角度计算",  "CPU",     8, 9),
+            ("①CPU→GPU",  "CPU→GPU", 0, 1),
+            ("②鱼眼展开", "GPU",     1, 2),
+            ("③GPU→CPU",  "GPU→CPU", 2, 3),
+            ("④裁剪切片", "CPU",     3, 4),
+            ("⑤YOLO推理", "GPU",     4, 5),
+            ("⑥合并过滤", "CPU+GPU", 5, 6),
+            ("⑦跟踪绘制", "CPU",     6, 7),
+            ("⑧角度计算", "CPU",     7, 8),
         ]
-        total = (t[9] - t[0]) * 1000
+        total = (t[8] - t[0]) * 1000
         parts = "  ".join(f"{name}[{dev}]={ms(a,b):.1f}ms"
                           for name, dev, a, b in steps)
         print(f"[总耗时 {total:.1f}ms | 检测 {n_det} 人]  {parts}")

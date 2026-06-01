@@ -4,9 +4,17 @@
 import argparse
 
 OSNET_WEIGHT_MAP = {
-    'osnet_ain_x1_0': 'imagenet.pyth/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth',
-    'osnet_x0_25':    'imagenet.pyth/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth',
+    'osnet_ain_x1_0':   'imagenet.pyth/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth',
+    'osnet_x0_25':      'imagenet.pyth/osnet_x0_25_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth',
     'osnet_ain_x1_0_D': 'imagenet.pyth/osnet_ain_x1_0_dukemtmcreid_256x128_amsgrad_ep90_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth',
+}
+
+# torchreid 实际识别的架构名（与 OSNET_WEIGHT_MAP 的 key 一一对应）
+# 不同数据集预训练的变体（如 osnet_ain_x1_0_D）底层架构相同，只是权重文件不同
+OSNET_ARCH_MAP = {
+    'osnet_ain_x1_0':   'osnet_ain_x1_0',
+    'osnet_x0_25':      'osnet_x0_25',
+    'osnet_ain_x1_0_D': 'osnet_ain_x1_0',   # DukeMTMC 权重，同 osnet_ain_x1_0 架构
 }
 
 
@@ -44,7 +52,7 @@ def parse_args():
                         help='鱼眼标定YAML文件路径 (如果不提供则使用内置系数)')
 
     # YOLO参数
-    parser.add_argument('--model-path', type=str, default='./yolo26n-pose.engine', help='YOLO模型路径（.pt 或 .engine）')
+    parser.add_argument('--model-path', type=str, default='./yolo_model/yolo26n-pose.engine', help='YOLO模型路径（.pt 或 .engine）')
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
 
@@ -82,10 +90,20 @@ def parse_args():
     parser.add_argument('--crop-divisor', type=int, default=3,
                         help='裁剪全景图正上方区域的分母，0表示不裁剪，3表示裁剪1/3，以此类推 (默认: 0)')
 
+    # 环绕重叠可视化（调试用）
+    parser.add_argument('--show-wrap-overlap', action='store_true', default=False,
+                        help='在最终显示帧左右各拼接环绕重叠区域副本，验证 slice0/slice2 环绕切片效果')
+
     # 跟踪器选择
     parser.add_argument('--tracker', type=str, default='hybridsort',
                         choices=['none', 'botsort', 'hybridsort'],
                         help='跟踪器类型：none=不使用跟踪，botsort=BoT-SORT，hybridsort=Hybrid-SORT (默认: hybridsort)')
+
+    # 检测框平滑（对两种跟踪器均有效）
+    parser.add_argument('--smooth-bbox', action='store_true', default=True,
+                        help='对输出框做全框 EMA 平滑（中心坐标 + 宽高），减少 YOLO 帧间抖动')
+    parser.add_argument('--smooth-bbox-alpha', type=float, default=0.5,
+                        help='框宽高平滑的 EMA 系数：0=完全用当前帧，1=完全用历史 (默认: 0.5)')
 
     # BoT-SORT 跟踪器参数（--tracker botsort 时生效）
     parser.add_argument('--botsort-match-thresh', type=float, default=0.3,

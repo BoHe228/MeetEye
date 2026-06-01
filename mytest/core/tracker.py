@@ -822,56 +822,60 @@ class BoT_SORTTracker:
         # 预测当前位置
         STrack.multi_predict(strack_pool)
 
+        # ── 预计算检测框两两重叠情况（assignment 和 update 两阶段共用）────────
+        # 必须在 assignment 之前完成，用于：
+        #   1. fuse_score 去偏（重叠框 score→1.0）
+        #   2. ReID 参与分配时屏蔽重叠列（裁图已被污染，参与分配反而帮倒忙）
+        #   3. 确定 update 阶段的 freeze_feat / near_other 标志
+        _FREEZE_IOU_THRESH = 0.3
+        _NEAR_IOU_THRESH   = 0.1
+        freeze_det_cols: set = set()
+        near_det_cols:   set = set()
+        _n_dh = len(detections_high)
+        for _a in range(_n_dh):
+            for _b in range(_a + 1, _n_dh):
+                _iou_ab = box_iou(detections_high[_a].tlbr, detections_high[_b].tlbr)
+                if _iou_ab > _FREEZE_IOU_THRESH:
+                    freeze_det_cols.add(_a)
+                    freeze_det_cols.add(_b)
+                elif _iou_ab > _NEAR_IOU_THRESH:
+                    near_det_cols.add(_a)
+                    near_det_cols.add(_b)
+        _overlap_det_cols = freeze_det_cols | near_det_cols
+
         # 计算IoU距离
         ious_dists = iou_distance(strack_pool, detections_high)
         ious_dists_mask = (ious_dists > self.proximity_thresh)
 
         # 融合检测置信度
-        ious_dists = fuse_score(ious_dists, detections_high)
+        # 重叠检测框（IoU > _NEAR_IOU_THRESH）的 score 临时设为 1.0：
+        # fuse_score 会让高置信度检测对所有轨迹都降低代价，两人bbox重叠时置信度
+        # 差异会把高置信度那个人错误地推给所有轨迹，直接引发 ID 互换。
+        _fuse_scores = np.array([d.score for d in detections_high], dtype=np.float32)
+        for _col in _overlap_det_cols:
+            _fuse_scores[_col] = 1.0
+        ious_dists = 1 - (1 - ious_dists) * _fuse_scores[np.newaxis, :]
 
         # 如果有ReID特征，融合外观距离
         if self.with_reid:
             emb_dists = embedding_distance(strack_pool, detections_high)  # 余弦距离 [0,1]
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[ious_dists_mask] = 1.0  # IoU 不足时不信任 ReID
+            # 重叠检测列：OSNet 裁图包含邻近人体，特征已被污染，不参与分配决策
+            if _overlap_det_cols:
+                emb_dists[:, list(_overlap_det_cols)] = 1.0
             dists = np.minimum(ious_dists, emb_dists)
-            # ⚠️ 注意：不做 reid_veto（用 ReID 强制封锁 IoU 支持的匹配）
-            # 原因：特征在近邻/遮挡期间会被污染，污染的 smooth_feat 会导致
-            # emb_dist(Track_A, Det_A) > appearance_thresh，触发错误否决，
-            # 把正确匹配封掉，反而造成 ID 互换。
-            # 应对近邻污染的手段是特征冻结（near_other / freeze_feat），而不是事后否决。
         else:
             dists = ious_dists
 
         # 线性分配
         matches, u_track, u_detection = linear_assignment(dists, thresh=self.match_thresh, use_hungarian=self.use_hungarian)
 
-        # ── 近邻检测：找出任意两个匹配框之间空间接近的对 ──────────────────
-        # 判断标准：IoU > 0 (框有重叠) 或 中心距离 < 均值框尺寸的 1.5 倍
-        # 两个层级：
-        #   near_other   (轻度接近, IoU > 0 或 距离较近) → alpha=0.98 保护特征
-        #   freeze_feat  (重度重叠, IoU > 0.3)          → 完全跳过特征更新
-        _FREEZE_IOU_THRESH = 0.3   # 重度：完全跳过特征更新
-        _NEAR_IOU_THRESH   = 0.1   # 轻度：IoU > 0.1 即视为框有接触
-        matched_dets = [detections_high[idet] for _, idet in matches]
-        freeze_det_indices: set = set()
-        near_det_indices:   set = set()
-        n_md = len(matched_dets)
-        for _a in range(n_md):
-            for _b in range(_a + 1, n_md):
-                _iou = box_iou(matched_dets[_a].tlbr, matched_dets[_b].tlbr)
-                if _iou > _FREEZE_IOU_THRESH:
-                    freeze_det_indices.add(_a)
-                    freeze_det_indices.add(_b)
-                elif _iou > _NEAR_IOU_THRESH:
-                    near_det_indices.add(_a)
-                    near_det_indices.add(_b)
-
         for _mi, (itracked, idet) in enumerate(matches):
             track = strack_pool[itracked]
             det = detections_high[idet]
-            freeze_feat = (_mi in freeze_det_indices)
-            near_other  = (_mi in near_det_indices)
+            freeze_feat = (idet in freeze_det_cols)
+            near_other  = (idet in near_det_cols)
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id,
                              freeze_feat=freeze_feat, near_other=near_other)
@@ -1191,6 +1195,9 @@ class HybridSortTracker:
         tcm_byte_step_weight: float = 1.0,
         asso_func: str = "iou",
         min_hits: int = 1,
+        # ── 框平滑 ──
+        smooth_bbox: bool = False,       # 是否对输出框宽高做 EMA 平滑
+        smooth_bbox_alpha: float = 0.5,  # EMA 系数，0=纯当前帧，1=纯历史
         # ── 全景图尺寸 ──
         panorama_width: int = 3840,
         panorama_height: int = 1080,
@@ -1299,6 +1306,11 @@ class HybridSortTracker:
         self.prev_track_info: Dict[int, Dict] = {}
         self.temp_id_map: Dict[int, int] = {}
 
+        # 框宽高 EMA 平滑
+        self._smooth_bbox = smooth_bbox
+        self._smooth_bbox_alpha = float(np.clip(smooth_bbox_alpha, 0.0, 0.99))
+        self._bbox_size_cache: Dict[int, Tuple[float, float, float, float]] = {}  # track_id → (cx, cy, w, h)
+
     # ── 内部工具 ─────────────────────────────────────────────────────────────
 
     def _make_inner(self):
@@ -1339,6 +1351,7 @@ class HybridSortTracker:
         self._prev_bbox.clear()
         self.temp_id_map.clear()
         self.prev_track_info.clear()
+        self._bbox_size_cache.clear()
         if self.boundary_tracker is not None:
             self.boundary_tracker.reset()
 
@@ -1449,9 +1462,11 @@ class HybridSortTracker:
             else set()
         )
 
-        # ⑤ 处理消失轨迹 → 注册到边界匹配器 ─────────────────────────────────
+        # ⑤ 处理消失轨迹 → 注册到边界匹配器，并清理框平滑缓存 ──────────────────
         #    消失轨迹 = 上帧活跃、本帧不活跃的轨迹
         lost_ids = self._prev_active_ids - current_active_ids
+        for _lost in lost_ids:
+            self._bbox_size_cache.pop(_lost, None)
         if self.enable_boundary_matching and self.boundary_tracker is not None:
             for lost_id in lost_ids:
                 smooth_feat = self._feat_cache.get(lost_id)
@@ -1564,7 +1579,26 @@ class HybridSortTracker:
                 final_track_id = track_id
                 boundary_matched = False
 
-            # ── e. 构建输出 dict（字段与 BoT_SORTTracker 完全相同） ──────────
+            # ── e. 全框 EMA 平滑（--smooth-bbox）─────────────────────────────
+            # 同时平滑中心坐标（cx/cy）和宽高（w/h）：
+            # 仅平滑宽高在框大小稳定时几乎无效；中心坐标才是帧间抖动的主要来源。
+            if self._smooth_bbox:
+                cx = (out_bbox[0] + out_bbox[2]) / 2
+                cy = (out_bbox[1] + out_bbox[3]) / 2
+                w  = out_bbox[2] - out_bbox[0]
+                h  = out_bbox[3] - out_bbox[1]
+                _cached = self._bbox_size_cache.get(track_id)
+                if _cached is not None and len(_cached) == 4:  # 防御旧格式 2-tuple
+                    pcx, pcy, pw, ph = _cached
+                    a = self._smooth_bbox_alpha
+                    cx = a * pcx + (1 - a) * cx
+                    cy = a * pcy + (1 - a) * cy
+                    w  = a * pw  + (1 - a) * w
+                    h  = a * ph  + (1 - a) * h
+                self._bbox_size_cache[track_id] = (cx, cy, w, h)
+                out_bbox = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+
+            # ── f. 构建输出 dict（字段与 BoT_SORTTracker 完全相同） ──────────
             out_feat = smooth_feat[np.newaxis, :] if smooth_feat is not None else None
             det_out = {
                 'bbox':              out_bbox,
