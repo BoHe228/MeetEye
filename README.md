@@ -12,7 +12,7 @@ Detects, tracks, and estimates the azimuth, elevation, and distance of every per
 > Small conference room · 4 persons · blackboard discussion  
 > HybridSORT tracking · OSNet ReID · 3-slice panorama · 960 × 630
 
-[![▶ Click to play demo (8.5 MB)](docs/demo_preview.jpg)](docs/demo_compressed.mp4)
+https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181
 
 <!-- To embed as an inline video player:
      1. Open the GitHub web editor for this README
