@@ -1,0 +1,3 @@
+[submodule "mytest/VGDSE/FunASR"]
+	path = mytest/VGDSE/FunASR
+	url = https://github.com/modelscope/FunASR.git
