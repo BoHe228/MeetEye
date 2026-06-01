@@ -12,7 +12,7 @@
 > 小会议室 · 4 人黑板交流  
 > HybridSORT 跟踪 · OSNet ReID · 3 切片全景 · 960 × 630
 
-[![▶ 点击播放演示视频（8.5 MB）](docs/demo_preview.jpg)](docs/demo_compressed.mp4)
+https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181
 
 <!-- 实现页面内嵌播放器的步骤：
      1. 在 GitHub 网页上打开此 README 的编辑器
