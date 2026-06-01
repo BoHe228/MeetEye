@@ -232,15 +232,34 @@ class KalmanBoxTracker(object):
                         # break
                 if previous_box is None:
                     previous_box = self.last_observation
-                    self.velocity_lt = speed_direction_lt(previous_box, bbox)
-                    self.velocity_rt = speed_direction_rt(previous_box, bbox)
-                    self.velocity_lb = speed_direction_lb(previous_box, bbox)
-                    self.velocity_rb = speed_direction_rb(previous_box, bbox)
+                    new_vel_lt = speed_direction_lt(previous_box, bbox)
+                    new_vel_rt = speed_direction_rt(previous_box, bbox)
+                    new_vel_lb = speed_direction_lb(previous_box, bbox)
+                    new_vel_rb = speed_direction_rb(previous_box, bbox)
                 else:
-                    self.velocity_lt = velocity_lt
-                    self.velocity_rt = velocity_rt
-                    self.velocity_lb = velocity_lb
-                    self.velocity_rb = velocity_rb
+                    new_vel_lt = velocity_lt
+                    new_vel_rt = velocity_rt
+                    new_vel_lb = velocity_lb
+                    new_vel_rb = velocity_rb
+
+                _cx_ref = (previous_box[0] + previous_box[2]) * 0.5
+                _cy_ref = (previous_box[1] + previous_box[3]) * 0.5
+                _cx_cur = (bbox[0] + bbox[2]) * 0.5
+                _cy_cur = (bbox[1] + bbox[3]) * 0.5
+                _disp = np.sqrt((_cx_cur - _cx_ref) ** 2 + (_cy_cur - _cy_ref) ** 2)
+                _avg_h = max((previous_box[3] - previous_box[1] + bbox[3] - bbox[1]) * 0.5, 1.0)
+                _kf_damp = False
+                if _disp >= 0.05 * _avg_h:
+                    self.velocity_lt = new_vel_lt
+                    self.velocity_rt = new_vel_rt
+                    self.velocity_lb = new_vel_lb
+                    self.velocity_rb = new_vel_rb
+                elif self.velocity_lt is not None:
+                    self.velocity_lt = self.velocity_lt * 0.3
+                    self.velocity_rt = self.velocity_rt * 0.3
+                    self.velocity_lb = self.velocity_lb * 0.3
+                    self.velocity_rb = self.velocity_rb * 0.3
+                    _kf_damp = True
             """
               Insert new observations. This is a ugly way to maintain both self.observations
               and self.history_observations. Bear it for the moment.
@@ -255,6 +274,9 @@ class KalmanBoxTracker(object):
             self.hits += 1
             self.hit_streak += 1
             self.kf.update(convert_bbox_to_z(bbox))
+            if _kf_damp:
+                self.kf.x[5] *= 0.3  # vx
+                self.kf.x[6] *= 0.3  # vy
             # add interface for update feature or not
             if update_feature:
                 if self.args.adapfs:
@@ -275,6 +297,12 @@ class KalmanBoxTracker(object):
             self.kf.x[7] *= 0.0
 
         self.kf.predict()
+        # 卡尔曼预测后 x[2](面积) 或 x[4](宽高比) 可能被速度项拉成负数
+        # 钳位到最小正值，避免 convert_x_to_bbox 中 sqrt(负数) 产生 nan
+        if self.kf.x[2] <= 0:
+            self.kf.x[2] = 1e-6
+        if self.kf.x[4] <= 0:
+            self.kf.x[4] = 1e-6
         self.age += 1
         if(self.time_since_update > 0):
             self.hit_streak = 0
