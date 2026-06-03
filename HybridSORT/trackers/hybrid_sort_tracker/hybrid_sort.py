@@ -86,6 +86,18 @@ def speed_direction_rb(bbox1, bbox2):
     norm = np.sqrt((cy2-cy1)**2 + (cx2-cx1)**2) + 1e-6
     return speed / norm
 
+def _normalize_vel(vel):
+    """将速度方向向量单位化（模长归一）。
+
+    上游实现把最近 delta_t 帧的方向向量直接累加（未除以帧数），模长可达 ~delta_t，
+    使 association.cost_vel 中 inertia·dir 的点积超出 [-1,1] 被 np.clip 截断饱和，
+    VDC 方向一致性代价退化为近二值。单位化后点积恢复为真实余弦，方向代价随夹角平滑变化。
+    """
+    if vel is None:
+        return vel
+    n = np.sqrt((vel ** 2).sum()) + 1e-6
+    return vel / n
+
 class KalmanBoxTracker(object):
     """
     This class represents the internal state of individual tracked objects observed as bbox.
@@ -183,6 +195,7 @@ class KalmanBoxTracker(object):
         velocity_lb = None
         velocity_rb = None
         if bbox is not None:
+            _kf_damp = False
             if self.last_observation.sum() >= 0:  # no previous observation
                 previous_box = None
                 for i in range(self.delta_t):
@@ -213,6 +226,12 @@ class KalmanBoxTracker(object):
                     new_vel_rt = velocity_rt
                     new_vel_lb = velocity_lb
                     new_vel_rb = velocity_rb
+
+                # 速度向量单位化（修正上游多帧累加导致的模长>1、VDC 余弦饱和问题）
+                new_vel_lt = _normalize_vel(new_vel_lt)
+                new_vel_rt = _normalize_vel(new_vel_rt)
+                new_vel_lb = _normalize_vel(new_vel_lb)
+                new_vel_rb = _normalize_vel(new_vel_rb)
 
                 # 位移幅值门控：以 previous_box（最多 delta_t 帧前的最老观测）到当前检测
                 # 的中心距离衡量运动幅度。位移 < 5% 体高视为近静止（如偏头），此时衰减而非
@@ -312,7 +331,7 @@ ASSO_FUNCS = {  "iou": iou_batch,
 class Hybrid_Sort(object):
     def __init__(self, args, det_thresh, max_age=30, min_hits=3,
         iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, use_byte=False,
-        low_thresh=0.1):
+        low_thresh=0.1, new_track_thresh=None):
         """
         Sets key parameters for SORT
         """
@@ -323,6 +342,9 @@ class Hybrid_Sort(object):
         self.frame_count = 0
         self.det_thresh = det_thresh
         self.low_thresh = low_thresh
+        # 新轨迹生成阈值：仅置信度 >= 此值的未匹配高分检测才会创建新轨迹。
+        # 默认回退到 det_thresh（与原行为一致）；设为更高值可抑制低质量检测起新 ID。
+        self.new_track_thresh = new_track_thresh if new_track_thresh is not None else det_thresh
         self.delta_t = delta_t
         self.asso_func = ASSO_FUNCS[asso_func]
         self.inertia = inertia
@@ -461,6 +483,8 @@ class Hybrid_Sort(object):
 
         # create and initialise new trackers for unmatched detections
         for i in unmatched_dets:
+            if dets[i, 4] < self.new_track_thresh:
+                continue  # 置信度低于新轨迹阈值，不生成新 ID
             trk = KalmanBoxTracker(dets[i, :], delta_t=self.delta_t, args=self.args)
             self.trackers.append(trk)
         i = len(self.trackers)
