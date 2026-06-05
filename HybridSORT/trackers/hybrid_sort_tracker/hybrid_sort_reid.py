@@ -100,6 +100,25 @@ def _normalize_vel(vel):
     n = np.sqrt((vel ** 2).sum()) + 1e-6
     return vel / n
 
+
+def _center_dist_normalized(dets, trks):
+    """归一化中心点距离矩阵（以框高度归一化），对框大小变化鲁棒。"""
+    n_d, n_t = len(dets), len(trks)
+    mat = np.full((n_d, n_t), np.inf, dtype=np.float32)
+    for i in range(n_d):
+        cx_d = (dets[i, 0] + dets[i, 2]) / 2.0
+        cy_d = (dets[i, 1] + dets[i, 3]) / 2.0
+        h_d = max(dets[i, 3] - dets[i, 1], 1.0)
+        for j in range(n_t):
+            if trks[j, 0] < 0:
+                continue
+            cx_t = (trks[j, 0] + trks[j, 2]) / 2.0
+            cy_t = (trks[j, 1] + trks[j, 3]) / 2.0
+            h_t = max(trks[j, 3] - trks[j, 1], 1.0)
+            dist = np.sqrt((cx_d - cx_t) ** 2 + (cy_d - cy_t) ** 2)
+            mat[i, j] = dist / ((h_d + h_t) / 2.0)
+    return mat
+
 class KalmanBoxTracker(object):
     """
     This class represents the internal state of individual tracked objects observed as bbox.
@@ -145,8 +164,9 @@ class KalmanBoxTracker(object):
         self.kf.x[:5] = convert_bbox_to_z(bbox)
 
         self.time_since_update = 0
-        self.id = KalmanBoxTracker.count
-        KalmanBoxTracker.count += 1
+        # 延迟 ID 分配：创建时不占用全局计数器，待轨迹确认（连续命中达到 min_hits）后再分配。
+        # -1 表示尚未确认；避免瞬时误检消耗 ID 号导致编号跳变/膨胀。
+        self.id = -1
         self.history = []
         self.hits = 0
         self.hit_streak = 0
@@ -356,7 +376,8 @@ ASSO_FUNCS = {  "iou": iou_batch,
 
 class Hybrid_Sort_ReID(object):
     def __init__(self, args, det_thresh, max_age=30, min_hits=3,
-        iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, new_track_thresh=None):
+        iou_threshold=0.3, delta_t=3, asso_func="iou", inertia=0.2, new_track_thresh=None,
+        new_track_overlap_thresh=0.6):
         """
         Sets key parameters for SORT
         """
@@ -369,6 +390,9 @@ class Hybrid_Sort_ReID(object):
         # 新轨迹生成阈值：仅置信度 >= 此值的未匹配高分检测才会创建新轨迹。
         # 默认回退到 det_thresh（与原行为一致）；设为更高值可抑制低质量检测起新 ID。
         self.new_track_thresh = new_track_thresh if new_track_thresh is not None else det_thresh
+        # 保持旧 ID 优先：未匹配检测若与任一现有轨迹 IoU > 此值，则不新建轨迹（视为重复/抖动）。
+        # 1.0 表示关闭该抑制。越小越倾向"宁可不出新 ID 也不抢号"。
+        self.new_track_overlap_thresh = new_track_overlap_thresh
         self.delta_t = delta_t
         self.asso_func = ASSO_FUNCS[asso_func]
         self.inertia = inertia
@@ -570,6 +594,12 @@ class Hybrid_Sort_ReID(object):
         for i in unmatched_dets:
             if dets[i, 4] < self.new_track_thresh:
                 continue  # 置信度低于新轨迹阈值，不生成新 ID
+            # 保持旧 ID 优先：与任一现有轨迹（含本帧刚新建的）显著重叠的检测不另起新轨迹，
+            # 避免边界重复检测/抖动生成抢号的重复轨迹。
+            if self.new_track_overlap_thresh < 1.0 and len(self.trackers) > 0:
+                exist_boxes = np.array([t.get_state()[0][:4] for t in self.trackers], dtype=np.float32)
+                if iou_batch(dets[i, :4][None, :], exist_boxes).max() > self.new_track_overlap_thresh:
+                    continue
             trk = KalmanBoxTracker(dets[i, :], id_feature_keep[i, :], delta_t=self.delta_t, args=self.args)
             self.trackers.append(trk)
         i = len(self.trackers)
@@ -582,12 +612,24 @@ class Hybrid_Sort_ReID(object):
                     we didn't notice significant difference here
                 """
                 d = trk.last_observation[:4]
-            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+            # 确认 vs 显示解耦：
+            #   · 未确认轨迹(id<0)需连续命中达到 min_hits 才"确认"并首次分配 ID（严苛新增）；
+            #   · 已确认轨迹(id>=0)只要本帧有匹配就显示，不因遮挡后 hit_streak 被 predict 重置
+            #     而被再次抑制——否则每次遮挡后已确认目标会凭空消失 min_hits 帧（仍保留 ID）。
+            is_confirmed = (trk.id >= 0) or (trk.hit_streak >= self.min_hits)
+            if (trk.time_since_update < 1) and is_confirmed:
+                if trk.id < 0:
+                    trk.id = KalmanBoxTracker.count
+                    KalmanBoxTracker.count += 1
                 # +1 as MOT benchmark requires positive
                 ret.append(np.concatenate((d, [trk.id+1])).reshape(1, -1))
             i -= 1
             # remove dead tracklet
-            if(trk.time_since_update > self.max_age):
+            if trk.time_since_update > self.max_age:
+                self.trackers.pop(i)
+            # 未确认轨迹（尚未分配 ID）一旦发生漏检立即删除：强制连续 min_hits 帧命中才确认，
+            # 杜绝闪烁式误检（检到-丢-检到）在多帧后侥幸累积确认并占用新 ID。
+            elif trk.id < 0 and trk.time_since_update >= 1:
                 self.trackers.pop(i)
         if(len(ret) > 0):
             return np.concatenate(ret)

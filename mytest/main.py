@@ -40,10 +40,19 @@ from utils import (
     draw_yolo_only,
     draw_detections,
     filter_cross_boundary_detections,
+    compute_stable_bbox_from_keypoints,
 )
 
 # 导入特征提取器
 from utils.feature_extractor import FeatureExtractor
+
+# 导入人脸识别（可选）
+try:
+    from face_rec.face_rec_manager import FaceRecManager
+    _FACE_REC_AVAILABLE = True
+except Exception as _e:
+    _FACE_REC_AVAILABLE = False
+    print(f"[FaceRec] 导入失败，人脸识别不可用: {_e}")
 
 # ── 全局 CUDA 标志（导入时确定一次）─────────────────────────────────────
 _CUDA = torch.cuda.is_available()
@@ -92,6 +101,21 @@ class FisheyePanoramaYOLOPose:
         self.angle_calculator = None
         self.show_angles = True
         self.show_angle_overview = False
+        self.show_id: bool = getattr(args, 'show_id', True)
+        self.show_conf: bool = getattr(args, 'show_conf', True)
+        self.show_angle: bool = getattr(args, 'show_angle', False)
+        self.show_arrow: bool = getattr(args, 'show_arrow', False)
+        self.kpt_display: bool = getattr(args, 'kpt_display', False)
+        self.kpt_track: bool = getattr(args, 'kpt_track', False)
+        self.kpt_bbox_conf: float = getattr(args, 'kpt_bbox_conf', 0.3)
+        self.kpt_bbox_padding: float = getattr(args, 'kpt_bbox_padding', 0.15)
+        self.kpt_bbox_padding_v: float = getattr(args, 'kpt_bbox_padding_v', 0.3)
+        self.kpt_bbox_upper_only: bool = getattr(args, 'kpt_bbox_upper_only', True)
+
+        # 人脸识别
+        self.face_rec: Optional[FaceRecManager] = None
+        self._face_name_map: Dict[int, str] = {}   # track_id → person_name
+        self._prev_track_ids: set = set()
         self.num_slices = getattr(args, 'num_slices', 3)
         self.slice_overlap = getattr(args, 'slice_overlap', 0.05)
         self.use_tracker = (args.tracker != 'none')
@@ -110,7 +134,8 @@ class FisheyePanoramaYOLOPose:
             self.slicer = PanoramaSlicer(
                 overlap_ratio=self.slice_overlap,
                 iou_threshold=0.2,
-                reid_similarity_threshold=0.7
+                reid_similarity_threshold=0.7,
+                dedup_use_reid=getattr(args, 'dedup_use_reid', False),
             )
 
         # 边界匹配公共参数（两种 tracker 共用）
@@ -140,29 +165,39 @@ class FisheyePanoramaYOLOPose:
                 reid_lost_thresh=args.reid_lost_thresh,
                 with_reid=True,
                 use_hungarian=args.use_hungarian,
+                kalman_bbox=getattr(args, 'kalman_bbox', False),
                 **_boundary_kwargs,
             )
         elif args.tracker == 'hybridsort':
             self.tracker = HybridSortTracker(
                 # ── 置信度阈值 ──────────────────────────────────────────────
-                track_high_thresh=0.5,
+                track_high_thresh=0.4,
                 track_low_thresh=0.1,
+                # 新增 ID 严苛化①：置信度门控。仅 conf >= 0.6 的未匹配高分检测才生成候选轨迹
+                # （> det_thresh=0.5，过滤掉刚过线的低质量检测）。
                 new_track_thresh=0.5,
                 # ── 轨迹生命周期 ────────────────────────────────────────────
-                track_buffer=150,
+                track_buffer=500,
                 frame_rate=30,
                 # ── 关联阈值 ────────────────────────────────────────────────
-                match_thresh=0.2,
+                # 帧间 IoU 关联门限调低（0.2→0.15）：检测框/人体小幅晃动时更容易关联回
+                # 原轨迹，减少"旧轨迹还在却没接上→另起新号"的碎片化（代价：略增误配风险）。
+                match_thresh=0.15,
                 # ── Hybrid-SORT 专有参数 ─────────────────────────────────────
-                inertia=0.2,
-                delta_t=3,
+                inertia=0.1,
+                delta_t=4,
                 use_byte=True,
                 tcm_first_step=True,
-                tcm_first_step_weight=1,
+                tcm_first_step_weight=0.5,
                 tcm_byte_step=True,
-                tcm_byte_step_weight=1,
+                tcm_byte_step_weight=0.5,
                 asso_func="iou",
-                min_hits=1,
+                # 新增 ID 严苛化②：连续命中门控。候选轨迹需连续命中 3 帧才确认并分配 ID，
+                # 未确认期间漏检即删除、且不占用全局 ID 计数器（见 hybrid_sort 延迟分配逻辑）。
+                min_hits=3,
+                # Round 3.5 兜底：IoU < match_thresh 但中心距离 < cd_thresh 倍框高时强制关联
+                # 应对遮挡后框大小变化导致 IoU 不足进而重新生成 ID 的问题
+                cd_thresh=0.5,
                 # ── ReID ────────────────────────────────────────────────────
                 with_reid=args.use_reid,
                 reid_emb_weight_high=args.reid_emb_weight_high,
@@ -173,6 +208,8 @@ class FisheyePanoramaYOLOPose:
                 # ── 框平滑 ──────────────────────────────────────────────────
                 smooth_bbox=getattr(args, 'smooth_bbox', False),
                 smooth_bbox_alpha=getattr(args, 'smooth_bbox_alpha', 0.5),
+                # ── Kalman 轨迹框 ────────────────────────────────────────────
+                kalman_bbox=getattr(args, 'kalman_bbox', False),
                 **_boundary_kwargs,
             )
         else:
@@ -247,22 +284,44 @@ class FisheyePanoramaYOLOPose:
         )
 
         # ── OSNet 特征提取器 ─────────────────────────────────────────
-        print(f"初始化OSNet特征提取器 ({self.osnet_model_name})...")
-        try:
-            self.feature_extractor = FeatureExtractor(
-                model_name=self.osnet_model_name,
-                model_path=self.osnet_model_path
-            )
-            if _CUDA:
-                self.feature_extractor.extractor.model.to('cuda')
-                self.feature_extractor.device = 'cuda'
-                print("OSNet 已移至 GPU（FP32，BatchNorm 不支持 FP16）")
-            else:
-                print("OSNet 特征提取器初始化成功（CPU 模式）")
-        except Exception as e:
-            print(f"警告: OSNet特征提取器初始化失败: {e}")
-            print("将不使用ReID特征进行跟踪")
+        if getattr(self.args, 'use_osnet', True):
+            print(f"初始化OSNet特征提取器 ({self.osnet_model_name})...")
+            try:
+                self.feature_extractor = FeatureExtractor(
+                    model_name=self.osnet_model_name,
+                    model_path=self.osnet_model_path
+                )
+                if _CUDA:
+                    self.feature_extractor.extractor.model.to('cuda')
+                    self.feature_extractor.device = 'cuda'
+                    print("OSNet 已移至 GPU（FP32，BatchNorm 不支持 FP16）")
+                else:
+                    print("OSNet 特征提取器初始化成功（CPU 模式）")
+            except Exception as e:
+                print(f"警告: OSNet特征提取器初始化失败: {e}")
+                print("将不使用ReID特征进行跟踪")
+                self.feature_extractor = None
+        else:
+            print("OSNet 特征提取已禁用（--no-use-osnet）")
             self.feature_extractor = None
+
+        # ── 人脸识别 ─────────────────────────────────────────────────────
+        if getattr(self.args, 'use_face_rec', False):
+            if not _FACE_REC_AVAILABLE:
+                print("警告: FaceRecManager 不可用，跳过人脸识别初始化")
+            else:
+                try:
+                    self.face_rec = FaceRecManager(
+                        model_path=self.args.face_rec_model,
+                        library_dir=self.args.face_library_dir,
+                        threshold=getattr(self.args, 'face_rec_threshold', 0.35),
+                        frontal_yaw_thresh=getattr(self.args, 'face_frontal_threshold', 0.35),
+                        cooldown_frames=getattr(self.args, 'face_rec_cooldown', 30),
+                        device='cuda' if _CUDA else 'cpu',
+                    )
+                except Exception as e:
+                    print(f"警告: 人脸识别初始化失败: {e}")
+                    self.face_rec = None
 
         print("初始化完成！")
         return True
@@ -409,6 +468,16 @@ class FisheyePanoramaYOLOPose:
         t[6] = time.perf_counter()
 
         # ⑦ 跟踪 + 绘制  [CPU]
+        if self.kpt_track:
+            for det in filtered_detections:
+                det['bbox'] = compute_stable_bbox_from_keypoints(
+                    det.get('keypoints', []),
+                    conf_thresh=self.kpt_bbox_conf,
+                    padding=self.kpt_bbox_padding,
+                    fallback_bbox=det['bbox'],
+                    upper_body_only=self.kpt_bbox_upper_only,
+                    padding_v=self.kpt_bbox_padding_v,
+                )
         if self.use_tracker:
             tracked_detections = self.tracker.update(filtered_detections)
         else:
@@ -417,7 +486,33 @@ class FisheyePanoramaYOLOPose:
                 det['track_id'] = i + 1
 
         yolo_only_image = draw_yolo_only(panorama, filtered_detections)
-        annotated_panorama = draw_detections(panorama, tracked_detections, self.tracker)
+
+        # ⑦-b 人脸识别  [CPU/GPU]
+        current_ids = {d['track_id'] for d in tracked_detections}
+        new_ids = current_ids - self._prev_track_ids
+        if self.face_rec is not None:
+            for det in tracked_detections:
+                tid = det['track_id']
+                kpts = det.get('keypoints', [])
+                self.face_rec.process_detection(
+                    panorama, kpts, tid,
+                    is_new_track=(tid in new_ids),
+                    face_name_map=self._face_name_map,
+                    frame_id=self._timing_counter,
+                )
+            for gone in (set(self._face_name_map) - current_ids):
+                self._face_name_map.pop(gone, None)
+                self.face_rec.cleanup_track(gone)
+        self._prev_track_ids = current_ids
+
+        annotated_panorama = draw_detections(panorama, tracked_detections, self.tracker,
+                                             show_id=self.show_id, show_conf=self.show_conf,
+                                             face_name_map=self._face_name_map,
+                                             use_kpt_bbox=self.kpt_display,
+                                             kpt_bbox_conf=self.kpt_bbox_conf,
+                                             kpt_bbox_padding=self.kpt_bbox_padding,
+                                             kpt_bbox_upper_only=self.kpt_bbox_upper_only,
+                                             kpt_bbox_padding_v=self.kpt_bbox_padding_v)
         t[7] = time.perf_counter()
 
         # ⑧ 角度计算  [CPU]
@@ -428,9 +523,15 @@ class FisheyePanoramaYOLOPose:
                 angle_info = self.angle_calculator.calculate_angles_from_keypoints(
                     np.array(kpts_list)
                 )
-                draw_fn = (self.angle_calculator.draw_angle_overview if self.show_angle_overview
-                           else self.angle_calculator.draw_angles_on_image)
-                annotated_panorama = draw_fn(annotated_panorama, angle_info)
+                if self.show_angle_overview:
+                    annotated_panorama = self.angle_calculator.draw_angle_overview(
+                        annotated_panorama, angle_info)
+                else:
+                    annotated_panorama = self.angle_calculator.draw_angles_on_image(
+                        annotated_panorama, angle_info,
+                        show_angle=self.show_angle,
+                        show_arrow=self.show_arrow,
+                    )
         t[8] = time.perf_counter()
 
         # ── 每 30 帧打印一次各步耗时 ─────────────────────────────────
@@ -532,6 +633,44 @@ class FisheyePanoramaYOLOPose:
         print(f"  检测到 {len(detection_results) if detection_results else 0} 个人")
 
     # ──────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _resolve_video_path(output_dir: str, name: Optional[str],
+                            default_stem: str, timestamp: str) -> str:
+        """解析视频输出路径：指定了 --video-name 则用它（自动补 .mp4），否则用带时间戳的默认名"""
+        if name:
+            if not name.endswith('.mp4'):
+                name += '.mp4'
+            return os.path.join(output_dir, name)
+        return os.path.join(output_dir, f'{default_stem}_{timestamp}.mp4')
+
+    def _create_single_video_writer(self, output_dir: str, timestamp: str,
+                                    sample: np.ndarray) -> cv2.VideoWriter:
+        """根据首帧显示图像尺寸创建单窗口 VideoWriter（懒初始化）"""
+        path = self._resolve_video_path(output_dir, self.args.video_name,
+                                        'detection_result', timestamp)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(path, fourcc, self.args.video_fps,
+                                 (sample.shape[1], sample.shape[0]))
+        print(f"正在保存视频到: {path}")
+        return writer
+
+    def _create_dual_video_writers(self, output_dir: str, timestamp: str,
+                                   yolo_sample: np.ndarray,
+                                   final_sample: np.ndarray):
+        """根据首帧显示图像尺寸创建双窗口 VideoWriter（懒初始化），返回 (yolo_writer, final_writer)"""
+        yolo_path = self._resolve_video_path(output_dir, self.args.yolo_video_name,
+                                             'yolo_detection', timestamp)
+        final_path = self._resolve_video_path(output_dir, self.args.video_name,
+                                              'final_result', timestamp)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        yolo_writer = cv2.VideoWriter(yolo_path, fourcc, self.args.video_fps,
+                                      (yolo_sample.shape[1], yolo_sample.shape[0]))
+        final_writer = cv2.VideoWriter(final_path, fourcc, self.args.video_fps,
+                                       (final_sample.shape[1], final_sample.shape[0]))
+        print(f"正在保存视频到:\n  {yolo_path}\n  {final_path}")
+        return yolo_writer, final_writer
+
+    # ──────────────────────────────────────────────────────────────────
     def run(self):
         """运行主循环"""
         if self.args.folder_path:
@@ -580,68 +719,15 @@ class FisheyePanoramaYOLOPose:
         video_writer = None
         yolo_video_writer = None
 
+        # VideoWriter 在主循环首帧根据实际显示尺寸懒初始化。
+        # 早期实现会先抓一帧 test_frame 跑完整 process_panorama_slices() 只为拿尺寸，
+        # 再 set(POS_FRAMES, 0) 回退——但那次调用已经把首帧喂进 tracker.update / 人脸识别，
+        # 回退后首帧又被处理一遍，导致首帧轨迹初始化重复、track_id 偏移。改为懒初始化后
+        # 首帧只处理一次，建 writer 所需尺寸直接取自该帧的显示图像。
+        timestamp = None
         if self.args.save_video:
             import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            ret, test_frame = self.camera.get_frame()
-            if ret:
-                # 第一帧：触发 GPU 全景处理器懒初始化
-                panorama, yolo_only_frame, annotated_frame, _, _ = self.process_panorama_slices(test_frame)
-                useful_area = self.panorama_processor.get_useful_area(test_frame)
-
-                if self.args.use_dual_windows:
-                    yolo_display = self.display_manager.add_info_overlay(
-                        yolo_only_frame, "YOLO Detection Only", "", ""
-                    )
-                    final_display = self.display_manager.create_layout(
-                        test_frame, useful_area, annotated_frame, self.args.display_scale
-                    )
-                    if self.args.yolo_video_name:
-                        yolo_video_filename = self.args.yolo_video_name
-                        if not yolo_video_filename.endswith('.mp4'):
-                            yolo_video_filename += '.mp4'
-                        yolo_video_path = os.path.join(output_dir, yolo_video_filename)
-                    else:
-                        yolo_video_path = os.path.join(output_dir, f'yolo_detection_{timestamp}.mp4')
-
-                    if self.args.video_name:
-                        final_video_filename = self.args.video_name
-                        if not final_video_filename.endswith('.mp4'):
-                            final_video_filename += '.mp4'
-                        final_video_path = os.path.join(output_dir, final_video_filename)
-                    else:
-                        final_video_path = os.path.join(output_dir, f'final_result_{timestamp}.mp4')
-
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    yolo_video_writer = cv2.VideoWriter(
-                        yolo_video_path, fourcc, self.args.video_fps,
-                        (yolo_display.shape[1], yolo_display.shape[0])
-                    )
-                    video_writer = cv2.VideoWriter(
-                        final_video_path, fourcc, self.args.video_fps,
-                        (final_display.shape[1], final_display.shape[0])
-                    )
-                    print(f"正在保存视频到:\n  {yolo_video_path}\n  {final_video_path}")
-                else:
-                    display_image = self.display_manager.create_layout(
-                        test_frame, useful_area, annotated_frame, self.args.display_scale
-                    )
-                    if self.args.video_name:
-                        video_filename = self.args.video_name
-                        if not video_filename.endswith('.mp4'):
-                            video_filename += '.mp4'
-                        video_path = os.path.join(output_dir, video_filename)
-                    else:
-                        video_path = os.path.join(output_dir, f'detection_result_{timestamp}.mp4')
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    video_writer = cv2.VideoWriter(
-                        video_path, fourcc, self.args.video_fps,
-                        (display_image.shape[1], display_image.shape[0])
-                    )
-                    print(f"正在保存视频到: {video_path}")
-
-                self.camera.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         while True:
             ret, frame = self.camera.get_frame()
@@ -721,7 +807,11 @@ class FisheyePanoramaYOLOPose:
                 )
                 self.display_manager.show_dual(yolo_display, final_display)
 
-                if self.args.save_video and video_writer and yolo_video_writer:
+                if self.args.save_video:
+                    if video_writer is None:
+                        yolo_video_writer, video_writer = self._create_dual_video_writers(
+                            output_dir, timestamp, yolo_display, final_display
+                        )
                     yolo_video_writer.write(yolo_display)
                     video_writer.write(final_display)
             else:
@@ -733,7 +823,11 @@ class FisheyePanoramaYOLOPose:
                 )
                 self.display_manager.show(display_image)
 
-                if self.args.save_video and video_writer:
+                if self.args.save_video:
+                    if video_writer is None:
+                        video_writer = self._create_single_video_writer(
+                            output_dir, timestamp, display_image
+                        )
                     video_writer.write(display_image)
 
             key = cv2.waitKey(1) & 0xFF

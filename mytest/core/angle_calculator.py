@@ -311,7 +311,8 @@ class AngleCalculator:
         return azimuth_deg, elevation_deg
     
     
-    def draw_angles_on_image(self, image: np.ndarray, angle_info: Dict) -> np.ndarray:
+    def draw_angles_on_image(self, image: np.ndarray, angle_info: Dict,
+                             show_angle: bool = True, show_arrow: bool = True) -> np.ndarray:
         """
         在图像上绘制角度信息
         
@@ -339,54 +340,56 @@ class AngleCalculator:
             cv2.circle(annotated_image, (int(nose_x), int(nose_y)), 6, (0, 255, 255), -1)  # 黄色
             cv2.circle(annotated_image, (int(nose_x), int(nose_y)), 8, (0, 165, 255), 2)   # 橙色边框
 
-            # 创建角度文本
-            angle_text = f"P{person_id}: A={azimuth:.1f}, E={elevation:.1f}"
+            if show_angle:
+                # 创建角度文本
+                angle_text = f"P{person_id}: A={azimuth:.1f}, E={elevation:.1f}"
 
-            # 添加头部方向信息
-            if head_direction != "unknown":
-                angle_text += f" ({head_direction})"
+                # 添加头部方向信息
+                if head_direction != "unknown":
+                    angle_text += f" ({head_direction})"
 
-            # 文本位置（在鼻子下方）
-            text_x = int(nose_x)
-            text_y = int(nose_y) + 25
+                # 文本位置（在鼻子下方）
+                text_x = int(nose_x)
+                text_y = int(nose_y) + 25
 
-            # 绘制文本背景
-            (text_width, text_height), baseline = cv2.getTextSize(
-                angle_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2
-            )
+                # 绘制文本背景
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    angle_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2
+                )
 
-            # 背景矩形 - 黄色背景
-            cv2.rectangle(
-                annotated_image,
-                (text_x - 5, text_y - text_height - 5),
-                (text_x + text_width + 5, text_y + 5),
-                (0, 255, 255),  # 黄色背景
-                -1
-            )
+                # 背景矩形 - 黄色背景
+                cv2.rectangle(
+                    annotated_image,
+                    (text_x - 5, text_y - text_height - 5),
+                    (text_x + text_width + 5, text_y + 5),
+                    (0, 255, 255),  # 黄色背景
+                    -1
+                )
 
-            # 绘制角度文本 - 黑色文字
-            cv2.putText(
-                annotated_image,
-                angle_text,
-                (text_x, text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 0),  # 黑色文本
-                2
-            )
-            
-            # 绘制角度指示线（从中心指向鼻子）
-            center_x = self.panorama_width // 2
-            center_y = self.panorama_height // 2
-            
-            cv2.arrowedLine(
-                annotated_image,
-                (center_x, center_y),
-                (int(nose_x), int(nose_y)),
-                (255, 0, 0),  # 蓝色箭头
-                2,
-                tipLength=0.05
-            )
+                # 绘制角度文本 - 黑色文字
+                cv2.putText(
+                    annotated_image,
+                    angle_text,
+                    (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 0),  # 黑色文本
+                    2
+                )
+
+            if show_arrow:
+                # 绘制角度指示线（从中心指向鼻子）
+                center_x = self.panorama_width // 2
+                center_y = self.panorama_height // 2
+
+                cv2.arrowedLine(
+                    annotated_image,
+                    (center_x, center_y),
+                    (int(nose_x), int(nose_y)),
+                    (255, 0, 0),  # 蓝色箭头
+                    2,
+                    tipLength=0.05
+                )
         
         return annotated_image
     

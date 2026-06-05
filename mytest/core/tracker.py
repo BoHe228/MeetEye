@@ -670,7 +670,9 @@ class BoT_SORTTracker:
                  enable_top_boundary: bool = False,  # 是否启用顶部边界
                  enable_bottom_boundary: bool = True,  # 是否启用底部边界
                  enable_left_boundary: bool = True,  # 是否启用左侧边界
-                 enable_right_boundary: bool = True):  # 是否启用右侧边界
+                 enable_right_boundary: bool = True,  # 是否启用右侧边界
+                 kalman_bbox: bool = False):  # 是否用 Kalman 状态框替代 YOLO 原始框 + 显示 lost 预测框
+        self.kalman_bbox = kalman_bbox
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
         self.removed_stracks: List[STrack] = []
@@ -1053,7 +1055,7 @@ class BoT_SORTTracker:
             # smooth_feat 是多帧 EMA 平均特征，比 curr_feat（单帧）更稳定
             out_feat = track.smooth_feat if track.smooth_feat is not None else track.curr_feat
             det_out = {
-                'bbox': track.xyxy.tolist(),
+                'bbox': track.tlbr.tolist() if self.kalman_bbox else track.xyxy.tolist(),
                 'confidence': track.score,
                 'class_id': track.cls,
                 'class_name': detections[0].get('class_name', 'person') if detections else 'person',
@@ -1074,6 +1076,32 @@ class BoT_SORTTracker:
         # === 边界匹配后处理 ===
         if self.enable_boundary_matching and self.boundary_tracker is not None:
             output_detections = self.boundary_tracker.post_process(output_detections)
+
+        # === use_track_bbox：补充 lost 轨迹的 Kalman 预测框 ===
+        # lost_stracks 已经过 Kalman predict，tlbr 是本帧预测位置
+        if self.kalman_bbox:
+            class_name = detections[0].get('class_name', 'person') if detections else 'person'
+            for track in self.lost_stracks:
+                if not track.is_activated:
+                    continue
+                final_track_id = track.track_id
+                if hasattr(track, '_boundary_matched_id'):
+                    final_track_id = track._boundary_matched_id
+                elif track.track_id in self.temp_id_map:
+                    final_track_id = self.temp_id_map[track.track_id]
+                out_feat = track.smooth_feat if track.smooth_feat is not None else track.curr_feat
+                output_detections.append({
+                    'bbox': track.tlbr.tolist(),
+                    'confidence': track.score,
+                    'class_id': track.cls,
+                    'class_name': class_name,
+                    'keypoints': track.keypoints,
+                    'track_id': final_track_id,
+                    'feature': out_feat[np.newaxis, :] if out_feat is not None else None,
+                    '_feature_count': len(track.features),
+                    '_boundary_matched': False,
+                    '_is_lost': True,
+                })
 
         # 更新轨迹信息缓存
         self.prev_track_info = current_track_info
@@ -1166,6 +1194,7 @@ class HybridSortTracker:
         track_high_thresh: float = 0.5,
         track_low_thresh: float = 0.1,
         new_track_thresh: float = 0.5,
+        new_track_overlap_thresh: float = 0.6,   # 与现有轨迹 IoU>此值的检测不新建轨迹（保持旧 ID 优先）
         # ── 轨迹生命周期 ──
         track_buffer: int = 30,
         frame_rate: int = 30,
@@ -1198,6 +1227,10 @@ class HybridSortTracker:
         # ── 框平滑 ──
         smooth_bbox: bool = False,       # 是否对输出框宽高做 EMA 平滑
         smooth_bbox_alpha: float = 0.5,  # EMA 系数，0=纯当前帧，1=纯历史
+        # ── Kalman 轨迹框 ──
+        kalman_bbox: bool = False,    # True → 输出 Kalman 状态框而非 YOLO 原始框
+        # ── Round 3.5 中心距离兜底 ──
+        cd_thresh: float = 0.5,       # 归一化中心点距离阈值（< 0 关闭）
         # ── 全景图尺寸 ──
         panorama_width: int = 3840,
         panorama_height: int = 1080,
@@ -1226,6 +1259,7 @@ class HybridSortTracker:
         self.track_high_thresh = track_high_thresh
         self.track_low_thresh = track_low_thresh
         self.new_track_thresh = new_track_thresh
+        self.new_track_overlap_thresh = new_track_overlap_thresh
         self.panorama_width = panorama_width
         self.panorama_height = panorama_height
         self._max_age = int(frame_rate / 30.0 * track_buffer)
@@ -1266,10 +1300,38 @@ class HybridSortTracker:
             ECC=False,
         )
 
+        # ── Round 3.5 / 遮挡后 ID 继承的中心距离阈值（需在 _make_inner 之前赋值）──
+        self._cd_thresh = float(cd_thresh)
+
         # ── 创建核心 Hybrid_Sort 实例 ────────────────────────────────────────
         self._inner: Hybrid_Sort = self._make_inner()
 
         self.frame_id = 0
+
+        # ── ID 生命周期调试日志（环境变量 HS_ID_DEBUG=1 开启）──────────────
+        # 将每帧"出现/消失"的最终 track_id 及其中心坐标写入 txt 文件（不打印到终端），
+        # 用于定位 ID 跳变事件。文件路径由 HS_ID_DEBUG_FILE 指定，默认 ./id_debug.txt。
+        self._id_debug = os.environ.get('HS_ID_DEBUG', '') not in ('', '0', 'false', 'False')
+        self._prev_output_dbg: Dict[int, List] = {}
+        self._id_debug_fp = None
+        if self._id_debug:
+            _dbg_path = os.environ.get('HS_ID_DEBUG_FILE', 'id_debug.txt')
+            try:
+                self._id_debug_fp = open(_dbg_path, 'w', encoding='utf-8')
+                self._id_debug_fp.write("# 格式: f<帧号>\\t事件\\tid=<最终ID>\\t@(cx,cy)\\tsize=(w x h)\n")
+                self._id_debug_fp.flush()
+                print(f"[ID] ID 生命周期日志将写入: {os.path.abspath(_dbg_path)}")
+            except Exception as _e:
+                print(f"[ID] 无法打开调试日志文件，已关闭 ID 调试: {_e}")
+                self._id_debug = False
+
+        # ── 显示号连续化 ────────────────────────────────────────────────────
+        # 内部计数器在"确认"时就 +1，但边界匹配可能随后把某条轨迹重映射回老 ID，
+        # 导致显示号出现缺口。这里在最终输出前再套一层映射：每个（重映射后的）内部
+        # final_track_id 首次出现时领取一个连续递增的公开号；被边界找回的轨迹复用其
+        # 老 final_track_id 对应的公开号 → 显示号严格连续、无缺口。
+        self._public_id_map: Dict[int, int] = {}
+        self._public_id_counter = 0
 
         # ── 特征 EMA 缓存（模拟 STrack.smooth_feat，供边界匹配使用） ────────
         # alpha=0.9 固定值；如需动态调整可参考 STrack.update_features()
@@ -1310,6 +1372,7 @@ class HybridSortTracker:
         self._smooth_bbox = smooth_bbox
         self._smooth_bbox_alpha = float(np.clip(smooth_bbox_alpha, 0.0, 0.99))
         self._bbox_size_cache: Dict[int, Tuple[float, float, float, float]] = {}  # track_id → (cx, cy, w, h)
+        self.kalman_bbox = kalman_bbox
 
     # ── 内部工具 ─────────────────────────────────────────────────────────────
 
@@ -1324,11 +1387,15 @@ class HybridSortTracker:
             delta_t=self._delta_t,
             asso_func=self._asso_func,
             inertia=self._inertia,
+            new_track_thresh=self.new_track_thresh,
+            new_track_overlap_thresh=self.new_track_overlap_thresh,
         )
         if self._with_reid:
-            return Hybrid_Sort_ReID(**common)
+            inner = Hybrid_Sort_ReID(**common)
         else:
-            return Hybrid_Sort(**common, use_byte=self._use_byte, low_thresh=self.track_low_thresh)
+            inner = Hybrid_Sort(**common, use_byte=self._use_byte, low_thresh=self.track_low_thresh)
+        inner.cd_thresh = self._cd_thresh  # Round 3.5 中心距离兜底阈值
+        return inner
 
     # ── 公共接口（与 BoT_SORTTracker 完全相同） ──────────────────────────────
 
@@ -1352,6 +1419,9 @@ class HybridSortTracker:
         self.temp_id_map.clear()
         self.prev_track_info.clear()
         self._bbox_size_cache.clear()
+        self._public_id_map.clear()
+        self._public_id_counter = 0
+        self._prev_output_dbg.clear()
         if self.boundary_tracker is not None:
             self.boundary_tracker.reset()
 
@@ -1403,10 +1473,12 @@ class HybridSortTracker:
         else:
             dets_np = np.empty((0, 5), dtype=np.float32)
 
-        # 预计算重叠检测框集合：IoU > 0.1 则裁图包含邻近人体，特征会被污染
+        # 预计算重叠检测框集合：IoU > 阈值则裁图包含邻近人体，特征会被污染
+        # 0.05：偏头等轻微接触（IoU 0.05~0.1）在 0.1 阈值下无法被拦截，导致 ReID 特征
+        # 悄悄污染；降到 0.05 可提前保护，避免高 reid_emb_weight 时污染特征主导分配。
         # with_reid 路径：置零 id_feature_np → KalmanBoxTracker.update_features() norm<1e-6 → 跳过
         # 无reid 路径：跳过外部 EMA 更新，保护 _feat_cache
-        _OVERLAP_IOU_THRESH = 0.1
+        _OVERLAP_IOU_THRESH = 0.12
         _contaminated_det_indices: set = set()
         if len(dets_np) > 1:
             for _a in range(len(dets_np)):
@@ -1450,10 +1522,12 @@ class HybridSortTracker:
 
         # ③-后：ReID 模式下，从内部 KalmanBoxTracker 同步 smooth_feat 到 _feat_cache
         # 内部跟踪器维护自己的 EMA（smooth_feat），比外部 EMA 更准确（含自适应平滑）
+        # 仅纳入已确认轨迹（trk.id >= 0）；未确认轨迹 id=-1 尚未分配 ID，不参与映射/特征同步
+        _id_to_inner_trk: Dict[int, Any] = {trk.id + 1: trk for trk in self._inner.trackers if trk.id >= 0}
         if self._with_reid:
-            for trk in self._inner.trackers:
+            for tid, trk in _id_to_inner_trk.items():
                 if trk.smooth_feat is not None:
-                    self._feat_cache[trk.id + 1] = trk.smooth_feat
+                    self._feat_cache[tid] = trk.smooth_feat
 
         # ④ 本帧活跃 track_id 集合 ────────────────────────────────────────────
         current_active_ids: set = (
@@ -1579,10 +1653,17 @@ class HybridSortTracker:
                 final_track_id = track_id
                 boundary_matched = False
 
+            # ── e-0. 可选：用 Kalman 状态框替代 YOLO 原始框 ─────────────────
+            if self.kalman_bbox and track_id in _id_to_inner_trk:
+                try:
+                    ks = _id_to_inner_trk[track_id].get_state()[0]
+                    out_bbox = [float(ks[0]), float(ks[1]), float(ks[2]), float(ks[3])]
+                except Exception:
+                    pass  # get_state 失败时保持原始框
+
             # ── e. 全框 EMA 平滑（--smooth-bbox）─────────────────────────────
-            # 同时平滑中心坐标（cx/cy）和宽高（w/h）：
-            # 仅平滑宽高在框大小稳定时几乎无效；中心坐标才是帧间抖动的主要来源。
-            if self._smooth_bbox:
+            # kalman_bbox 时 Kalman 本身已平滑，跳过 EMA 避免过度平滑
+            if self._smooth_bbox and not self.kalman_bbox:
                 cx = (out_bbox[0] + out_bbox[2]) / 2
                 cy = (out_bbox[1] + out_bbox[3]) / 2
                 w  = out_bbox[2] - out_bbox[0]
@@ -1619,6 +1700,137 @@ class HybridSortTracker:
         if self.enable_boundary_matching and self.boundary_tracker is not None:
             output_detections = self.boundary_tracker.post_process(output_detections)
 
+        # === use_track_bbox：补充 lost 轨迹的 Kalman 预测框 ===
+        if self.kalman_bbox:
+            output_internal_ids = {int(row[4]) for row in online_targets}
+            for trk in self._inner.trackers:
+                if trk.id < 0:
+                    continue  # 未确认轨迹（尚未分配 ID），不输出预测框
+                tid = trk.id + 1
+                if tid in output_internal_ids:
+                    continue  # 本帧已匹配，已在输出里
+                try:
+                    ks = trk.get_state()[0]
+                    out_bbox = [float(ks[0]), float(ks[1]), float(ks[2]), float(ks[3])]
+                except Exception:
+                    continue
+                final_tid = self.temp_id_map.get(tid, tid)
+                meta = self._meta_cache.get(tid) or {}
+                smooth_feat = self._feat_cache.get(tid)
+                output_detections.append({
+                    'bbox': out_bbox,
+                    'confidence': meta.get('confidence', 0.5),
+                    'class_id': meta.get('class_id', 0),
+                    'class_name': meta.get('class_name', 'person'),
+                    'keypoints': meta.get('keypoints', []),
+                    'track_id': final_tid,
+                    'feature': smooth_feat[np.newaxis, :] if smooth_feat is not None else None,
+                    '_feature_count': 0,
+                    '_boundary_matched': False,
+                    '_is_lost': True,
+                })
+
+        # ⑦-末-pre 短暂遮挡后 ID 恢复
+        #
+        # 触发条件：新确认轨迹（raw_id 首次出现，不在 _public_id_map）+ 附近有最近丢失的旧轨迹
+        #
+        # 保护措施（仅保留时间 + 位置两个约束，不排除"附近有活跃目标"的情况）：
+        #   ① 时间约束：旧轨迹 time_since_update ≤ _max_frames_lost（丢失时间短）
+        #   ② 位置约束：新旧轨迹中心距离 < _INHERIT_CD_THRESH 倍平均框高（位置足够近）
+        #
+        # 注意：被其他目标遮挡时，遮挡者本身是活跃目标——若加"周边活跃排除"会把被遮挡后
+        # 重现的情况也拦住，因此不做活跃邻居排除。两个约束合力保证：只有"短时间内在同一
+        # 位置消失又出现"才触发继承；人真的走远了（位置远）或消失太久（时间长）则不继承。
+        _MAX_FRAMES_LOST = self._max_age   # 与 max_age 对齐：旧轨迹还活着就参与比较
+        _INHERIT_CD_THRESH = 1.0           # 中心距离 / 平均框高，新旧轨迹位置必须足够近
+        _INHERIT_DEBUG = os.environ.get('HS_INHERIT_DEBUG', '') not in ('', '0', 'false')
+
+        # 找出"已确认但本帧未匹配"的旧轨迹
+        _lost_confirmed = {
+            tid: trk for tid, trk in _id_to_inner_trk.items()
+            if tid not in current_active_ids
+        }
+
+        if _lost_confirmed:
+            for det in output_detections:
+                if det.get('_is_lost'):
+                    continue
+                raw_id = det['track_id']
+                if raw_id in self._public_id_map:
+                    continue  # 已知 ID，无需继承
+
+                det_bbox = det['bbox']
+                cx_n = (det_bbox[0] + det_bbox[2]) / 2.0
+                cy_n = (det_bbox[1] + det_bbox[3]) / 2.0
+                h_n = max(det_bbox[3] - det_bbox[1], 1.0)
+
+                if _INHERIT_DEBUG:
+                    print(f"[INHERIT] f{self.frame_id} new_raw={raw_id} "
+                          f"pos=({cx_n:.0f},{cy_n:.0f}) h={h_n:.0f} "
+                          f"lost_ids={list(_lost_confirmed.keys())}")
+
+                # 寻找满足条件的最近旧轨迹
+                # 同时比较 last_observation（最后检测位置）和 Kalman 预测位置，取最小距离：
+                # · last_observation：人没动时最准
+                # · Kalman 预测：人在遮挡期间匀速运动时，预测位置更接近重现位置
+                best_old_raw, best_dist = None, _INHERIT_CD_THRESH
+                for old_tid, old_trk in _lost_confirmed.items():
+                    # ① 时间约束：丢失太久的旧轨迹不参与（可能已是不同目标）
+                    tsu = old_trk.time_since_update
+                    if tsu > _MAX_FRAMES_LOST:
+                        if _INHERIT_DEBUG:
+                            print(f"[INHERIT]   skip old_raw={old_tid} tsu={tsu} > {_MAX_FRAMES_LOST}")
+                        continue
+                    if old_trk.last_observation.sum() < 0:
+                        if _INHERIT_DEBUG:
+                            print(f"[INHERIT]   skip old_raw={old_tid} no obs")
+                        continue
+                    obs = old_trk.last_observation
+                    cx_o = (obs[0] + obs[2]) / 2.0
+                    cy_o = (obs[1] + obs[3]) / 2.0
+                    h_o = max(obs[3] - obs[1], 1.0)
+                    avg_h = (h_n + h_o) / 2.0
+                    d_obs = (np.sqrt((cx_n - cx_o) ** 2 + (cy_n - cy_o) ** 2) / avg_h)
+                    # Kalman 预测位置（已连续 predict tsu 帧，跟踪器内部状态）
+                    d_kalman = d_obs
+                    try:
+                        ks = old_trk.get_state()[0]
+                        cx_k = (ks[0] + ks[2]) / 2.0
+                        cy_k = (ks[1] + ks[3]) / 2.0
+                        d_kalman = np.sqrt((cx_n - cx_k) ** 2 + (cy_n - cy_k) ** 2) / avg_h
+                    except Exception:
+                        pass
+                    d = min(d_obs, d_kalman)
+                    if _INHERIT_DEBUG:
+                        print(f"[INHERIT]   old_raw={old_tid} pub={self._public_id_map.get(old_tid)} "
+                              f"tsu={tsu} obs=({cx_o:.0f},{cy_o:.0f}) "
+                              f"d_obs={d_obs:.3f} d_kalman={d_kalman:.3f} d={d:.3f}")
+                    if d < best_dist:
+                        best_dist, best_old_raw = d, old_tid
+
+                if best_old_raw is not None and best_old_raw in self._public_id_map:
+                    old_pub = self._public_id_map.pop(best_old_raw)
+                    self._public_id_map[raw_id] = old_pub  # 继承旧公开号
+                    if _INHERIT_DEBUG:
+                        print(f"[INHERIT] ✓ f{self.frame_id} new_raw={raw_id} → pub={old_pub} "
+                              f"(from old_raw={best_old_raw} dist={best_dist:.3f})")
+                elif _INHERIT_DEBUG:
+                    reason = "no_match" if best_old_raw is None else f"old_raw={best_old_raw}_not_in_pubmap"
+                    print(f"[INHERIT] ✗ f{self.frame_id} new_raw={raw_id} ({reason})")
+
+        # ⑦-末 显示号连续化：把（边界重映射后的）final_track_id 映射到连续递增的公开号。
+        # 仅改写对外输出的 track_id；内部状态（_prev_active_ids/temp_id_map/_meta_cache/
+        # boundary_tracker 等）仍用 Hybrid_Sort 内部 ID，不受影响。被边界找回的轨迹其
+        # final_track_id 等于老内部 ID，命中已有映射 → 复用老公开号，因此不再产生缺号。
+        for det in output_detections:
+            _raw = det['track_id']
+            _pub = self._public_id_map.get(_raw)
+            if _pub is None:
+                self._public_id_counter += 1
+                _pub = self._public_id_counter
+                self._public_id_map[_raw] = _pub
+            det['track_id'] = _pub
+
         # ⑧ 更新帧间状态（_prev_active_ids / _prev_bbox 使用 Hybrid_Sort 内部 ID） ──
         self._prev_active_ids = current_active_ids
         self._prev_bbox = {
@@ -1629,5 +1841,21 @@ class HybridSortTracker:
             det['track_id']: {'bbox': det['bbox'], 'track_id': det['track_id']}
             for det in output_detections
         }
+
+        # ── ID 生命周期日志：将本帧最终 ID 的"出现/消失"事件写入 txt 文件 ────
+        if self._id_debug and self._id_debug_fp is not None:
+            cur_boxes = {d['track_id']: d['bbox'] for d in output_detections}
+            lines = []
+            for tid in sorted(set(cur_boxes) - set(self._prev_output_dbg)):
+                x1, y1, x2, y2 = cur_boxes[tid]
+                lines.append(f"f{self.frame_id}\t+出现\tid={tid}\t@({(x1+x2)/2:.0f},{(y1+y2)/2:.0f})\t"
+                             f"size=({x2-x1:.0f}x{y2-y1:.0f})")
+            for tid in sorted(set(self._prev_output_dbg) - set(cur_boxes)):
+                x1, y1, x2, y2 = self._prev_output_dbg[tid]
+                lines.append(f"f{self.frame_id}\t-消失\tid={tid}\t@({(x1+x2)/2:.0f},{(y1+y2)/2:.0f})")
+            if lines:
+                self._id_debug_fp.write("\n".join(lines) + "\n")
+                self._id_debug_fp.flush()
+            self._prev_output_dbg = cur_boxes
 
         return output_detections

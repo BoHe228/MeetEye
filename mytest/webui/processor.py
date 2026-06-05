@@ -32,8 +32,15 @@ from utils import (
     DisplayManager,
     draw_detections,
     filter_cross_boundary_detections,
+    compute_stable_bbox_from_keypoints,
 )
 from utils.feature_extractor import FeatureExtractor
+
+try:
+    from face_rec.face_rec_manager import FaceRecManager
+    _FACE_REC_AVAILABLE = True
+except Exception as _e:
+    _FACE_REC_AVAILABLE = False
 
 _CUDA = torch.cuda.is_available()
 
@@ -51,6 +58,21 @@ class FisheyePanoramaYOLOPose:
 
         self.show_angles = True
         self.show_angle_overview = False
+        self.show_id: bool = getattr(args, 'show_id', True)
+        self.show_conf: bool = getattr(args, 'show_conf', True)
+        self.show_angle: bool = getattr(args, 'show_angle', True)
+        self.show_arrow: bool = getattr(args, 'show_arrow', True)
+        self.kpt_display: bool = getattr(args, 'kpt_display', False)
+        self.kpt_track: bool = getattr(args, 'kpt_track', False)
+        self.kpt_bbox_conf: float = getattr(args, 'kpt_bbox_conf', 0.3)
+        self.kpt_bbox_padding: float = getattr(args, 'kpt_bbox_padding', 0.15)
+        self.kpt_bbox_upper_only: bool = getattr(args, 'kpt_bbox_upper_only', True)
+
+        # 人脸识别
+        self.face_rec: Optional[FaceRecManager] = None
+        self._face_name_map: Dict[int, str] = {}
+        self._prev_track_ids: set = set()
+
         self.num_slices: int = getattr(args, 'num_slices', 3)
         self.slice_overlap: float = getattr(args, 'slice_overlap', 0.05)
         self.use_tracker: bool = (args.tracker != 'none')
@@ -64,6 +86,7 @@ class FisheyePanoramaYOLOPose:
             overlap_ratio=self.slice_overlap,
             iou_threshold=0.2,
             reid_similarity_threshold=0.7,
+            dedup_use_reid=getattr(args, 'dedup_use_reid', False),
         )
 
         # ── 边界匹配公共参数（与 main.py 保持对齐）──────────────────────
@@ -93,6 +116,7 @@ class FisheyePanoramaYOLOPose:
                 reid_lost_thresh=args.reid_lost_thresh,
                 with_reid=True,
                 use_hungarian=args.use_hungarian,
+                kalman_bbox=getattr(args, 'kalman_bbox', False),
                 **_boundary_kwargs,
             )
         elif args.tracker == 'hybridsort':
@@ -116,6 +140,8 @@ class FisheyePanoramaYOLOPose:
                 tcm_byte_step_weight=1,
                 asso_func="iou",
                 min_hits=1,
+                # Round 3.5 兜底
+                cd_thresh=0.5,
                 # ── ReID ──────────────────────────────────────────────────
                 with_reid=args.use_reid,
                 reid_emb_weight_high=args.reid_emb_weight_high,
@@ -126,6 +152,8 @@ class FisheyePanoramaYOLOPose:
                 # ── 框平滑 ─────────────────────────────────────────────────
                 smooth_bbox=getattr(args, 'smooth_bbox', True),
                 smooth_bbox_alpha=getattr(args, 'smooth_bbox_alpha', 0.5),
+                # ── Kalman 轨迹框 ───────────────────────────────────────────
+                kalman_bbox=getattr(args, 'kalman_bbox', False),
                 **_boundary_kwargs,
             )
         else:
@@ -166,19 +194,40 @@ class FisheyePanoramaYOLOPose:
             no_display=self.no_display,
         )
 
-        print(f"初始化 OSNet 特征提取器 ({self._osnet_model_name})...")
-        try:
-            self.feature_extractor = FeatureExtractor(
-                model_name=self._osnet_model_name,
-                model_path=self._osnet_model_path,
-            )
-            if _CUDA:
-                self.feature_extractor.extractor.model.to('cuda')
-                self.feature_extractor.device = 'cuda'
-                print("OSNet 已移至 GPU（FP32，BatchNorm 不支持 FP16）")
-        except Exception as e:
-            print(f"OSNet 初始化失败: {e}，将不使用 ReID 特征")
+        if getattr(self.args, 'use_osnet', True):
+            print(f"初始化 OSNet 特征提取器 ({self._osnet_model_name})...")
+            try:
+                self.feature_extractor = FeatureExtractor(
+                    model_name=self._osnet_model_name,
+                    model_path=self._osnet_model_path,
+                )
+                if _CUDA:
+                    self.feature_extractor.extractor.model.to('cuda')
+                    self.feature_extractor.device = 'cuda'
+                    print("OSNet 已移至 GPU（FP32，BatchNorm 不支持 FP16）")
+            except Exception as e:
+                print(f"OSNet 初始化失败: {e}，将不使用 ReID 特征")
+                self.feature_extractor = None
+        else:
+            print("OSNet 特征提取已禁用（--no-use-osnet）")
             self.feature_extractor = None
+
+        if getattr(self.args, 'use_face_rec', False):
+            if not _FACE_REC_AVAILABLE:
+                print("警告: FaceRecManager 不可用，跳过人脸识别初始化")
+            else:
+                try:
+                    self.face_rec = FaceRecManager(
+                        model_path=self.args.face_rec_model,
+                        library_dir=self.args.face_library_dir,
+                        threshold=getattr(self.args, 'face_rec_threshold', 0.35),
+                        frontal_yaw_thresh=getattr(self.args, 'face_frontal_threshold', 0.35),
+                        cooldown_frames=getattr(self.args, 'face_rec_cooldown', 30),
+                        device='cuda' if _CUDA else 'cpu',
+                    )
+                except Exception as e:
+                    print(f"警告: 人脸识别初始化失败: {e}")
+                    self.face_rec = None
 
         print("模型加载完成！等待第一帧以完成全景处理器初始化...")
         return True
@@ -311,6 +360,15 @@ class FisheyePanoramaYOLOPose:
         t[6] = time.perf_counter()
 
         # ⑦ 跟踪 + 绘制  [CPU]
+        if self.kpt_track:
+            for det in filtered:
+                det['bbox'] = compute_stable_bbox_from_keypoints(
+                    det.get('keypoints', []),
+                    conf_thresh=self.kpt_bbox_conf,
+                    padding=self.kpt_bbox_padding,
+                    fallback_bbox=det['bbox'],
+                    upper_body_only=self.kpt_bbox_upper_only,
+                )
         if self.use_tracker:
             tracked = self.tracker.update(filtered)
         else:
@@ -318,7 +376,30 @@ class FisheyePanoramaYOLOPose:
             for i, d in enumerate(tracked):
                 d['track_id'] = i + 1
 
-        annotated = draw_detections(panorama, tracked, self.tracker)
+        # ⑦-b 人脸识别
+        current_ids = {d['track_id'] for d in tracked}
+        new_ids = current_ids - self._prev_track_ids
+        if self.face_rec is not None:
+            for det in tracked:
+                tid = det['track_id']
+                self.face_rec.process_detection(
+                    panorama, det.get('keypoints', []), tid,
+                    is_new_track=(tid in new_ids),
+                    face_name_map=self._face_name_map,
+                    frame_id=self._timing_counter,
+                )
+            for gone in (set(self._face_name_map) - current_ids):
+                self._face_name_map.pop(gone, None)
+                self.face_rec.cleanup_track(gone)
+        self._prev_track_ids = current_ids
+
+        annotated = draw_detections(panorama, tracked, self.tracker,
+                                    show_id=self.show_id, show_conf=self.show_conf,
+                                    face_name_map=self._face_name_map,
+                                    use_kpt_bbox=self.kpt_display,
+                                    kpt_bbox_conf=self.kpt_bbox_conf,
+                                    kpt_bbox_padding=self.kpt_bbox_padding,
+                                    kpt_bbox_upper_only=self.kpt_bbox_upper_only)
         t[7] = time.perf_counter()
 
         # ⑧ 角度计算  [CPU]
@@ -329,9 +410,14 @@ class FisheyePanoramaYOLOPose:
                 angle_info = self.angle_calculator.calculate_angles_from_keypoints(
                     np.array(kpts_list)
                 )
-                draw_fn = (self.angle_calculator.draw_angle_overview if self.show_angle_overview
-                           else self.angle_calculator.draw_angles_on_image)
-                annotated = draw_fn(annotated, angle_info)
+                if self.show_angle_overview:
+                    annotated = self.angle_calculator.draw_angle_overview(annotated, angle_info)
+                else:
+                    annotated = self.angle_calculator.draw_angles_on_image(
+                        annotated, angle_info,
+                        show_angle=self.show_angle,
+                        show_arrow=self.show_arrow,
+                    )
         t[8] = time.perf_counter()
 
         self._timing_counter += 1

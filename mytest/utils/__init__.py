@@ -8,6 +8,7 @@ from .visualizer import (
     draw_keypoints,
     draw_detections,
     filter_cross_boundary_detections,
+    compute_stable_bbox_from_keypoints,
 )
 from .feature import (
     cosine_similarity,
@@ -25,6 +26,7 @@ __all__ = [
     'draw_keypoints',
     'draw_detections',
     'filter_cross_boundary_detections',
+    'compute_stable_bbox_from_keypoints',
     'cosine_similarity',
     'cosine_similarity_batch',
     'cosine_distance',

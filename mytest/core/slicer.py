@@ -24,6 +24,7 @@ class PanoramaSlicer:
                  reid_similarity_threshold: float = 0.7,
                  wrap_reid_threshold: float = 0.5,
                  max_width_ratio: float = 0.6,
+                 dedup_use_reid: bool = True,
                  verbose: bool = False):
         """
         初始化切片器
@@ -48,6 +49,7 @@ class PanoramaSlicer:
         self.confidence_threshold = confidence_threshold
         self.reid_similarity_threshold = reid_similarity_threshold
         self.wrap_reid_threshold = wrap_reid_threshold
+        self.dedup_use_reid = dedup_use_reid
         self.max_width_ratio = max_width_ratio
         self.verbose = verbose
 
@@ -138,12 +140,17 @@ class PanoramaSlicer:
                 if hasattr(result, 'keypoints') and result.keypoints is not None:
                     keypoints_data = result.keypoints.data.cpu().numpy()
 
+                _multiclass = len(result.names) > 1
                 for i, (box, conf, cls_id) in enumerate(zip(boxes_data, confidences, class_ids)):
+                    class_name = result.names[int(cls_id)]
+                    # 多类模型（如 yolo26n.pt）只保留 person 类
+                    if _multiclass and class_name != 'person':
+                        continue
                     det = {
                         'bbox': box.tolist(),
                         'confidence': float(conf),
                         'class_id': int(cls_id),
-                        'class_name': result.names[int(cls_id)],
+                        'class_name': class_name,
                     }
 
                     if i < len(keypoints_data):
@@ -281,15 +288,17 @@ class PanoramaSlicer:
         # === 第三步：基于ReID特征的智能去重 ===
         suppressed = np.zeros(len(all_boxes), dtype=bool)
 
-        # 获取全景图宽度（用于处理环绕边界）
+        # 获取全景图宽度与切片数量（切片数随 --num-slices 变化，不再写死 3）
         panorama_width = slice_infos[0]['original_width']
+        num_slices = len(slice_infos)
+        last_slice_idx = num_slices - 1
 
         # 首先计算每个检测框是否位于切片边界重叠区域（用于相邻切片对）
         in_boundary_overlap = self._check_in_boundary_overlap(
             all_boxes,
             all_detection_infos,
             slice_infos,
-            num_slices=3
+            num_slices=num_slices
         )
 
         for i in range(len(all_boxes)):
@@ -304,45 +313,71 @@ class PanoramaSlicer:
                 if all_detection_infos[i]['slice_idx'] == all_detection_infos[j]['slice_idx']:
                     continue
 
-                # 检查是否是环绕边界对（slice0 & slice2）
+                # 检查是否是环绕边界对（首切片 & 末切片，即 slice0 与 slice(N-1)）
+                # 仅 num_slices>=3 时成立；num_slices==2 时首末切片本身相邻，归为相邻对处理
                 slice_i = all_detection_infos[i]['slice_idx']
                 slice_j = all_detection_infos[j]['slice_idx']
-                is_wrap_around_pair = (slice_i == 0 and slice_j == 2) or (slice_i == 2 and slice_j == 0)
+                is_wrap_around_pair = (
+                    num_slices >= 3
+                    and {slice_i, slice_j} == {0, last_slice_idx}
+                )
 
-                # 检查是否是相邻边界对（slice0&slice1 或 slice1&slice2）
+                # 检查是否是相邻边界对（相邻切片，slice_k & slice_(k+1)）
                 is_adjacent_pair = (abs(slice_i - slice_j) == 1)
 
                 # 环绕边界对：只要特征相似就去重，不限制位置
                 # 相邻边界对：需要在边界重叠区域才去重
                 if is_wrap_around_pair:
-                    # 环绕边界对（slice0 & slice2）：无位置门控，用专用宽松阈值
-                    feat1 = all_features[i]
-                    feat2 = all_features[j]
+                    # 环绕边界对（slice0 & sliceN-1）：
+                    # 两框在全景坐标下分别位于 x≈0 和 x≈W 两端，标准 IoU=0。
+                    # 将 x 较大的框向左平移 panorama_width，使两框在接缝处对齐，
+                    # 再计算 min_iou，与相邻切片逻辑统一，精度优于中心距离启发式。
+                    b1 = all_boxes[i]
+                    b2 = all_boxes[j]
+                    # 判断哪个框在右侧（x 中心更大），平移至左侧接缝
+                    cx1 = (b1[0] + b1[2]) / 2
+                    cx2 = (b2[0] + b2[2]) / 2
+                    if cx2 > cx1:
+                        b2_shifted = [b2[0] - panorama_width, b2[1],
+                                      b2[2] - panorama_width, b2[3]]
+                        ba, bb = b1, b2_shifted
+                    else:
+                        b1_shifted = [b1[0] - panorama_width, b1[1],
+                                      b1[2] - panorama_width, b1[3]]
+                        ba, bb = b1_shifted, b2
+
+                    inter_x1 = max(ba[0], bb[0]); inter_y1 = max(ba[1], bb[1])
+                    inter_x2 = min(ba[2], bb[2]); inter_y2 = min(ba[3], bb[3])
+                    inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+                    min_area = min((b1[2]-b1[0])*(b1[3]-b1[1]),
+                                   (b2[2]-b2[0])*(b2[3]-b2[1]))
+                    wrap_min_iou = inter / (min_area + 1e-6)
 
                     is_same_target = False
 
-                    if feat1 is not None and feat2 is not None:
-                        similarity = cosine_similarity(feat1, feat2)
-                        if similarity >= self.wrap_reid_threshold:
+                    if not self.dedup_use_reid:
+                        # 纯空间：平移后 min_iou 达标即去重
+                        if wrap_min_iou > self.iou_threshold:
                             is_same_target = True
                             if self.verbose:
-                                print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：特征相似度={similarity:.3f} → 同一目标，去重")
+                                print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})："
+                                      f"wrap_min_iou={wrap_min_iou:.3f}（纯空间）→ 同一目标，去重")
                     else:
-                        # 无特征时：用全景坐标下的环绕近邻距离代替 IoU
-                        # 环绕对的框经过坐标转换后可能一个在 x≈0、一个在 x≈W，
-                        # 正常 IoU 永远为 0，改用全景最短距离判断是否同一区域
-                        b1 = all_boxes[i]
-                        b2 = all_boxes[j]
-                        cx1 = (b1[0] + b1[2]) / 2
-                        cx2 = (b2[0] + b2[2]) / 2
-                        cy1 = (b1[1] + b1[3]) / 2
-                        cy2 = (b2[1] + b2[3]) / 2
-                        wrap_dx = min(abs(cx1 - cx2), panorama_width - abs(cx1 - cx2))
-                        box_w = max((b1[2] - b1[0] + b2[2] - b2[0]) / 2, 1)
-                        if wrap_dx < box_w * 1.5 and abs(cy1 - cy2) < box_w:
-                            is_same_target = True
-                            if self.verbose:
-                                print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：无特征，环绕中心距={wrap_dx:.1f} → 同一目标，去重")
+                        feat1 = all_features[i]
+                        feat2 = all_features[j]
+                        if feat1 is not None and feat2 is not None:
+                            similarity = cosine_similarity(feat1, feat2)
+                            if similarity >= self.wrap_reid_threshold:
+                                is_same_target = True
+                                if self.verbose:
+                                    print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})："
+                                          f"wrap_min_iou={wrap_min_iou:.3f}, 特征相似度={similarity:.3f} → 同一目标，去重")
+                        else:
+                            if wrap_min_iou > self.iou_threshold:
+                                is_same_target = True
+                                if self.verbose:
+                                    print(f"[环绕去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})："
+                                          f"wrap_min_iou={wrap_min_iou:.3f}，无特征 → 同一目标，去重")
 
                     if is_same_target:
                         if all_scores[i] >= all_scores[j]:
@@ -351,27 +386,38 @@ class PanoramaSlicer:
                             suppressed[i] = True
                             break
                 elif is_adjacent_pair:
-                    # 相邻边界对：不限制必须在边界区域，只要IoU高就去重
-                    # 计算正常IoU
-                    iou = box_iou(all_boxes[i], all_boxes[j])
+                    # min-IoU = 交集 / min(面积i, 面积j)：小框被大框覆盖时趋近1.0，
+                    # 解决切片边缘"一高一矮"导致标准IoU偏低、去重失败的问题
+                    b1 = all_boxes[i]
+                    b2 = all_boxes[j]
+                    inter_x1 = max(b1[0], b2[0]); inter_y1 = max(b1[1], b2[1])
+                    inter_x2 = min(b1[2], b2[2]); inter_y2 = min(b1[3], b2[3])
+                    inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+                    min_area = min((b1[2]-b1[0])*(b1[3]-b1[1]), (b2[2]-b2[0])*(b2[3]-b2[1]))
+                    min_iou = inter / (min_area + 1e-6)
 
-                    if iou > self.iou_threshold:
-                        feat1 = all_features[i]
-                        feat2 = all_features[j]
-
+                    if min_iou > self.iou_threshold:
                         is_same_target = False
 
-                        if feat1 is not None and feat2 is not None:
-                            similarity = cosine_similarity(feat1, feat2)
-                            if similarity >= self.reid_similarity_threshold:
-                                is_same_target = True
-                                if self.verbose:
-                                    print(f"[相邻去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：IoU={iou:.3f}, 特征相似度={similarity:.3f} → 同一目标，去重")
+                        if not self.dedup_use_reid:
+                            # 纯空间判据：IoU 满足即视为同一目标，不引入特征
+                            is_same_target = True
+                            if self.verbose:
+                                print(f"[相邻去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：min_iou={min_iou:.3f}（纯空间）→ 同一目标，去重")
                         else:
-                            if self._are_keypoints_similar(all_keypoints[i], all_keypoints[j]):
-                                is_same_target = True
-                                if self.verbose:
-                                    print(f"[相邻去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：IoU={iou:.3f}, 无特征但关键点相似 → 同一目标，去重")
+                            feat1 = all_features[i]
+                            feat2 = all_features[j]
+                            if feat1 is not None and feat2 is not None:
+                                similarity = cosine_similarity(feat1, feat2)
+                                if similarity >= self.reid_similarity_threshold:
+                                    is_same_target = True
+                                    if self.verbose:
+                                        print(f"[相邻去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：min_iou={min_iou:.3f}, 特征相似度={similarity:.3f} → 同一目标，去重")
+                            else:
+                                if self._are_keypoints_similar(all_keypoints[i], all_keypoints[j]):
+                                    is_same_target = True
+                                    if self.verbose:
+                                        print(f"[相邻去重] 检测{i}(slice{slice_i})和{j}(slice{slice_j})：min_iou={min_iou:.3f}, 无特征但关键点相似 → 同一目标，去重")
 
                         if is_same_target:
                             if all_scores[i] >= all_scores[j]:
@@ -646,7 +692,9 @@ class PanoramaSlicer:
                 'right_boundary': (right_boundary_start, right_boundary_end)
             })
 
-        # 检查每个检测框是否位于边界重叠区域
+        # 检查每个检测框是否位于边界重叠区域（对任意切片数通用）
+        # 策略：每个切片只检查其右侧边界（与下一切片衔接）；
+        #       末切片的右侧会环绕到全景图最左侧，额外检查 [0, overlap_width]。
         for idx, (box, det_info) in enumerate(zip(all_boxes, all_detection_infos)):
             x1, y1, x2, y2 = box
             slice_idx = det_info['slice_idx']
@@ -658,25 +706,16 @@ class PanoramaSlicer:
                 # 计算检测框中心点
                 center_x = (x1 + x2) / 2
 
-                if slice_idx == 0:
-                    # slice0：检查右侧边界（与slice1衔接）
-                    right_start, right_end = region['right_boundary']
-                    in_right_overlap = (center_x >= right_start) and (center_x <= right_end)
-                    in_boundary_overlap[idx] = in_right_overlap
-                elif slice_idx == 1:
-                    # slice1：检查右侧边界（与slice2衔接）
-                    right_start, right_end = region['right_boundary']
-                    in_right_overlap = (center_x >= right_start) and (center_x <= right_end)
-                    in_boundary_overlap[idx] = in_right_overlap
-                elif slice_idx == 2:
-                    # slice2：检查右侧边界（与slice0的环绕边界衔接）
-                    # slice2的右侧边界包括环绕到全景图左侧的部分
-                    right_start, right_end = region['right_boundary']
-                    # 正常右侧部分
-                    in_right_overlap = (center_x >= right_start) and (center_x <= right_end)
-                    # 环绕到左侧的部分（slice2右侧超出panorama_width后会环绕到0开始）
+                # 右侧边界（与下一切片衔接），所有切片通用
+                right_start, right_end = region['right_boundary']
+                in_right_overlap = (center_x >= right_start) and (center_x <= right_end)
+
+                # 末切片：右侧超出 panorama_width 后环绕到全景图最左侧 [0, overlap_width]
+                if slice_idx == num_slices - 1:
                     in_wrap_right = (center_x >= 0) and (center_x <= overlap_width)
-                    in_boundary_overlap[idx] = in_right_overlap or in_wrap_right
+                    in_right_overlap = in_right_overlap or in_wrap_right
+
+                in_boundary_overlap[idx] = in_right_overlap
 
         return in_boundary_overlap
 

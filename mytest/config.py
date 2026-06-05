@@ -42,8 +42,11 @@ def parse_args():
     # 全景切片参数
     parser.add_argument('--num-slices', type=int, default=3, choices=[2, 3, 4, 5, 6, 7],
                         help='全景图切片数量 (默认: 3)')
-    parser.add_argument('--slice-overlap', type=float, default=0.05,
+    parser.add_argument('--slice-overlap', type=float, default=0.1,
                         help='切片重叠比例 (默认: 0.1)')
+    parser.add_argument('--dedup-use-reid', action=argparse.BooleanOptionalAction, default=False,
+                        help='跨切片去重时是否用 ReID 特征辅助判断；'
+                             '--no-dedup-use-reid（默认）只用空间 IoU，避免切片边缘裁图质量差导致去重失败 (默认: False)')
 
     # 角度计算参数
     parser.add_argument('--fit-degree', type=int, default=4, choices=[4, 5],
@@ -56,7 +59,9 @@ def parse_args():
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
 
-    # OSNet ReID 模型选择
+    # OSNet 开关与模型选择
+    parser.add_argument('--use-osnet', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否启用 OSNet 特征提取；--no-use-osnet 完全跳过，节省计算 (默认: True)')
     parser.add_argument('--osnet-model', type=str, default='osnet_ain_x1_0',
                         choices=list(OSNET_WEIGHT_MAP.keys()),
                         help='OSNet ReID 模型选型（默认: osnet_ain_x1_0）')
@@ -94,6 +99,54 @@ def parse_args():
     parser.add_argument('--show-wrap-overlap', action='store_true', default=False,
                         help='在最终显示帧左右各拼接环绕重叠区域副本，验证 slice0/slice2 环绕切片效果')
 
+    # 人脸识别开关
+    parser.add_argument('--use-face-rec', action=argparse.BooleanOptionalAction, default=False,
+                        help='是否启用人脸识别（AdaFace IR-18，默认: False）')
+    parser.add_argument('--face-library-dir', type=str, default='face_library',
+                        help='人脸特征库目录，每个 .npy 文件对应一人，文件名即为人名 (默认: face_library)')
+    parser.add_argument('--face-rec-model', type=str,
+                        default='face_rec_model/adaface_ir18_vgg2.ckpt',
+                        help='AdaFace IR-18 模型权重路径')
+    parser.add_argument('--face-rec-threshold', type=float, default=0.35,
+                        help='人脸识别余弦相似度阈值，低于此值视为未知（默认: 0.35）')
+    parser.add_argument('--face-frontal-threshold', type=float, default=0.65,
+                        help='正面人脸判断阈值（鼻子水平偏移/眼距），越小越严格（默认: 0.35）')
+    parser.add_argument('--face-rec-cooldown', type=int, default=30,
+                        help='未识别目标重试间隔帧数，避免每帧触发推理（默认: 30）')
+
+    # 画面标注显示开关
+    parser.add_argument('--show-id', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否在检测框上显示 Track ID (默认: True)')
+    parser.add_argument('--show-conf', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否在检测框上显示置信度 (默认: True)')
+    parser.add_argument('--show-angle', action=argparse.BooleanOptionalAction, default=False,
+                        help='是否在画面上显示角度文字标注 (默认: False)')
+    parser.add_argument('--show-arrow', action=argparse.BooleanOptionalAction, default=False,
+                        help='是否在画面上绘制方向箭头 (默认: False)')
+
+    # 检测框策略
+    # --kalman-bbox   : 跟踪输出改用 Kalman 状态框（非 YOLO 原始框），
+    #                   且在目标暂时未被检测到时继续用 Kalman 预测框保持显示（灰色细线）
+    # --kpt-track     : 跟踪输入（送进 tracker 的 bbox）改用关键点推导框，
+    #                   减少大框之间的假性重叠，降低 freeze_feat 误触发
+    # --kpt-display   : 仅画面绘制时改用关键点推导框，不影响跟踪逻辑
+    parser.add_argument('--kalman-bbox', action='store_true', default=False,
+                        help='用 Kalman 状态框替代 YOLO 原始框输出；目标丢失时继续显示预测框（灰色）(默认: False)')
+    parser.add_argument('--kpt-track', action='store_true', default=False,
+                        help='跟踪层（IoU 匹配 + Kalman 初始化）使用关键点推导框，减少大框重叠误判 (默认: False)')
+    parser.add_argument('--kpt-display', action='store_true', default=False,
+                        help='显示层用关键点推导框替代原始框绘制，不影响跟踪逻辑 (默认: False)')
+
+    # 关键点框公共参数（--kpt-track 和 --kpt-display 共用）
+    parser.add_argument('--kpt-bbox-conf', type=float, default=0.3,
+                        help='关键点可见性阈值，低于此值的关键点不参与框推导（默认: 0.3）')
+    parser.add_argument('--kpt-bbox-padding', type=float, default=0.3,
+                        help='关键点框左右(水平)扩展比例，相对于关键点跨度（默认: 0.2）')
+    parser.add_argument('--kpt-bbox-padding-v', type=float, default=0.4,
+                        help='关键点框上下(垂直)扩展比例，相对于关键点跨度（默认: 0.3，比左右多扩以包住头顶/下颌）')
+    parser.add_argument('--kpt-bbox-upper-only', action=argparse.BooleanOptionalAction, default=True,
+                        help='仅用头肩关键点（0-6：鼻/眼/耳/肩）推导框，排除手肘/腕/腿（默认: True）')
+
     # 跟踪器选择
     parser.add_argument('--tracker', type=str, default='hybridsort',
                         choices=['none', 'botsort', 'hybridsort'],
@@ -118,7 +171,7 @@ def parse_args():
     # ReID 参数（--tracker hybridsort 时生效）
     parser.add_argument('--use-reid', action=argparse.BooleanOptionalAction, default=True,
                         help='HybridSort 是否启用 ReID 外观特征参与关联，--no-use-reid 禁用 (默认: True)')
-    parser.add_argument('--reid-emb-weight-high', type=float, default=0.3,
+    parser.add_argument('--reid-emb-weight-high', type=float, default=0.1,
                         help='HybridSort ReID 第一轮关联外观代价权重（0=纯IoU+VDC，越大越依赖外观，默认: 0.3）')
     parser.add_argument('--reid-emb-weight-low', type=float, default=0.0,
                         help='HybridSort ReID BYTE第二轮关联外观代价权重（默认: 0.0）')
