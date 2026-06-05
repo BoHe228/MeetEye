@@ -342,6 +342,7 @@ class FisheyePanoramaYOLOPose:
                 try:
                     self.talking_detector = TalkingDetector(
                         mar_threshold=getattr(self.args, 'talking_mar_threshold', 0.035),
+                        detect_interval=getattr(self.args, 'talking_detect_interval', 3),
                     )
                     print("说话检测已启用（MediaPipe FaceMesh MAR）")
                 except Exception as e:

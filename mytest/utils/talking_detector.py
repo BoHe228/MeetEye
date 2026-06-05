@@ -68,21 +68,24 @@ class TalkingDetector:
         self,
         mar_threshold: float = 0.035,
         smooth_frames: int = 3,
+        detect_interval: int = 3,
         model_path: Optional[str] = None,
     ):
         """
         Args:
-            mar_threshold:  MAR 超过此值判定为说话（推荐 0.03-0.06，需按场景调参）
-            smooth_frames:  滑动平均帧数，抑制单帧抖动
-            model_path:     face_landmarker.task 路径；None 时使用默认路径并自动下载
+            mar_threshold:   MAR 超过此值判定为说话（推荐 0.03-0.06，需按场景调参）
+            smooth_frames:   滑动平均帧数，抑制单帧抖动
+            detect_interval: 每隔多少帧才跑一次 MediaPipe（默认 3，即约 1/3 推理开销）
+            model_path:      face_landmarker.task 路径；None 时使用默认路径并自动下载
         """
         if not _MP_AVAILABLE:
             raise RuntimeError(
                 "mediapipe 导入失败，请确认已安装：pip install mediapipe"
             )
 
-        self.mar_threshold = mar_threshold
-        self.smooth_frames = smooth_frames
+        self.mar_threshold    = mar_threshold
+        self.smooth_frames    = smooth_frames
+        self.detect_interval  = max(1, detect_interval)
 
         if model_path is None:
             model_path = os.path.join(_DEFAULT_MODEL_DIR, _MODEL_FILENAME)
@@ -100,6 +103,9 @@ class TalkingDetector:
 
         # track_id → 最近 N 帧 MAR 值
         self._mar_history: dict = {}
+        # track_id → (帧计数, 上次检测结果)
+        self._frame_counter: dict = {}
+        self._last_result: dict = {}
 
     # ── 内部方法 ──────────────────────────────────────────────────────────
 
@@ -168,16 +174,22 @@ class TalkingDetector:
         Returns:
             True = 说话中，False = 静默
         """
+        # 跳帧：非检测帧直接返回上次结果
+        count = self._frame_counter.get(track_id, 0)
+        self._frame_counter[track_id] = count + 1
+        if count % self.detect_interval != 0:
+            return self._last_result.get(track_id, False)
+
         face_crop, _ = self._crop_face(frame, keypoints)
         if face_crop is None:
-            return False
+            return self._last_result.get(track_id, False)
 
         rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self._landmarker.detect(mp_image)
 
         if not result.face_landmarks:
-            return False
+            return self._last_result.get(track_id, False)
 
         fh, fw = face_crop.shape[:2]
         mar = self._compute_mar(result.face_landmarks[0], fw, fh)
@@ -187,12 +199,15 @@ class TalkingDetector:
         if len(history) > self.smooth_frames:
             history.pop(0)
 
-        avg_mar = sum(history) / len(history)
-        return avg_mar > self.mar_threshold
+        talking = (sum(history) / len(history)) > self.mar_threshold
+        self._last_result[track_id] = talking
+        return talking
 
     def cleanup_track(self, track_id: int) -> None:
         """清理已消失目标的历史数据，防止内存泄漏。"""
         self._mar_history.pop(track_id, None)
+        self._frame_counter.pop(track_id, None)
+        self._last_result.pop(track_id, None)
 
     def close(self) -> None:
         """释放 FaceLandmarker 资源。"""
