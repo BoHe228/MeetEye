@@ -136,6 +136,7 @@ class FisheyePanoramaYOLOPose:
                 iou_threshold=0.2,
                 reid_similarity_threshold=0.7,
                 dedup_use_reid=getattr(args, 'dedup_use_reid', False),
+                verbose=False,
             )
 
         # 边界匹配公共参数（两种 tracker 共用）

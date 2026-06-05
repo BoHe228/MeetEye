@@ -1,6 +1,7 @@
 import numpy as np
 from typing import List, Tuple, Dict, Any
 import cv2
+from math import sqrt
 from ultralytics.engine.results import Results
 
 import sys
@@ -309,8 +310,29 @@ class PanoramaSlicer:
                 if suppressed[j]:
                     continue
 
-                # 来自不同切片才可能是重复检测
+                # 同切片内：YOLO 偶尔对同一人输出两个框（如全身+头部），
+                # 标准 IoU 可能只有 0.09，但 min-IoU（小框面积为分母）趋近 1.0。
+                # 用 min-IoU > 0.7 压制"小框大部分落在大框内"的同人重复检测。
                 if all_detection_infos[i]['slice_idx'] == all_detection_infos[j]['slice_idx']:
+                    _b1 = all_boxes[i]; _b2 = all_boxes[j]
+                    _ix1 = max(_b1[0], _b2[0]); _iy1 = max(_b1[1], _b2[1])
+                    _ix2 = min(_b1[2], _b2[2]); _iy2 = min(_b1[3], _b2[3])
+                    _inter = max(0.0, _ix2 - _ix1) * max(0.0, _iy2 - _iy1)
+                    _min_a = min((_b1[2]-_b1[0])*(_b1[3]-_b1[1]),
+                                 (_b2[2]-_b2[0])*(_b2[3]-_b2[1]))
+                    _intra_min_iou = _inter / (_min_a + 1e-6)
+                    if _intra_min_iou > 0.7:
+                        if self.verbose:
+                            _cx1 = (_b1[0]+_b1[2])/2; _cx2 = (_b2[0]+_b2[2])/2
+                            print(f"[同切片去重] 检测{i}和{j}"
+                                  f"(slice{all_detection_infos[i]['slice_idx']},"
+                                  f"cx={_cx1:.0f}/{_cx2:.0f})："
+                                  f"min_iou={_intra_min_iou:.3f} → 同人重复框，去重")
+                        if all_scores[i] >= all_scores[j]:
+                            suppressed[j] = True
+                        else:
+                            suppressed[i] = True
+                            break
                     continue
 
                 # 检查是否是环绕边界对（首切片 & 末切片，即 slice0 与 slice(N-1)）
@@ -390,6 +412,17 @@ class PanoramaSlicer:
                     # 解决切片边缘"一高一矮"导致标准IoU偏低、去重失败的问题
                     b1 = all_boxes[i]
                     b2 = all_boxes[j]
+                    cx1 = (b1[0] + b1[2]) / 2
+                    cx2 = (b2[0] + b2[2]) / 2
+
+                    # 边界近邻门控：只对靠近共享切片边界的框做去重
+                    # 距边界超过 3×overlap_width 的框不可能是跨切片重复检测
+                    _sw = panorama_width // num_slices
+                    _boundary_x = max(slice_i, slice_j) * _sw
+                    _max_dist = 3.0 * _sw * self.overlap_ratio
+                    if abs(cx1 - _boundary_x) > _max_dist or abs(cx2 - _boundary_x) > _max_dist:
+                        continue
+
                     inter_x1 = max(b1[0], b2[0]); inter_y1 = max(b1[1], b2[1])
                     inter_x2 = min(b1[2], b2[2]); inter_y2 = min(b1[3], b2[3])
                     inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
@@ -425,9 +458,43 @@ class PanoramaSlicer:
                             else:
                                 suppressed[i] = True
                                 break
-                    # else:
-                        # 不是同一目标（可能是邻近的不同人）：都保留
-                        # print(f"[边界去重] 检测{i}和{j}（都在边界）：IoU={iou:.3f}，但不是同一目标 → 都保留")
+                    else:
+                        # min_iou 未达阈值时的中心距离兜底：
+                        # 适用于同一人在切片边界被检测为两个不同高度的框（如一个只检测到头部、
+                        # 一个检测到全身），导致 YOLO 原始框重叠少，但同一人归一化中心距很小。
+                        cy1 = (b1[1] + b1[3]) / 2
+                        cy2 = (b2[1] + b2[3]) / 2
+                        avg_h = ((b1[3] - b1[1]) + (b2[3] - b2[1])) / 2.0
+                        cd_norm = sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) / max(avg_h, 1.0)
+                        is_same_target = False
+                        if cd_norm < 0.8:
+                            if not self.dedup_use_reid:
+                                is_same_target = True
+                                if self.verbose:
+                                    print(f"[相邻去重(CD)] 检测{i}(slice{slice_i},cx={cx1:.0f})和{j}(slice{slice_j},cx={cx2:.0f})："
+                                          f"min_iou={min_iou:.3f}, cd={cd_norm:.2f} → 中心距近，去重")
+                            else:
+                                feat1 = all_features[i]
+                                feat2 = all_features[j]
+                                if feat1 is not None and feat2 is not None:
+                                    similarity = cosine_similarity(feat1, feat2)
+                                    if similarity >= self.reid_similarity_threshold:
+                                        is_same_target = True
+                                        if self.verbose:
+                                            print(f"[相邻去重(CD)] 检测{i}(slice{slice_i})和{j}(slice{slice_j})："
+                                                  f"cd={cd_norm:.2f}, 特征={similarity:.3f} → 去重")
+                                else:
+                                    if self._are_keypoints_similar(all_keypoints[i], all_keypoints[j]):
+                                        is_same_target = True
+                        elif self.verbose:
+                            print(f"[相邻未去重] 检测{i}(slice{slice_i},cx={cx1:.0f})和{j}(slice{slice_j},cx={cx2:.0f})："
+                                  f"min_iou={min_iou:.3f}, cd={cd_norm:.2f} [边界x={_boundary_x}]")
+                        if is_same_target:
+                            if all_scores[i] >= all_scores[j]:
+                                suppressed[j] = True
+                            else:
+                                suppressed[i] = True
+                                break
 
         # === 第四步：应用面积加权NMS处理剩余检测 ===
         keep_indices = []
