@@ -253,6 +253,7 @@ def draw_keypoints(image: np.ndarray, detections: List[Dict]) -> np.ndarray:
         绘制后的图像
     """
     annotated = image.copy()
+    seam_threshold = image.shape[1] // 2  # 跨接缝的骨架线水平跨度必然超过半幅宽
 
     for det in detections:
         if 'keypoints' not in det:
@@ -276,6 +277,8 @@ def draw_keypoints(image: np.ndarray, detections: List[Dict]) -> np.ndarray:
                 x2, y2, conf2 = keypoints[end_idx]
 
                 if conf1 > 0.3 and conf2 > 0.3:
+                    if abs(x1 - x2) > seam_threshold:
+                        continue  # 跨越全景接缝的伪连线，跳过
                     cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)),
                             (0, 255, 0), 2)
 
