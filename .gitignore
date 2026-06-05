@@ -74,7 +74,7 @@ yolo_pose_output/
 data/
 maps/
 yolo_model/
-
+face_rec_model/
 
 # ======================
 # docs 下的演示素材保留
