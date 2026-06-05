@@ -54,6 +54,13 @@ except Exception as _e:
     _FACE_REC_AVAILABLE = False
     print(f"[FaceRec] 导入失败，人脸识别不可用: {_e}")
 
+# 导入说话检测（可选，需 pip install mediapipe）
+try:
+    from utils.talking_detector import TalkingDetector, _MP_AVAILABLE as _TALKING_AVAILABLE
+except Exception as _e:
+    _TALKING_AVAILABLE = False
+    print(f"[TalkingDetector] 导入失败，说话检测不可用: {_e}")
+
 # ── 全局 CUDA 标志（导入时确定一次）─────────────────────────────────────
 _CUDA = torch.cuda.is_available()
 
@@ -116,6 +123,9 @@ class FisheyePanoramaYOLOPose:
         self.face_rec: Optional[FaceRecManager] = None
         self._face_name_map: Dict[int, str] = {}   # track_id → person_name
         self._prev_track_ids: set = set()
+
+        # 说话检测
+        self.talking_detector: Optional['TalkingDetector'] = None
         self.num_slices = getattr(args, 'num_slices', 3)
         self.slice_overlap = getattr(args, 'slice_overlap', 0.05)
         self.use_tracker = (args.tracker != 'none')
@@ -324,6 +334,20 @@ class FisheyePanoramaYOLOPose:
                     print(f"警告: 人脸识别初始化失败: {e}")
                     self.face_rec = None
 
+        # ── 说话检测 ─────────────────────────────────────────────────────
+        if getattr(self.args, 'talking_detection', False):
+            if not _TALKING_AVAILABLE:
+                print("警告: mediapipe 未安装，说话检测不可用。请运行: pip install mediapipe")
+            else:
+                try:
+                    self.talking_detector = TalkingDetector(
+                        mar_threshold=getattr(self.args, 'talking_mar_threshold', 0.035),
+                    )
+                    print("说话检测已启用（MediaPipe FaceMesh MAR）")
+                except Exception as e:
+                    print(f"警告: 说话检测初始化失败: {e}")
+                    self.talking_detector = None
+
         print("初始化完成！")
         return True
 
@@ -505,6 +529,16 @@ class FisheyePanoramaYOLOPose:
                 self._face_name_map.pop(gone, None)
                 self.face_rec.cleanup_track(gone)
         self._prev_track_ids = current_ids
+
+        # ⑦-c 说话检测  [CPU, MediaPipe]
+        if self.talking_detector is not None:
+            gone_ids = set(self._mar_prev_ids) - current_ids if hasattr(self, '_mar_prev_ids') else set()
+            for gone in gone_ids:
+                self.talking_detector.cleanup_track(gone)
+            self._mar_prev_ids = current_ids
+            for det in tracked_detections:
+                kpts = det.get('keypoints', [])
+                det['talking'] = self.talking_detector.detect(panorama, kpts, det['track_id'])
 
         annotated_panorama = draw_detections(panorama, tracked_detections, self.tracker,
                                              show_id=self.show_id, show_conf=self.show_conf,

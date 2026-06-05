@@ -238,6 +238,18 @@ def draw_bounding_boxes(image: np.ndarray, detections: List[Dict],
             2
         )
 
+        # 说话状态标签（框右下角）
+        talking = det.get('talking')
+        if talking is not None:
+            t_label = "Speaking" if talking else "Silent"
+            t_color = (0, 200, 80) if talking else (180, 180, 180)
+            (tw, th), _ = cv2.getTextSize(t_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            tx1 = x2 - tw - 4
+            ty1 = y2 - th - 4
+            cv2.rectangle(annotated, (tx1 - 2, ty1 - 2), (x2, y2), t_color, -1)
+            cv2.putText(annotated, t_label, (tx1, y2 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
     return annotated
 
 

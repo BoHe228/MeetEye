@@ -114,6 +114,12 @@ def parse_args():
     parser.add_argument('--face-rec-cooldown', type=int, default=30,
                         help='未识别目标重试间隔帧数，避免每帧触发推理（默认: 30）')
 
+    # 说话检测开关
+    parser.add_argument('--talking-detection', action=argparse.BooleanOptionalAction, default=False,
+                        help='是否启用说话检测（基于 MediaPipe FaceMesh MAR，需 pip install mediapipe，默认: False）')
+    parser.add_argument('--talking-mar-threshold', type=float, default=0.035,
+                        help='嘴巴纵横比（MAR）阈值，超过则判定为说话（默认: 0.035，可按场景在 0.03-0.06 间调整）')
+
     # 画面标注显示开关
     parser.add_argument('--show-id', action=argparse.BooleanOptionalAction, default=True,
                         help='是否在检测框上显示 Track ID (默认: True)')
