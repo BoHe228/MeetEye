@@ -119,7 +119,7 @@ def parse_args():
                         help='是否启用说话检测（基于 MediaPipe FaceMesh MAR，需 pip install mediapipe，默认: False）')
     parser.add_argument('--talking-mar-threshold', type=float, default=0.035,
                         help='嘴巴纵横比（MAR）阈值，超过则判定为说话（默认: 0.035，可按场景在 0.03-0.06 间调整）')
-    parser.add_argument('--talking-detect-interval', type=int, default=3,
+    parser.add_argument('--talking-detect-interval', type=int, default=15,
                         help='说话检测跳帧间隔：每隔 N 帧才跑一次 MediaPipe，中间帧复用上次结果（默认: 3）')
 
     # 画面标注显示开关
