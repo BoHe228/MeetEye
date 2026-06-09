@@ -16,7 +16,7 @@ Detects, tracks, and estimates the azimuth, elevation, and distance of every per
      docs/demo_coast.mp4 into the edit box → GitHub generates a
      https://github.com/user-attachments/assets/xxxx URL → replace the placeholder
      line below with that URL → save to show the inline player -->
-<!-- Paste the user-attachments link here after uploading docs/demo_coast.mp4 -->
+[<!-- Paste the user-attachments link here after uploading docs/demo_coast.mp4 -->](https://github.com/user-attachments/assets/141b880a-fcd8-4ae8-ba29-a69648f7ba5c)
 
 <br>
 
