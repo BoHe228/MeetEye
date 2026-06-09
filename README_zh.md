@@ -15,7 +15,7 @@
 <!-- 内嵌播放器步骤：网页打开此 README → Edit → 把本地 docs/demo_coast.mp4 拖入编辑框
      → GitHub 自动上传生成 https://github.com/user-attachments/assets/xxxx 链接
      → 用该链接替换下面这一行占位 → 保存即显示播放器 -->
-<!-- 在此粘贴上传 docs/demo_coast.mp4 后得到的 user-attachments 链接 -->
+[<!-- 在此粘贴上传 docs/demo_coast.mp4 后得到的 user-attachments 链接 -->](https://github.com/user-attachments/assets/141b880a-fcd8-4ae8-ba29-a69648f7ba5c)
 
 <br>
 
