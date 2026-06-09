@@ -187,7 +187,9 @@ class PanoramaSlicer:
         slice_infos: List[dict],
         slice_images: List[np.ndarray] = None,
         slice_tensors=None,          # GPU [3,H,W] float 0-1 RGB 张量列表（优先级高于 slice_images）
-        feature_extractor=None
+        feature_extractor=None,
+        recall_yolo_results: List[List[Results]] = None,  # 补漏检测模型的逐切片结果（--recall-boost）
+        recall_match_iou: float = 0.4,                    # 补漏框与 pose 框的 IoU 关联阈值
     ) -> List[Dict[str, Any]]:
         """
         合并所有切片的检测结果 - 基于ReID特征的智能去重
@@ -210,6 +212,33 @@ class PanoramaSlicer:
                 slice_info=info
             )
             all_detections.append(detections)
+
+        # === 第一步(a)：补漏融合（--recall-boost）===
+        # 对每个切片，提取补漏检测模型的 person 框；凡是与本切片任何 pose 框
+        # IoU >= recall_match_iou 的，视为同一人已被 pose 覆盖 → 丢弃（保留带关键点的 pose 版本）；
+        # 与所有 pose 框都不重叠的，作为「无关键点检测」补入（遮挡/背身等 pose 漏检目标）。
+        # 在切片局部坐标下做关联，补入的框随后与 pose 框一起做特征提取、坐标转换、去重与 NMS。
+        if recall_yolo_results is not None:
+            _added = 0
+            for slice_idx, recall_results in enumerate(recall_yolo_results):
+                if slice_idx >= len(all_detections):
+                    break
+                recall_dets = self.extract_detections_from_yolo_results(
+                    recall_results,
+                    slice_img=None,
+                    feature_extractor=None,
+                    slice_info=slice_infos[slice_idx]
+                )
+                pose_boxes = [d['bbox'] for d in all_detections[slice_idx]]
+                for rdet in recall_dets:
+                    rb = rdet['bbox']
+                    matched = any(box_iou(rb, pb) >= recall_match_iou for pb in pose_boxes)
+                    if not matched:
+                        rdet['from_recall'] = True   # 标记来源，便于调试/下游区分
+                        all_detections[slice_idx].append(rdet)
+                        _added += 1
+            if self.verbose and _added:
+                print(f"[补漏融合] 本帧补入 {_added} 个 pose 漏检目标（无关键点）")
 
         # === 第一步(b)：批量 OSNet 特征提取（所有切片 crop 一次 forward pass）===
         # 优先使用 GPU 张量路径（省去 numpy→PIL→transform CPU 开销，约 5ms）

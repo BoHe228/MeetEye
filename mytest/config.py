@@ -59,6 +59,22 @@ def parse_args():
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
 
+    # 补漏检测（recall boost）：额外跑一个检测模型，捞回 pose 漏检的遮挡/背身目标（无关键点）
+    parser.add_argument('--recall-boost', action='store_true',
+                        help='启用补漏检测：额外跑一个纯检测模型，把 pose 模型漏掉的'
+                             '（肩部/下半身被遮挡、背身等）目标作为无关键点框补进来 (默认: 关闭)')
+    parser.add_argument('--recall-model', type=str, default='./yolo_model/yolo26n.engine',
+                        help='补漏检测模型路径（建议用 nano 纯检测模型，如 yolo26n.pt）')
+    parser.add_argument('--recall-conf-threshold', type=float, default=0.4,
+                        help='补漏检测模型专用置信度阈值（独立于主模型的 --conf-threshold）：'
+                             '设高一些可避免低阈值引入不合适的框，只补回较可靠的遮挡/背身目标 (默认: 0.4)')
+    parser.add_argument('--recall-match-iou', type=float, default=0.4,
+                        help='补漏框与 pose 框的 IoU 关联阈值：超过即视为同一人已被 pose 覆盖、'
+                             '丢弃该补漏框；低于则作为新目标补入 (默认: 0.4)')
+    parser.add_argument('--recall-head-ratio', type=float, default=0.12,
+                        help='补漏框（无关键点）合成鼻子点时，头部 y 取「框顶往下该比例×框高」处；'
+                             '用框中心 x 保证水平角准确，靠顶部近似头部使俯仰角与 pose 口径一致 (默认: 0.12)')
+
     # OSNet 开关与模型选择
     parser.add_argument('--use-osnet', action=argparse.BooleanOptionalAction, default=True,
                         help='是否启用 OSNet 特征提取；--no-use-osnet 完全跳过，节省计算 (默认: True)')
@@ -117,7 +133,7 @@ def parse_args():
     # 说话检测开关
     parser.add_argument('--talking-detection', action=argparse.BooleanOptionalAction, default=False,
                         help='是否启用说话检测（基于 MediaPipe FaceMesh MAR，需 pip install mediapipe，默认: False）')
-    parser.add_argument('--talking-mar-threshold', type=float, default=0.035,
+    parser.add_argument('--talking-mar-threshold', type=float, default=0.06,
                         help='嘴巴纵横比（MAR）阈值，超过则判定为说话（默认: 0.035，可按场景在 0.03-0.06 间调整）')
     parser.add_argument('--talking-detect-interval', type=int, default=15,
                         help='说话检测跳帧间隔：每隔 N 帧才跑一次 MediaPipe，中间帧复用上次结果（默认: 3）')
@@ -134,7 +150,7 @@ def parse_args():
 
     # 检测框策略
     # --kalman-bbox   : 跟踪输出改用 Kalman 状态框（非 YOLO 原始框），
-    #                   且在目标暂时未被检测到时继续用 Kalman 预测框保持显示（灰色细线）
+    #                   且在目标暂时未被检测到时继续用 Kalman 预测框保持显示（蓝色细线）
     # --kpt-track     : 跟踪输入（送进 tracker 的 bbox）改用关键点推导框，
     #                   减少大框之间的假性重叠，降低 freeze_feat 误触发
     # --kpt-display   : 仅画面绘制时改用关键点推导框，不影响跟踪逻辑

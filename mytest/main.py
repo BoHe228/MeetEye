@@ -289,6 +289,24 @@ class FisheyePanoramaYOLOPose:
         else:
             print("未检测到 CUDA GPU，使用 CPU 推理")
 
+        # ── 补漏检测模型（--recall-boost）─────────────────────────────
+        # 用一个纯检测模型捞回 pose 漏检的遮挡/背身目标，作为无关键点框补入。
+        self.recall_detector = None
+        if getattr(self.args, 'recall_boost', False):
+            if not os.path.exists(self.args.recall_model):
+                print(f"警告: 补漏模型 {self.args.recall_model} 不存在，补漏检测已禁用")
+            else:
+                _recall_conf = getattr(self.args, 'recall_conf_threshold', 0.4)
+                self.recall_detector = YOLOPoseDetector(
+                    model_path=self.args.recall_model,
+                    conf_threshold=_recall_conf,
+                    iou_threshold=self.args.iou_threshold,
+                )
+                if _CUDA and not self.args.recall_model.endswith('.engine'):
+                    self.recall_detector.model.to('cuda')
+                print(f"补漏检测已启用: {self.args.recall_model}"
+                      f"（置信度阈值={_recall_conf}, IoU 关联阈值={self.args.recall_match_iou}）")
+
         self.display_manager = DisplayManager(
             use_dual_windows=self.args.use_dual_windows,
             no_display=self.no_display
@@ -477,6 +495,10 @@ class FisheyePanoramaYOLOPose:
         # ⑤ 批量 YOLO 推理  [GPU]
         with torch.no_grad():
             all_yolo_results = self.yolo_detector.detect_batch(slices)
+            # 补漏路（--recall-boost）：同样的切片再跑一次纯检测模型
+            recall_yolo_results = None
+            if getattr(self, 'recall_detector', None) is not None:
+                recall_yolo_results = self.recall_detector.detect_batch(slices)
         sync()
         t[5] = time.perf_counter()
 
@@ -487,7 +509,9 @@ class FisheyePanoramaYOLOPose:
             slice_infos,
             slice_images=slices,
             slice_tensors=slice_tensors_gpu,
-            feature_extractor=self.feature_extractor
+            feature_extractor=self.feature_extractor,
+            recall_yolo_results=recall_yolo_results,
+            recall_match_iou=getattr(self.args, 'recall_match_iou', 0.4),
         )
         filtered_detections = filter_cross_boundary_detections(merged_detections, panorama.shape)
         filtered_detections = self.slicer.filter_wide_detections(filtered_detections, panorama.shape[1])
@@ -554,7 +578,24 @@ class FisheyePanoramaYOLOPose:
         # ⑧ 角度计算  [CPU]
         angle_info = None
         if tracked_detections and self.angle_calculator:
-            kpts_list = [np.array(d['keypoints']) for d in tracked_detections if d.get('keypoints')]
+            # 有真实关键点的（pose）直接用；无关键点的（补漏框）用「框顶中心」合成一个鼻子点：
+            #   x 取框中心 → 水平角准确；y 取框顶往下 recall_head_ratio×框高 → 近似头部，
+            #   使俯仰角与 pose 口径一致。其余点留零（仅鼻子 COCO 索引 0 参与角度计算），
+            #   补够 17×3 以满足 calculate_angles_from_keypoints 的 >=5 点校验。
+            _head_ratio = getattr(self.args, 'recall_head_ratio', 0.12)
+            kpts_list = []
+            _recall_pts = []   # 补漏框的合成鼻子点，仅用于可视化标记（不写入 det['keypoints']）
+            for d in tracked_detections:
+                kp = d.get('keypoints')
+                if kp:
+                    kpts_list.append(np.array(kp))
+                else:
+                    x1, y1, x2, y2 = d['bbox']
+                    nx, ny = (x1 + x2) / 2.0, y1 + _head_ratio * (y2 - y1)
+                    synth = np.zeros((17, 3), dtype=np.float32)
+                    synth[0] = [nx, ny, 1.0]
+                    kpts_list.append(synth)
+                    _recall_pts.append((int(nx), int(ny)))
             if kpts_list:
                 angle_info = self.angle_calculator.calculate_angles_from_keypoints(
                     np.array(kpts_list)
@@ -568,6 +609,10 @@ class FisheyePanoramaYOLOPose:
                         show_angle=self.show_angle,
                         show_arrow=self.show_arrow,
                     )
+                # 补漏框合成点用洋红实心圈+白边标记，区别于 pose 的黄/橙鼻子圈，便于确认角度生效
+                for (px, py) in _recall_pts:
+                    cv2.circle(annotated_panorama, (px, py), 6, (255, 0, 255), -1)
+                    cv2.circle(annotated_panorama, (px, py), 8, (255, 255, 255), 2)
         t[8] = time.perf_counter()
 
         # ── 每 30 帧打印一次各步耗时 ─────────────────────────────────
