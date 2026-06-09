@@ -164,6 +164,10 @@ class FisheyePanoramaYOLOPose:
             enable_right_boundary=True,
         )
 
+        # 无 OSNet 特征时禁用 ReID 关联：零特征会让 embedding_distance 的余弦距离变 NaN，
+        # 污染关联代价矩阵，导致高置信度目标也无法关联确认而被丢弃（见 HybridSORT association.py）。
+        _reid_ok = getattr(args, 'use_osnet', True)
+
         if args.tracker == 'botsort':
             self.tracker = BoT_SORTTracker(
                 track_high_thresh=0.5,
@@ -174,9 +178,10 @@ class FisheyePanoramaYOLOPose:
                 match_thresh=args.botsort_match_thresh,
                 appearance_thresh=args.appearance_thresh,
                 reid_lost_thresh=args.reid_lost_thresh,
-                with_reid=True,
+                with_reid=_reid_ok,
                 use_hungarian=args.use_hungarian,
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
+                coast_frames=getattr(args, 'coast_frames', 0),
                 **_boundary_kwargs,
             )
         elif args.tracker == 'hybridsort':
@@ -210,7 +215,7 @@ class FisheyePanoramaYOLOPose:
                 # 应对遮挡后框大小变化导致 IoU 不足进而重新生成 ID 的问题
                 cd_thresh=0.5,
                 # ── ReID ────────────────────────────────────────────────────
-                with_reid=args.use_reid,
+                with_reid=(args.use_reid and _reid_ok),
                 reid_emb_weight_high=args.reid_emb_weight_high,
                 reid_emb_weight_low=args.reid_emb_weight_low,
                 # ── 全景图尺寸 ───────────────────────────────────────────────
@@ -221,6 +226,7 @@ class FisheyePanoramaYOLOPose:
                 smooth_bbox_alpha=getattr(args, 'smooth_bbox_alpha', 0.5),
                 # ── Kalman 轨迹框 ────────────────────────────────────────────
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
+                coast_frames=getattr(args, 'coast_frames', 0),
                 **_boundary_kwargs,
             )
         else:

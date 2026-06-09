@@ -204,6 +204,13 @@ def draw_bounding_boxes(image: np.ndarray, detections: List[Dict],
             color = (0, 165, 255)
 
         thickness = 1 if is_lost else 2
+
+        # 扇区代表（--sector-output 选中的目标）：整框改画红色加粗强调，
+        # 直接替换原置信度色，避免另叠加一个红框造成"红框+原色框"双框。
+        if det.get('_sector_rep'):
+            color = (0, 0, 255)
+            thickness = 3
+
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
 
         label_parts = []

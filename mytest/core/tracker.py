@@ -671,8 +671,10 @@ class BoT_SORTTracker:
                  enable_bottom_boundary: bool = True,  # 是否启用底部边界
                  enable_left_boundary: bool = True,  # 是否启用左侧边界
                  enable_right_boundary: bool = True,  # 是否启用右侧边界
-                 kalman_bbox: bool = False):  # 是否用 Kalman 状态框替代 YOLO 原始框 + 显示 lost 预测框
+                 kalman_bbox: bool = False,  # 是否用 Kalman 状态框替代 YOLO 原始框 + 显示 lost 预测框
+                 coast_frames: int = 0):     # >0：丢失轨迹用 Kalman 预测框续命至多 N 帧（独立开关，不改正常框）
         self.kalman_bbox = kalman_bbox
+        self.coast_frames = coast_frames
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
         self.removed_stracks: List[STrack] = []
@@ -1077,12 +1079,17 @@ class BoT_SORTTracker:
         if self.enable_boundary_matching and self.boundary_tracker is not None:
             output_detections = self.boundary_tracker.post_process(output_detections)
 
-        # === use_track_bbox：补充 lost 轨迹的 Kalman 预测框 ===
-        # lost_stracks 已经过 Kalman predict，tlbr 是本帧预测位置
-        if self.kalman_bbox:
+        # === 补充 lost 轨迹的 Kalman 预测框（续命/coasting）===
+        # lost_stracks 已经过 Kalman predict，tlbr 是本帧预测位置。
+        # 触发：kalman_bbox 或 coast_frames>0。续命时长：coast_frames>0 时限至多 N 帧
+        # （短尺度时间平滑，N 帧内未重现即停止显示，不留幽灵框）；否则沿用原 max_time_lost。
+        if self.kalman_bbox or self.coast_frames > 0:
+            _coast_limit = self.coast_frames if self.coast_frames > 0 else self.max_time_lost
             class_name = detections[0].get('class_name', 'person') if detections else 'person'
             for track in self.lost_stracks:
                 if not track.is_activated:
+                    continue
+                if track.time_since_update > _coast_limit:
                     continue
                 final_track_id = track.track_id
                 if hasattr(track, '_boundary_matched_id'):
@@ -1229,6 +1236,8 @@ class HybridSortTracker:
         smooth_bbox_alpha: float = 0.5,  # EMA 系数，0=纯当前帧，1=纯历史
         # ── Kalman 轨迹框 ──
         kalman_bbox: bool = False,    # True → 输出 Kalman 状态框而非 YOLO 原始框
+        # ── 丢失轨迹预测框续命（coasting，独立开关，不改正常框）──
+        coast_frames: int = 0,        # >0：丢失轨迹用 Kalman 预测框续命至多 N 帧，N 帧内未重现即停止显示
         # ── Round 3.5 中心距离兜底 ──
         cd_thresh: float = 0.5,       # 归一化中心点距离阈值（< 0 关闭）
         # ── 全景图尺寸 ──
@@ -1373,6 +1382,7 @@ class HybridSortTracker:
         self._smooth_bbox_alpha = float(np.clip(smooth_bbox_alpha, 0.0, 0.99))
         self._bbox_size_cache: Dict[int, Tuple[float, float, float, float]] = {}  # track_id → (cx, cy, w, h)
         self.kalman_bbox = kalman_bbox
+        self.coast_frames = coast_frames
 
     # ── 内部工具 ─────────────────────────────────────────────────────────────
 
@@ -1700,12 +1710,17 @@ class HybridSortTracker:
         if self.enable_boundary_matching and self.boundary_tracker is not None:
             output_detections = self.boundary_tracker.post_process(output_detections)
 
-        # === use_track_bbox：补充 lost 轨迹的 Kalman 预测框 ===
-        if self.kalman_bbox:
+        # === 补充 lost 轨迹的 Kalman 预测框（续命/coasting）===
+        # 触发：kalman_bbox 或 coast_frames>0。续命时长：coast_frames>0 时限至多 N 帧
+        # （短尺度时间平滑，N 帧内未重现即停止显示，不留幽灵框）；否则沿用原 max_age。
+        if self.kalman_bbox or self.coast_frames > 0:
+            _coast_limit = self.coast_frames if self.coast_frames > 0 else self._max_age
             output_internal_ids = {int(row[4]) for row in online_targets}
             for trk in self._inner.trackers:
                 if trk.id < 0:
                     continue  # 未确认轨迹（尚未分配 ID），不输出预测框
+                if trk.time_since_update > _coast_limit:
+                    continue  # 超过续命窗口仍未重现 → 停止显示预测框
                 tid = trk.id + 1
                 if tid in output_internal_ids:
                     continue  # 本帧已匹配，已在输出里

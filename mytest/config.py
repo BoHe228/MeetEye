@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument('--recall-conf-threshold', type=float, default=0.4,
                         help='补漏检测模型专用置信度阈值（独立于主模型的 --conf-threshold）：'
                              '设高一些可避免低阈值引入不合适的框，只补回较可靠的遮挡/背身目标 (默认: 0.4)')
-    parser.add_argument('--recall-match-iou', type=float, default=0.4,
+    parser.add_argument('--recall-match-iou', type=float, default=0.3,
                         help='补漏框与 pose 框的 IoU 关联阈值：超过即视为同一人已被 pose 覆盖、'
                              '丢弃该补漏框；低于则作为新目标补入 (默认: 0.4)')
     parser.add_argument('--recall-head-ratio', type=float, default=0.12,
@@ -156,6 +156,10 @@ def parse_args():
     # --kpt-display   : 仅画面绘制时改用关键点推导框，不影响跟踪逻辑
     parser.add_argument('--kalman-bbox', action='store_true', default=False,
                         help='用 Kalman 状态框替代 YOLO 原始框输出；目标丢失时继续显示预测框（灰色）(默认: False)')
+    parser.add_argument('--coast-frames', type=int, default=0,
+                        help='丢失轨迹预测框续命帧数（独立开关，不改正常框）：>0 时目标某帧漏检后'
+                             '继续用 Kalman 预测框显示至多 N 帧，N 帧内重现则接回真实框、否则停止显示，'
+                             '用于平滑 1~2 帧瞬时漏检的闪烁。0=关闭。建议 2 (默认: 0)')
     parser.add_argument('--kpt-track', action='store_true', default=False,
                         help='跟踪层（IoU 匹配 + Kalman 初始化）使用关键点推导框，减少大框重叠误判 (默认: False)')
     parser.add_argument('--kpt-display', action='store_true', default=False,
@@ -205,6 +209,14 @@ def parse_args():
                         help='将每帧推理结果追加保存为 JSONL 文件（每行一个 JSON，含角度/距离/特征）')
     parser.add_argument('--json-output', type=str, default=None,
                         help='JSONL 输出文件路径（默认：output_dir/视频名或camera_时间戳.jsonl）')
+
+    # 扇区聚合输出（仅 WebUI 模式生效）：水平 360° 等分为 N 个扇区，
+    # 每帧每个扇区内取检测框最大的目标作为代表，输出扇区→（有无目标 + 水平角/俯仰角）。
+    parser.add_argument('--sector-output', action='store_true', default=False,
+                        help='JSON 改为扇区聚合格式：忽略 ID，按水平角把目标分入扇区，'
+                             '每扇区取检测框最大者输出其水平角/俯仰角 (默认: 关闭，沿用按 ID 输出)')
+    parser.add_argument('--num-sectors', type=int, default=8,
+                        help='水平 360° 等分的扇区数（可改 16 等），配合 --sector-output (默认: 8)')
 
     # 是否使用外部UI
     parser.add_argument('--webui', action='store_true', help='Run with local web UI (browser)')

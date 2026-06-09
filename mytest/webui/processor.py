@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import config as _config
 
+import cv2
 import numpy as np
 import torch
 
@@ -35,6 +36,7 @@ from utils import (
     compute_stable_bbox_from_keypoints,
 )
 from utils.feature_extractor import FeatureExtractor
+from utils.sector import aggregate_sectors
 
 try:
     from face_rec.face_rec_manager import FaceRecManager
@@ -52,6 +54,7 @@ class FisheyePanoramaYOLOPose:
         self.args = args
         self.panorama_processor: Optional[FisheyePanoramaGPU] = None
         self.yolo_detector: Optional[YOLOPoseDetector] = None
+        self.recall_detector: Optional[YOLOPoseDetector] = None   # 补漏检测模型（--recall-boost）
         self.display_manager = None
         self.angle_calculator: Optional[AngleCalculator] = None
         self.feature_extractor: Optional[FeatureExtractor] = None
@@ -104,6 +107,10 @@ class FisheyePanoramaYOLOPose:
             enable_right_boundary=True,
         )
 
+        # 无 OSNet 特征时禁用 ReID 关联：零特征会让 embedding_distance 的余弦距离变 NaN，
+        # 污染关联代价矩阵，导致高置信度目标也无法关联确认而被丢弃（见 HybridSORT association.py）。
+        _reid_ok = getattr(args, 'use_osnet', True)
+
         if args.tracker == 'botsort':
             self.tracker = BoT_SORTTracker(
                 track_high_thresh=0.5,
@@ -114,9 +121,10 @@ class FisheyePanoramaYOLOPose:
                 match_thresh=args.botsort_match_thresh,
                 appearance_thresh=args.appearance_thresh,
                 reid_lost_thresh=args.reid_lost_thresh,
-                with_reid=True,
+                with_reid=_reid_ok,
                 use_hungarian=args.use_hungarian,
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
+                coast_frames=getattr(args, 'coast_frames', 0),
                 **_boundary_kwargs,
             )
         elif args.tracker == 'hybridsort':
@@ -143,7 +151,7 @@ class FisheyePanoramaYOLOPose:
                 # Round 3.5 兜底
                 cd_thresh=0.5,
                 # ── ReID ──────────────────────────────────────────────────
-                with_reid=args.use_reid,
+                with_reid=(args.use_reid and _reid_ok),
                 reid_emb_weight_high=args.reid_emb_weight_high,
                 reid_emb_weight_low=args.reid_emb_weight_low,
                 # ── 全景图尺寸 ─────────────────────────────────────────────
@@ -154,6 +162,7 @@ class FisheyePanoramaYOLOPose:
                 smooth_bbox_alpha=getattr(args, 'smooth_bbox_alpha', 0.5),
                 # ── Kalman 轨迹框 ───────────────────────────────────────────
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
+                coast_frames=getattr(args, 'coast_frames', 0),
                 **_boundary_kwargs,
             )
         else:
@@ -188,6 +197,26 @@ class FisheyePanoramaYOLOPose:
                 print("YOLO TensorRT 引擎已就绪（GPU 绑定在导出时完成）")
         else:
             print("未检测到 CUDA GPU，使用 CPU 推理")
+
+        # ── 补漏检测模型（--recall-boost）─────────────────────────────
+        # 默认关闭，关闭时不加载、不推理，对实时性零影响。
+        self.recall_detector = None
+        if getattr(self.args, 'recall_boost', False):
+            if not os.path.exists(self.args.recall_model):
+                print(f"警告: 补漏模型 {self.args.recall_model} 不存在，补漏检测已禁用")
+            elif os.path.abspath(self.args.recall_model) == os.path.abspath(self.args.model_path):
+                print("警告: 补漏模型与主模型相同，补漏无意义，已禁用补漏检测")
+            else:
+                _recall_conf = getattr(self.args, 'recall_conf_threshold', 0.4)
+                self.recall_detector = YOLOPoseDetector(
+                    model_path=self.args.recall_model,
+                    conf_threshold=_recall_conf,
+                    iou_threshold=self.args.iou_threshold,
+                )
+                if _CUDA and not self.args.recall_model.endswith('.engine'):
+                    self.recall_detector.model.to('cuda')
+                print(f"补漏检测已启用: {self.args.recall_model}"
+                      f"（置信度阈值={_recall_conf}, IoU 关联阈值={self.args.recall_match_iou}）")
 
         self.display_manager = DisplayManager(
             use_dual_windows=self.args.use_dual_windows,
@@ -345,6 +374,10 @@ class FisheyePanoramaYOLOPose:
         # ⑤ 批量 YOLO 推理  [GPU]
         with torch.no_grad():
             all_yolo_results = self.yolo_detector.detect_batch(slices)
+            # 补漏路（--recall-boost）：同样的切片再跑一次纯检测模型；关闭时为 None，无开销
+            recall_yolo_results = None
+            if self.recall_detector is not None:
+                recall_yolo_results = self.recall_detector.detect_batch(slices)
         sync()
         t[5] = time.perf_counter()
 
@@ -354,6 +387,8 @@ class FisheyePanoramaYOLOPose:
             slice_images=slices,
             slice_tensors=slice_tensors_gpu,
             feature_extractor=self.feature_extractor,
+            recall_yolo_results=recall_yolo_results,
+            recall_match_iou=getattr(self.args, 'recall_match_iou', 0.4),
         )
         filtered = filter_cross_boundary_detections(merged, panorama.shape)
         filtered = self.slicer.filter_wide_detections(filtered, panorama.shape[1])
@@ -393,6 +428,43 @@ class FisheyePanoramaYOLOPose:
                 self.face_rec.cleanup_track(gone)
         self._prev_track_ids = current_ids
 
+        # ⑧ 角度数据计算（仅算数据，画框/画角度在后面）  [CPU]
+        # 有真实关键点的（pose）直接用；无关键点的（补漏框）用「框顶中心」合成一个鼻子点：
+        #   x 取框中心 → 水平角准确；y 取框顶往下 recall_head_ratio×框高 → 近似头部，
+        #   使俯仰角与 pose 口径一致。这样 angle_info['persons'] 与 tracked 严格 1:1 对齐
+        #   （每个目标一条），下游 JSON 直接按下标取角度。
+        angle_info = None
+        _recall_pts = []   # 补漏框的合成鼻子点，仅用于可视化标记（不写入 det['keypoints']）
+        if tracked and self.angle_calculator:
+            _head_ratio = getattr(self.args, 'recall_head_ratio', 0.12)
+            kpts_list = []
+            for d in tracked:
+                kp = d.get('keypoints')
+                if kp:
+                    kpts_list.append(np.array(kp))
+                else:
+                    x1, y1, x2, y2 = d['bbox']
+                    nx, ny = (x1 + x2) / 2.0, y1 + _head_ratio * (y2 - y1)
+                    synth = np.zeros((17, 3), dtype=np.float32)
+                    synth[0] = [nx, ny, 1.0]
+                    kpts_list.append(synth)
+                    _recall_pts.append((int(nx), int(ny)))
+            if kpts_list:
+                angle_info = self.angle_calculator.calculate_angles_from_keypoints(
+                    np.array(kpts_list)
+                )
+
+        # ⑧-b 扇区代表标记（--sector-output）：在画框之前标好哪些目标是扇区代表，
+        #     由 draw_detections 把代表框直接画成红色（单框，不再另叠加），与
+        #     main_GPU_webui 的 JSON 用同一份 aggregate_sectors 判定，保证一致。
+        if getattr(self.args, 'sector_output', False) and tracked:
+            _, rep_indices = aggregate_sectors(
+                tracked, angle_info, getattr(self.args, 'num_sectors', 8)
+            )
+            for i in rep_indices:
+                tracked[i]['_sector_rep'] = True
+
+        # ⑨ 画检测框（扇区代表为红框，其余按置信度色）
         annotated = draw_detections(panorama, tracked, self.tracker,
                                     show_id=self.show_id, show_conf=self.show_conf,
                                     face_name_map=self._face_name_map,
@@ -402,22 +474,20 @@ class FisheyePanoramaYOLOPose:
                                     kpt_bbox_upper_only=self.kpt_bbox_upper_only)
         t[7] = time.perf_counter()
 
-        # ⑧ 角度计算  [CPU]
-        angle_info = None
-        if tracked and self.angle_calculator:
-            kpts_list = [np.array(d['keypoints']) for d in tracked if d.get('keypoints')]
-            if kpts_list:
-                angle_info = self.angle_calculator.calculate_angles_from_keypoints(
-                    np.array(kpts_list)
+        # ⑩ 角度绘制（鼻子圈/箭头 + 补漏框合成点标记）
+        if angle_info is not None:
+            if self.show_angle_overview:
+                annotated = self.angle_calculator.draw_angle_overview(annotated, angle_info)
+            else:
+                annotated = self.angle_calculator.draw_angles_on_image(
+                    annotated, angle_info,
+                    show_angle=self.show_angle,
+                    show_arrow=self.show_arrow,
                 )
-                if self.show_angle_overview:
-                    annotated = self.angle_calculator.draw_angle_overview(annotated, angle_info)
-                else:
-                    annotated = self.angle_calculator.draw_angles_on_image(
-                        annotated, angle_info,
-                        show_angle=self.show_angle,
-                        show_arrow=self.show_arrow,
-                    )
+            # 补漏框合成点用洋红实心圈+白边标记，区别于 pose 的黄/橙鼻子圈
+            for (px, py) in _recall_pts:
+                cv2.circle(annotated, (px, py), 6, (255, 0, 255), -1)
+                cv2.circle(annotated, (px, py), 8, (255, 255, 255), 2)
         t[8] = time.perf_counter()
 
         self._timing_counter += 1

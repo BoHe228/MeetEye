@@ -35,6 +35,7 @@ from webui.gpu_info import update_perf, start_gpu_monitor
 from webui.processor import FisheyePanoramaYOLOPose
 from webui.routes import app
 from utils.distance_estimator import HeadPoseDistanceEstimator
+from utils.sector import aggregate_sectors
 
 
 # ── WebRTC 预转换（在推理线程完成，不在 asyncio 事件循环中执行）────────
@@ -83,9 +84,8 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
     将推理结果序列化为 JSON bytes。
     返回值直接存入 state，可被 /inference/latest 和 /ws/inference 读取。
 
-    track_id ↔ angle_info 对齐方式：
-      angle_info['persons'][j] 对应 tracked 中第 j 个有 keypoints 的目标，
-      因此用过滤后的下标重建 (tracked_index → angle_data) 映射。
+    angle_info['persons'][i] 与 tracked[i] 严格 1:1 对齐（processor 对无关键点的
+    补漏框用合成鼻子点占位）。--sector-output 开启时输出扇区聚合格式，否则按 track_id 输出。
 
     distance 字段使用 HeadPoseDistanceEstimator 进行偏转角修正，
     每个 track_id 持有独立实例以支持帧间熔断缓存。
@@ -93,14 +93,19 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
     global _frame_id_counter, _distance_estimators
     _frame_id_counter += 1
 
-    # 建立 tracked 下标 → 角度数据 的映射
-    angle_by_tracked_idx: dict = {}
-    if angle_info:
-        persons = angle_info.get('persons', [])
-        kpt_indices = [i for i, d in enumerate(tracked or []) if d.get('keypoints')]
-        for j, ti in enumerate(kpt_indices):
-            if j < len(persons) and persons[j] is not None:
-                angle_by_tracked_idx[ti] = persons[j]
+    # ── 扇区聚合格式（--sector-output）──────────────────────────────────
+    if _sector_output:
+        sectors, _reps = aggregate_sectors(tracked, angle_info, _num_sectors)
+        payload = {
+            'timestamp':   round(time.time(), 3),
+            'frame_id':    _frame_id_counter,
+            'num_sectors': _num_sectors,
+            'sectors':     sectors,
+        }
+        return json.dumps(payload, ensure_ascii=False).encode()
+
+    # ── 兼容：按 track_id 输出 ──────────────────────────────────────────
+    persons = (angle_info or {}).get('persons', [])
 
     targets: dict = {}
     current_tids: set = set()
@@ -108,7 +113,7 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
     for i, det in enumerate(tracked or []):
         tid = int(det.get('track_id', i + 1))
         current_tids.add(tid)
-        angle = angle_by_tracked_idx.get(i)
+        angle = persons[i] if i < len(persons) else None
 
         feat = det.get('feature')
         feat_list = feat.reshape(-1).tolist() if feat is not None else []
@@ -165,6 +170,10 @@ def _notify_inference_waiters() -> None:
 # ── JSON 结果持久化（--save-json 开启后每帧追加一行到 JSONL 文件）──────
 _json_file = None          # io.TextIOWrapper，由 main() 打开，finally 关闭
 _json_write_counter = 0    # 用于定期 flush
+
+# ── 扇区聚合输出配置（由 main() 从 args 写入）─────────────────────────
+_sector_output = False     # True 时 JSON 改为扇区聚合格式
+_num_sectors = 8           # 水平 360° 等分扇区数
 
 # ── 推理函数（在 inference_executor 单线程中执行）─────────────────────
 _infer_log_counter = 0   # 控制全流程耗时日志频率（每 30 帧一次）
@@ -369,6 +378,13 @@ def main() -> None:
             target=_video_loop, args=(args,), daemon=True, name='VideoLoop')
         video_thread.start()
 
+    # 扇区聚合输出配置（--sector-output / --num-sectors）
+    global _sector_output, _num_sectors
+    _sector_output = getattr(args, 'sector_output', False)
+    _num_sectors = max(1, int(getattr(args, 'num_sectors', 8)))
+    if _sector_output:
+        print(f"[JSON] 扇区聚合输出已启用：{_num_sectors} 个扇区")
+
     # 4. JSONL 输出文件（--save-json）
     global _json_file
     if getattr(args, 'save_json', False):
@@ -382,6 +398,27 @@ def main() -> None:
             json_path = os.path.join(args.output_dir, f'{src}_{ts}.jsonl')
         _json_file = open(json_path, 'w', encoding='utf-8', buffering=1)
         print(f"[JSON] 推理结果将保存到: {json_path}")
+
+    # 5. 自动录制（--save-video）：启动即开始录制，复用 inference_and_encode 里的
+    #    懒初始化 VideoWriter 逻辑（首帧建写入器）。annotated 路径取 --video-name，
+    #    原始帧另存 _original 后缀。退出时在 finally 中释放并做 faststart 修复。
+    if getattr(args, 'save_video', False):
+        import datetime, os
+        os.makedirs(args.output_dir, exist_ok=True)
+        name = getattr(args, 'video_name', None)
+        if not name:
+            ts  = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            src = os.path.splitext(os.path.basename(args.video_path))[0] \
+                  if getattr(args, 'video_path', None) else 'camera'
+            name = f'{src}_{ts}'
+        if name.endswith('.mp4'):
+            name = name[:-4]
+        annotated_path = os.path.join(args.output_dir, f'{name}.mp4')
+        original_path  = os.path.join(args.output_dir, f'{name}_original.mp4')
+        with ws.record_lock:
+            ws.record_filenames = {'original': original_path, 'annotated': annotated_path}
+            ws.is_recording = True
+        print(f"[录制] --save-video 已启用，自动录制到:\n  {annotated_path}（推理标注）\n  {original_path}（原始帧）")
 
     print()
     print("=" * 60)
@@ -411,6 +448,29 @@ def main() -> None:
     finally:
         global _video_running
         _video_running = False          # 通知视频线程退出
+
+        # 停止自动录制：在 record_lock 下置 is_recording=False 并释放 writer，
+        # 确保推理线程不会再写（它在同一把锁下检查 is_recording），再做 faststart 修复。
+        with ws.record_lock:
+            _was_recording = ws.is_recording
+            _rec_files = dict(ws.record_filenames)
+            ws.is_recording = False
+            ws.record_filenames = {}
+            if ws._video_writer_original is not None:
+                ws._video_writer_original.release()
+                ws._video_writer_original = None
+            if ws._video_writer_annotated is not None:
+                ws._video_writer_annotated.release()
+                ws._video_writer_annotated = None
+        if _was_recording:
+            print(f"[录制] 已停止并保存: {_rec_files}")
+            try:
+                from webui.routes import _fix_mp4_faststart
+                for _p in _rec_files.values():
+                    _fix_mp4_faststart(_p)
+            except Exception as _e:
+                print(f"[录制] faststart 跳过: {_e}")
+
         if _json_file is not None:
             _json_file.flush()
             _json_file.close()
