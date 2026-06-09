@@ -71,6 +71,10 @@ Fisheye Camera (360°)
 | **Tracking stability fixes** | VDC velocity-magnitude gate (oscillatory motion → decay instead of wrong direction); BoT-SORT pre-assignment overlap detection eliminates `fuse_score` confidence bias |
 | **GPU pipeline** | Fisheye unwarping, YOLO batch inference, and OSNet ReID all run on GPU; typical end-to-end latency ≈ 30–50 ms/frame on RTX 3080 |
 | **3D angular output** | Per-target azimuth (°) and elevation (°) from a calibrated polynomial fit; distance (m) estimated from inter-eye keypoint span |
+| **Recall boost** | Optional second detector (`--recall-boost`, e.g. `yolo26n`) recovers occluded / back-facing persons missed by the pose model and fuses them in; keypoint-less targets get an angle from a synthesized top-center reference point |
+| **Sector aggregation** | `--sector-output` splits the 360° horizon into N sectors (ID-agnostic), emits azimuth/elevation of the largest target per sector, and highlights it with a red box (WebUI mode) |
+| **Track coasting** | `--coast-frames N` keeps a momentarily-missed track alive with its Kalman-predicted box for up to N frames — resumes if it returns, drops otherwise (independent switch, does not alter normal boxes) |
+| **Face ID / speaking detection** | Optional AdaFace face recognition (`--use-face-rec`) labels names per track_id; MediaPipe mouth-aspect-ratio speaking detection (`--talking-detection`) |
 | **Two run modes** | **Local** (`main.py`): camera/video/folder + OpenCV display. **WebUI** (`webui/`): FastAPI server + browser dashboard + JSON WebSocket |
 | **TensorRT support** | Export YOLO `.pt` → `.engine` with `export_trt.py`; ~3× speedup over PyTorch on Jetson / desktop GPU |
 
@@ -166,12 +170,14 @@ python angle_visualizer.py --test
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--use-reid` / `--no-use-reid` | `True` | Enable OSNet ReID features in HybridSORT |
-| `--reid-emb-weight-high` | `0.3` | Weight of ReID embedding in HybridSORT first-round cost |
+| `--use-reid` / `--no-use-reid` | `True` | Enable OSNet ReID features in HybridSORT (auto-disabled under `--no-use-osnet` — no features, no appearance association) |
+| `--reid-emb-weight-high` | `0.1` | Weight of ReID embedding in HybridSORT first-round cost |
 | `--botsort-match-thresh` | `0.3` | BoT-SORT first-stage association threshold |
 | `--appearance-thresh` | `0.2` | BoT-SORT ReID gate threshold |
 | `--smooth-bbox` / `--no-smooth-bbox` | `True` | EMA smoothing on output bounding boxes |
 | `--smooth-bbox-alpha` | `0.5` | EMA coefficient (0 = no smoothing, 1 = frozen) |
+| `--coast-frames` | `0` | Keep lost tracks alive with Kalman-predicted box for up to N frames (>0 to enable; thin cyan box, normal boxes untouched) |
+| `--kalman-bbox` | off | Output Kalman state box instead of YOLO raw box, and keep showing predicted boxes for lost targets |
 
 ### Detection & panorama
 
@@ -180,20 +186,52 @@ python angle_visualizer.py --test
 | `--model-path` | `yolo26n-pose.engine` | YOLO model (`.pt` or `.engine`) |
 | `--conf-threshold` | `0.1` | YOLO confidence threshold |
 | `--num-slices` | `3` | Panorama sub-images per frame (2–7) |
-| `--slice-overlap` | `0.05` | Overlap ratio between adjacent slices |
+| `--slice-overlap` | `0.1` | Overlap ratio between adjacent slices |
 | `--crop-divisor` | `3` | Crop top `1/N` of panorama (removes fisheye artifacts) |
 | `--osnet-model` | `osnet_ain_x1_0` | ReID backbone (`osnet_x1_0`, `osnet_ain_x1_0`, …) |
+| `--no-use-osnet` | — | Skip OSNet feature extraction entirely (faster; ReID association auto-disabled) |
+| `--kpt-track` | off | Use keypoint-derived box instead of YOLO raw box for tracking (reduces large-box overlap mismatches) |
+| `--kpt-display` | off | Use keypoint-derived box for rendering only (does not affect tracking) |
+
+### Recall boost
+
+Run a second detection-only model to recover occluded / back-facing persons the pose model misses, fused in as keypoint-less boxes.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--recall-boost` | off | Enable recall boost |
+| `--recall-model` | `./yolo_model/yolo26n.engine` | Recall detector (use a nano detection model; must differ from the main model) |
+| `--recall-conf-threshold` | `0.4` | Recall model's own confidence threshold (independent of `--conf-threshold`) |
+| `--recall-match-iou` | `0.3` | Drop a recall box if its IoU with any pose box ≥ this (already covered) |
+| `--recall-head-ratio` | `0.12` | For keypoint-less boxes, synthesize the nose point at top + ratio×height |
+
+### Sector aggregation (WebUI mode)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--sector-output` | off | Switch JSON to sector-aggregated format; pick the largest target per sector and highlight it with a red box |
+| `--num-sectors` | `8` | Number of equal sectors over the 360° horizon (e.g. 16) |
+
+### Face ID / speaking detection (optional)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--use-face-rec` / `--no-use-face-rec` | `False` | Enable AdaFace IR-18 face recognition; labels names per track_id |
+| `--face-library-dir` | `face_library` | Face gallery dir (one `.npy` per person, filename = name) |
+| `--talking-detection` / `--no-talking-detection` | `False` | Enable MediaPipe FaceLandmarker mouth-aspect-ratio (MAR) speaking detection |
+| `--talking-mar-threshold` | `0.06` | MAR threshold above which a target is marked speaking |
 
 ### Output
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--output-dir` | `yolo_pose_output` | Directory for saved videos / frames |
-| `--save-video` | off | Save annotated output as `.mp4` |
+| `--save-video` | off | Save annotated output as `.mp4` (both Local and WebUI; WebUI records to `--video-name` from start, faststart on exit) |
+| `--video-name` | auto | Output video filename |
 | `--save-frames` | off | Save every frame as JPEG |
 | `--save-crops` | off | Save per-person crop images |
-| `--save-json` | off | Write inference results to JSON file |
-| `--use-dual-windows` | off | Show YOLO-only and tracking windows side by side |
+| `--save-json` | off | Append every frame's inference result to a JSONL file (WebUI mode only) |
+| `--use-dual-windows` | off | Show YOLO-only and tracking windows side by side (Local mode) |
 
 ---
 
@@ -226,6 +264,22 @@ Every frame result is broadcast on `/ws/inference` (WebUI mode) and optionally w
 | `distance` | m | Estimated range (calibrated polynomial, 0–5 m typical) |
 | `features` | — | 512-dim L2-normalised OSNet ReID feature vector |
 
+### Sector-aggregated format (`--sector-output`)
+
+When enabled, output is keyed by sector (ID-agnostic) instead of track_id; one entry per sector, with `has_target` indicating whether the sector holds a target this frame:
+
+```json
+{
+  "timestamp": 1747612800.123,
+  "frame_id": 42,
+  "num_sectors": 8,
+  "sectors": {
+    "0": { "has_target": true,  "azimuth": 12.5, "elevation": 3.1 },
+    "1": { "has_target": false, "azimuth": null, "elevation": null }
+  }
+}
+```
+
 ---
 
 ## Project Structure
@@ -238,15 +292,22 @@ MeetEye/
 │   ├── core/
 │   │   ├── panorama.py          # GPU fisheye unwarping (grid_sample)
 │   │   ├── detector.py          # YOLOv8 / YOLO26 pose detection wrapper
-│   │   ├── slicer.py            # Panorama slicing, cross-slice NMS + ReID merge
-│   │   ├── tracker.py           # BoT-SORT and HybridSortTracker wrappers
+│   │   ├── slicer.py            # Panorama slicing, cross-slice NMS + ReID merge, recall fusion
+│   │   ├── tracker.py           # BoT-SORT and HybridSortTracker wrappers (incl. coasting)
 │   │   ├── angle_calculator.py  # Azimuth / elevation / distance estimation
 │   │   ├── camera.py            # Camera / video / image-folder input
 │   │   └── boundary_matcher.py  # Wrap-around boundary re-ID
 │   ├── utils/
 │   │   ├── feature_extractor.py # OSNet torchreid wrapper (GPU crop path)
-│   │   └── display.py           # OpenCV annotation helpers
-│   └── webui/                   # FastAPI server, WebSocket, GPU monitor
+│   │   ├── visualizer.py        # Box / keypoint / angle drawing
+│   │   ├── sector.py            # Sector aggregation (shared by WebUI JSON + red-box highlight)
+│   │   ├── distance_estimator.py# Head-pose-corrected distance estimation
+│   │   ├── talking_detector.py  # MediaPipe mouth-aspect-ratio speaking detection
+│   │   └── display.py           # OpenCV display / layout helpers
+│   ├── face_rec/                # AdaFace face recognition (optional, names per track_id)
+│   ├── models/                  # MediaPipe model weights (face_landmarker.task)
+│   ├── main_GPU_webui.py        # ② WebUI mode entry point (FastAPI)
+│   └── webui/                   # Inference processor, FastAPI routes, WebSocket, GPU monitor
 ├── HybridSORT/                  # Hybrid-SORT tracker source
 │   └── trackers/hybrid_sort_tracker/
 │       ├── hybrid_sort.py       # Core tracker + velocity-magnitude gate (patched)

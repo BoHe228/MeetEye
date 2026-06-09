@@ -222,6 +222,8 @@ merged = self.slicer.merge_detections(
     slice_images=slices,
     slice_tensors=slice_tensors_gpu,    # 有则走 GPU crop 路径
     feature_extractor=self.feature_extractor,
+    recall_yolo_results=recall_yolo_results,        # --recall-boost 时为补漏模型结果，否则 None
+    recall_match_iou=getattr(self.args, 'recall_match_iou', 0.4),
 )
 filtered = filter_cross_boundary_detections(merged, panorama.shape)
 filtered = self.slicer.filter_wide_detections(filtered, panorama.shape[1])
@@ -232,6 +234,11 @@ filtered = self.slicer.filter_wide_detections(filtered, panorama.shape[1])
 2. IoU-NMS 去除重叠框（含跨切片重叠）
 3. 对保留框逐人调用 OSNet 提取 ReID 特征（`slice_tensors_gpu` 存在时直接在 GPU 上 crop + resize，否则走 PIL 路径）
 4. 特征向量挂在 `det['feature']` 上供跟踪器使用
+5. **补漏融合（`--recall-boost`）**：若传入 `recall_yolo_results`，把补漏检测模型的 person 框与本切片 pose 框做 IoU 关联，与所有 pose 框都不重叠（IoU < `recall_match_iou`）的作为「无关键点框」补入，捞回遮挡/背身目标；关闭时此步整体跳过，零开销
+
+> **补漏推理在步骤⑤**：`--recall-boost` 开启时，同一批切片会额外跑一次纯检测模型
+> `recall_yolo_results = self.recall_detector.detect_batch(slices)`（关闭时为 `None`）。
+> 这是开启后唯一的显著开销（多一次完整 YOLO 推理）。
 
 #### ⑦ OSNet 特征复用
 
@@ -246,21 +253,35 @@ dets_with_feat = filtered   # det['feature']: numpy [1, feat_dim]（或 None）
 #### ⑧ 跟踪 + 绘制（CPU）
 
 ```python
-tracked = self.tracker.update(dets_with_feat)   # BoT-SORT：卡尔曼预测 + ReID 关联
-annotated = draw_detections(panorama, tracked, self.tracker)
+tracked = self.tracker.update(dets_with_feat)   # 默认 HybridSort（IoU+VDC+TCM）；可选 BoT-SORT
+# --sector-output 时：先按角度聚合标记每扇区代表（draw 时画红框），再绘制
+annotated = draw_detections(panorama, tracked, self.tracker, ...)
 ```
 
-`BoT_SORTTracker` 使用卡尔曼滤波做运动预测，结合 ReID cosine 距离做外观匹配，支持左右边界 ID 保持（`enable_left_boundary / enable_right_boundary = True`，覆盖等距圆柱首尾循环场景）。`track_buffer=500` 表示目标消失后最多保留 500 帧再宣告丢失。
+默认跟踪器为 **HybridSort**（`--tracker hybridsort`），卡尔曼运动预测 + 四角点速度方向一致性（VDC）+ 置信度调制（TCM）；可选 `BoT-SORT`。两者都支持左右边界 ID 保持（`enable_left_boundary / enable_right_boundary = True`，覆盖等距圆柱首尾循环场景）。`track_buffer=500` 表示目标消失后最多保留 500 帧。
+
+- **续命/coasting（`--coast-frames N`）**：目标瞬时漏检时，tracker 额外输出其 Kalman 预测框（`_is_lost=True`，浅蓝细线）至多 N 帧，N 帧内重现则接回、否则停止；独立于 `--kalman-bbox`，不改正常框。
+- **ReID 与 OSNet 绑定**：`--no-use-osnet` 时无特征，tracker 的 `with_reid` 自动置否，走纯运动关联（避免零特征导致 `embedding_distance` 余弦距离 NaN 污染关联）。
 
 #### ⑨ 角度计算（CPU）
 
 ```python
-kpts_list = [np.array(d['keypoints']) for d in tracked if d.get('keypoints')]
+# 有真实关键点的（pose）直接用；无关键点的（补漏框）用「框顶中心」合成鼻子点，
+# 使 angle_info['persons'] 与 tracked 严格 1:1 对齐（下游 JSON / 扇区按下标取角度）
+kpts_list = []
+for d in tracked:
+    kp = d.get('keypoints')
+    if kp:
+        kpts_list.append(np.array(kp))
+    else:                                    # 补漏框：x 取框中心、y 取框顶往下 head_ratio×框高
+        x1, y1, x2, y2 = d['bbox']
+        synth = np.zeros((17, 3), np.float32)
+        synth[0] = [(x1 + x2) / 2, y1 + head_ratio * (y2 - y1), 1.0]
+        kpts_list.append(synth)
 angle_info = self.angle_calculator.calculate_angles_from_keypoints(np.array(kpts_list))
-annotated = self.angle_calculator.draw_angles_on_image(annotated, angle_info)
 ```
 
-`AngleCalculator` 根据关键点在等距圆柱图中的 x 坐标，结合 `fisheye_calib.yaml` 标定参数（或多项式拟合 `fit_degree=5`），计算每个检测目标相对摄像头光轴的水平方位角，叠加绘制到标注帧。
+`AngleCalculator` 根据鼻子关键点在等距圆柱图中的 x 坐标计算水平方位角（`360×x/W`），结合 `fisheye_calib.yaml` 标定参数（或多项式拟合 `fit_degree`）计算俯仰角，叠加绘制到标注帧。补漏框用合成鼻子点参与，口径与 pose 一致。
 
 ### 3.2 懒初始化：全景处理器从第一帧初始化
 

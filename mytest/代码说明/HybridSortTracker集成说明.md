@@ -295,6 +295,12 @@ tcm_byte_step        = True   BYTE 第二阶段启用 TCM
 track_buffer         = 500    轨迹最长存活帧数（max_age = buffer * fps/30）
 min_hits             = 1      连续命中几帧后才输出轨迹
 
+── 丢失轨迹预测框（续命/coasting） ──
+kalman_bbox          = False  输出 Kalman 状态框替代 YOLO 原始框，并持续显示丢失目标预测框
+coast_frames         = 0      >0：丢失轨迹用 Kalman 预测框续命至多 N 帧（独立开关，不改正常框）
+                               触发输出条件改为 (kalman_bbox or coast_frames>0)，且
+                               time_since_update > N 时停止输出预测框（_is_lost=True，浅蓝细线）
+
 ── TCM 置信度调制 ──
 tcm_first_step       = True   是否启用第一阶段 TCM（作用一：代价矩阵）
 tcm_first_step_weight= 1.0    TCM 代价矩阵惩罚的乘数（0=禁用代价惩罚）
@@ -308,3 +314,8 @@ reid_emb_weight_low  = 0.0    BYTE 第二阶段外观代价权重（建议保持
 reid_alpha           = 0.8    smooth_feat EMA 动量（越小更新越快）
 reid_longterm_bank   = 30     每轨迹历史特征帧数（长期 ReID 备用）
 ```
+
+> **with_reid 与 OSNet 绑定**：构造时 `with_reid = args.use_reid and use_osnet`。
+> `--no-use-osnet` 时无特征，若仍走 ReID 路径，`embedding_distance` 对零向量的余弦距离为
+> `0/0 = NaN`，会污染关联代价矩阵导致高置信度目标也关联不上被丢。因此无特征时自动关闭
+> ReID，回退纯运动（IoU+VDC）关联。
