@@ -9,21 +9,24 @@ Detects, tracks, and estimates the azimuth, elevation, and distance of every per
 
 ## Demo
 
-> Small conference room · 4 persons · blackboard discussion  
-> HybridSORT tracking · OSNet ReID · 3-slice panorama · 960 × 630
+> **Large conference room · multi-person meeting** — recall boost + 8-sector aggregation + track coasting  
+> HybridSORT tracking · 3-slice panorama · 1280 wide · first 180 s
+
+<!-- To embed: open this README in the GitHub web editor → Edit → drag your local
+     docs/demo_coast.mp4 into the edit box → GitHub generates a
+     https://github.com/user-attachments/assets/xxxx URL → replace the placeholder
+     line below with that URL → save to show the inline player -->
+<!-- Paste the user-attachments link here after uploading docs/demo_coast.mp4 -->
+
+<br>
+
+> **Small conference room · 4 persons · blackboard discussion** — HybridSORT tracking · OSNet ReID · 3-slice panorama · 960 × 630
 
 https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181
 
-<!-- To embed as an inline video player:
-     1. Open the GitHub web editor for this README
-     2. Drag docs/demo_compressed.mp4 into the edit box
-     3. GitHub uploads it to CDN and generates a real URL:
-        https://github.com/user-attachments/assets/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-     4. Replace the image link above with that URL -->
-
 *To compress your own result video for GitHub, run:*
 ```bash
-python compress_demo.py -i your_result.mp4 -o demo.mp4 --duration 90 --crf 23
+python compress_demo.py -i your_result.mp4 -o demo.mp4 --duration 180 --scale 1280:-2 --crf 18
 ```
 
 ---

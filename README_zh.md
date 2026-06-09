@@ -9,21 +9,23 @@
 
 ## 演示
 
-> 小会议室 · 4 人黑板交流  
-> HybridSORT 跟踪 · OSNet ReID · 3 切片全景 · 960 × 630
+> **大会议室 · 多人开会** — 补漏检测 + 8 扇区聚合 + 轨迹续命  
+> HybridSORT 跟踪 · 3 切片全景 · 1280 宽 · 前 180 秒
+
+<!-- 内嵌播放器步骤：网页打开此 README → Edit → 把本地 docs/demo_coast.mp4 拖入编辑框
+     → GitHub 自动上传生成 https://github.com/user-attachments/assets/xxxx 链接
+     → 用该链接替换下面这一行占位 → 保存即显示播放器 -->
+<!-- 在此粘贴上传 docs/demo_coast.mp4 后得到的 user-attachments 链接 -->
+
+<br>
+
+> **小会议室 · 4 人黑板交流** — HybridSORT 跟踪 · OSNet ReID · 3 切片全景 · 960 × 630
 
 https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181
 
-<!-- 实现页面内嵌播放器的步骤：
-     1. 在 GitHub 网页上打开此 README 的编辑器
-     2. 将 docs/demo_compressed.mp4 拖入编辑框
-     3. GitHub 自动上传到 CDN，生成真实链接：
-        https://github.com/user-attachments/assets/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-     4. 将上方图片链接替换为该链接，保存即可显示内嵌播放器 -->
-
 *如需将自己的结果视频压缩后上传 GitHub，运行：*
 ```bash
-python compress_demo.py -i your_result.mp4 -o demo.mp4 --duration 90 --crf 23
+python compress_demo.py -i your_result.mp4 -o demo.mp4 --duration 180 --scale 1280:-2 --crf 18
 ```
 
 ---
