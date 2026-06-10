@@ -23,7 +23,7 @@ Detects, tracks, and estimates the azimuth, elevation, and distance of every per
 > **↳ Same scene · sector angle visualizer window** — live radar + hemisphere view, each sector's azimuth/elevation rendered in real time (the local `angle_visualizer.py` window paired with the result video above)
 
 <!-- To embed: open this README in the GitHub web editor → drag your local docs/demo_coast_angle.mp4 into the edit box → replace the placeholder line below with the generated user-attachments URL -->
-<!-- Paste the user-attachments link here after uploading docs/demo_coast_angle.mp4 -->https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b
+https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b
 
 <br>
 
