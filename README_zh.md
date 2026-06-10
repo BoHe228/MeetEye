@@ -22,7 +22,7 @@
 > **↳ 同一场景 · 扇区角度可视化窗口** — 雷达图 + 半球视图实时显示各扇区方位角/仰角（与上方结果视频配套的本地 `angle_visualizer.py` 窗口）
 
 <!-- 内嵌播放器步骤：网页打开此 README → Edit → 把本地 docs/demo_coast_angle.mp4 拖入编辑框 → 用生成的 user-attachments 链接替换下面这一行占位 -->
-<!-- 在此粘贴上传 docs/demo_coast_angle.mp4 后得到的 user-attachments 链接 -->https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b
+https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b
 
 
 <br>
