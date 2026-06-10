@@ -133,7 +133,7 @@ class AngleCalculator:
 
     def __init__(self, panorama_width: int, panorama_height: int, vertical_fov: float = 200.0,
                  fisheye_center: Optional[Tuple[float, float]] = None, fit_degree: int = 5,
-                 yaml_file: Optional[str] = None):
+                 yaml_file: Optional[str] = None, feature_point_mode: str = 'nose'):
         """
         初始化角度计算器
 
@@ -171,6 +171,16 @@ class AngleCalculator:
         self.LEFT_EAR_INDEX = 3
         self.RIGHT_EAR_INDEX = 4
 
+        # 角度特征点来源：
+        #   'nose'  —— COCO pose（17 点），用鼻子(idx 0)
+        #   'mouth' —— 人脸模型 yolov8n-face（5 点：左眼/右眼/鼻子/左嘴角/右嘴角），
+        #              用左右嘴角(idx 3,4)中点。两嘴角无效时回退到人脸鼻子(idx 2)，
+        #              再回退到 idx 0（兼容补漏框的合成点）。
+        self.feature_point_mode = feature_point_mode
+        self.FACE_NOSE_INDEX = 2
+        self.FACE_LEFT_MOUTH_INDEX = 3
+        self.FACE_RIGHT_MOUTH_INDEX = 4
+
     def set_crop_offset(self, crop_top_offset: int):
         """
         设置顶部裁剪偏移量
@@ -179,6 +189,52 @@ class AngleCalculator:
             crop_top_offset: 从顶部裁剪掉的像素数
         """
         self.crop_top_offset = crop_top_offset
+
+    @staticmethod
+    def _kp_valid(kp) -> bool:
+        """关键点有效：存在、非全零、置信度>0（缺置信度列时按存在算）。"""
+        if kp is None:
+            return False
+        arr = np.asarray(kp, dtype=float)
+        if arr.size < 2 or (arr[:2] == 0).all():
+            return False
+        if arr.size >= 3 and arr[2] <= 0:
+            return False
+        return True
+
+    def _pick_feature_point(self, person_kpts) -> Optional[Tuple[float, float]]:
+        """
+        返回用于算角度的特征点 (x, y)，无可用点返回 None。
+
+        mouth 模式（人脸模型）：左右嘴角中点 → 人脸鼻子(idx2) → idx0（合成点）回退。
+        nose  模式（pose）：鼻子(idx0)。
+        """
+        n = len(person_kpts)
+        if self.feature_point_mode == 'mouth':
+            lm = person_kpts[self.FACE_LEFT_MOUTH_INDEX] if n > self.FACE_LEFT_MOUTH_INDEX else None
+            rm = person_kpts[self.FACE_RIGHT_MOUTH_INDEX] if n > self.FACE_RIGHT_MOUTH_INDEX else None
+            if self._kp_valid(lm) and self._kp_valid(rm):
+                return (float(lm[0]) + float(rm[0])) / 2.0, (float(lm[1]) + float(rm[1])) / 2.0
+            # 一个嘴角可用就用它，避免半遮挡时丢点
+            if self._kp_valid(lm):
+                return float(lm[0]), float(lm[1])
+            if self._kp_valid(rm):
+                return float(rm[0]), float(rm[1])
+            # 回退：人脸鼻子(idx2)
+            fn = person_kpts[self.FACE_NOSE_INDEX] if n > self.FACE_NOSE_INDEX else None
+            if self._kp_valid(fn):
+                return float(fn[0]), float(fn[1])
+            # 再回退：idx0（补漏框合成点）
+            z = person_kpts[self.NOSE_INDEX] if n > self.NOSE_INDEX else None
+            if self._kp_valid(z):
+                return float(z[0]), float(z[1])
+            return None
+
+        # nose 模式
+        nose_kp = person_kpts[self.NOSE_INDEX] if n > self.NOSE_INDEX else None
+        if self._kp_valid(nose_kp):
+            return float(nose_kp[0]), float(nose_kp[1])
+        return None
 
     def set_panorama_maps(self, map_x: np.ndarray, map_y: np.ndarray) -> None:
         """
@@ -254,17 +310,15 @@ class AngleCalculator:
                 persons_angles.append(None)
                 continue
             
-            # 检查鼻子关键点是否有效
-            nose_kp = person_kpts[self.NOSE_INDEX] if len(person_kpts) > self.NOSE_INDEX else None
-            
-            if nose_kp is None or (np.array(nose_kp) == 0).all():
+            # 选取角度特征点：pose→鼻子；人脸模型→嘴巴中心（带回退）
+            feat = self._pick_feature_point(person_kpts)
+            if feat is None:
                 persons_angles.append(None)
                 continue
-            
+
             try:
-                # 获取鼻子坐标
-                nose_x, nose_y = float(nose_kp[0]), float(nose_kp[1])
-                
+                nose_x, nose_y = feat
+
                 # 计算角度
                 azimuth_deg, elevation_deg = self._pixel_to_angle(nose_x, nose_y)
                 

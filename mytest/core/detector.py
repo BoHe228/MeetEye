@@ -21,8 +21,17 @@ class YOLOPoseDetector:
         """
         print(f"加载YOLO姿态估计模型: {model_path}")
         from ultralytics import YOLO
-        self.model = YOLO(model_path)
-        # self.model = self.model.half() 
+        # .engine 不带 task 元数据时 ultralytics 默认按 detect 解析：pose/face 模型的
+        # 关键点通道会被误当作类别，argmax 落到无效类别 → KeyError。按文件名显式指定 task：
+        #   名含 pose/face → 'pose'（17 点 / 人脸 5 点）；其余（如 yolo26n.engine）→ 'detect'
+        _p = str(model_path).lower()
+        if _p.endswith('.engine'):
+            _task = 'pose' if ('pose' in _p or 'face' in _p) else 'detect'
+            self.model = YOLO(model_path, task=_task)
+            print(f"  引擎任务类型推断为: {_task}")
+        else:
+            self.model = YOLO(model_path)  # .pt/.onnx 自带 task 元数据
+        # self.model = self.model.half()
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
 

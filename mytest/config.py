@@ -164,6 +164,9 @@ def parse_args():
                         help='跟踪层（IoU 匹配 + Kalman 初始化）使用关键点推导框，减少大框重叠误判 (默认: False)')
     parser.add_argument('--kpt-display', action='store_true', default=False,
                         help='显示层用关键点推导框替代原始框绘制，不影响跟踪逻辑 (默认: False)')
+    parser.add_argument('--face-kpt', action='store_true', default=False,
+                        help='输入为人脸关键点模型（如 yolov8n-face，5 点：左眼/右眼/鼻子/左右嘴角）：'
+                             '角度特征点改用左右嘴角中点而非鼻子。模型名含 "face" 时自动开启 (默认: False)')
 
     # 关键点框公共参数（--kpt-track 和 --kpt-display 共用）
     parser.add_argument('--kpt-bbox-conf', type=float, default=0.3,
@@ -217,6 +220,9 @@ def parse_args():
                              '每扇区取检测框最大者输出其水平角/俯仰角 (默认: 关闭，沿用按 ID 输出)')
     parser.add_argument('--num-sectors', type=int, default=8,
                         help='水平 360° 等分的扇区数（可改 16 等），配合 --sector-output (默认: 8)')
+    parser.add_argument('--show-sectors', action='store_true', default=False,
+                        help='在结果图上画出扇区范围：按 --num-sectors 等分画竖直边界线并标注'
+                             '扇区编号/角度区间，便于核对目标落在哪个扇区 (默认: 关闭)')
 
     # 是否使用外部UI
     parser.add_argument('--webui', action='store_true', help='Run with local web UI (browser)')

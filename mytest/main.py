@@ -43,6 +43,8 @@ from utils import (
     compute_stable_bbox_from_keypoints,
 )
 
+from utils.sector import aggregate_sectors, draw_sector_grid
+
 # 导入特征提取器
 from utils.feature_extractor import FeatureExtractor
 
@@ -402,11 +404,17 @@ class FisheyePanoramaYOLOPose:
             out_h = self.panorama_processor.output_height
             print(f"GPU 全景处理器就绪，全景输出: {out_w}×{out_h}")
 
+            # 人脸关键点模型（5 点）→ 角度特征点用嘴巴中心；模型名含 face 时自动开启
+            _mp = str(getattr(self.args, 'model_path', '')).lower()
+            _face_kpt = getattr(self.args, 'face_kpt', False) or ('face' in os.path.basename(_mp))
             self.angle_calculator = AngleCalculator(
                 out_w, out_h, self.args.vertical_fov,
                 fit_degree=getattr(self.args, 'fit_degree', 5),
-                yaml_file=getattr(self.args, 'calib_yaml', None)
+                yaml_file=getattr(self.args, 'calib_yaml', None),
+                feature_point_mode='mouth' if _face_kpt else 'nose',
             )
+            if _face_kpt:
+                print("人脸关键点模型：角度特征点使用嘴巴中心（左右嘴角中点）")
 
             if (self.tracker is not None
                     and self.tracker.enable_boundary_matching):
@@ -619,6 +627,16 @@ class FisheyePanoramaYOLOPose:
                 for (px, py) in _recall_pts:
                     cv2.circle(annotated_panorama, (px, py), 6, (255, 0, 255), -1)
                     cv2.circle(annotated_panorama, (px, py), 8, (255, 255, 255), 2)
+
+        # 扇区范围可视化（--show-sectors）：均匀竖线 + 编号/角度区间，
+        # 有目标的扇区顶部色带高亮（沿用 aggregate_sectors 判定，与扇区聚合口径一致）
+        if getattr(self.args, 'show_sectors', False):
+            _sectors = None
+            if tracked_detections:
+                _sectors, _ = aggregate_sectors(
+                    tracked_detections, angle_info, getattr(self.args, 'num_sectors', 8))
+            annotated_panorama = draw_sector_grid(
+                annotated_panorama, getattr(self.args, 'num_sectors', 8), _sectors, inplace=True)
         t[8] = time.perf_counter()
 
         # ── 每 30 帧打印一次各步耗时 ─────────────────────────────────

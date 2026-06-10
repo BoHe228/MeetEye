@@ -11,6 +11,9 @@
 """
 from typing import List, Dict, Optional, Set, Tuple
 
+import cv2
+import numpy as np
+
 
 def aggregate_sectors(
     tracked: List[dict],
@@ -51,3 +54,49 @@ def aggregate_sectors(
         if v is not None:
             rep_indices.add(v[3])
     return sectors, rep_indices
+
+
+def draw_sector_grid(
+    image: np.ndarray,
+    num_sectors: int,
+    sectors: Optional[Dict[str, dict]] = None,
+    inplace: bool = False,
+) -> np.ndarray:
+    """
+    在全景图上画出扇区范围（--show-sectors）。
+
+    映射与 angle_calculator._pixel_to_angle 一致：azimuth = 360·x/W 线性，
+    所以扇区边界就是均匀竖线 x = W·s/num_sectors。每个扇区顶部标注
+    「编号 + 角度区间」；若传入 sectors 字典，则把「有目标」的扇区底色高亮。
+
+    inplace=False（默认）在副本上绘制；调用处若已持有可改写的缓冲，传 inplace=True
+    省掉一次整帧拷贝（实时路径用）。
+    """
+    num_sectors = max(1, int(num_sectors))
+    out = image if inplace else image.copy()
+    h, w = out.shape[:2]
+    sector_deg = 360.0 / num_sectors
+
+    for s in range(num_sectors):
+        x0 = int(round(w * s / num_sectors))
+        x1 = int(round(w * (s + 1) / num_sectors))
+
+        # 有目标的扇区：顶部淡色色带强调
+        if sectors is not None and sectors.get(str(s), {}).get('has_target'):
+            band = out[0:28, x0:x1].copy()
+            tint = np.full_like(band, (0, 80, 160))  # BGR 暖橙
+            out[0:28, x0:x1] = cv2.addWeighted(band, 0.5, tint, 0.5, 0)
+
+        # 边界竖线（s==0 的左边界即图像左缘，也画出来）
+        cv2.line(out, (x0, 0), (x0, h - 1), (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 标注：扇区号 + 角度区间
+        label = f"S{s} [{int(s * sector_deg)}-{int((s + 1) * sector_deg)})"
+        cv2.putText(out, label, (x0 + 4, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, label, (x0 + 4, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # 最右边界（= 360°/0° 接缝）
+    cv2.line(out, (w - 1, 0), (w - 1, h - 1), (0, 255, 255), 1, cv2.LINE_AA)
+    return out

@@ -36,7 +36,7 @@ from utils import (
     compute_stable_bbox_from_keypoints,
 )
 from utils.feature_extractor import FeatureExtractor
-from utils.sector import aggregate_sectors
+from utils.sector import aggregate_sectors, draw_sector_grid
 
 try:
     from face_rec.face_rec_manager import FaceRecManager
@@ -287,11 +287,17 @@ class FisheyePanoramaYOLOPose:
             out_h = self.panorama_processor.output_height
             print(f"全景处理器就绪，全景输出: {out_w}×{out_h}")
 
+            # 人脸关键点模型（5 点）→ 角度特征点用嘴巴中心；模型名含 face 时自动开启
+            _mp = str(getattr(self.args, 'model_path', '')).lower()
+            _face_kpt = getattr(self.args, 'face_kpt', False) or ('face' in os.path.basename(_mp))
             self.angle_calculator = AngleCalculator(
                 out_w, out_h, self.args.vertical_fov,
                 fit_degree=getattr(self.args, 'fit_degree', 5),
                 yaml_file=getattr(self.args, 'calib_yaml', None),
+                feature_point_mode='mouth' if _face_kpt else 'nose',
             )
+            if _face_kpt:
+                print("人脸关键点模型：角度特征点使用嘴巴中心（左右嘴角中点）")
 
             if (self.tracker is not None
                     and self.tracker.enable_boundary_matching):
@@ -318,7 +324,11 @@ class FisheyePanoramaYOLOPose:
                 return None, None, None, None, None
 
         t = {}
-        sync = (lambda: torch.cuda.synchronize()) if _CUDA else (lambda: None)
+        # sync 仅为分阶段计时准确而存在；只有"本帧会打印计时"时才真正同步，
+        # 其余帧 no-op，避免每帧强制 GPU 全同步增加延迟。（.cpu()/merge 自带必要同步，
+        # 不影响正确性。）打印条件：自增后 %30==1 → 即当前 _timing_counter%30==0
+        _will_time = _CUDA and (self._timing_counter % 30 == 0)
+        sync = (lambda: torch.cuda.synchronize()) if _will_time else (lambda: None)
 
         # ① CPU → GPU  [CPU→GPU]
         t[0] = time.perf_counter()
@@ -457,12 +467,16 @@ class FisheyePanoramaYOLOPose:
         # ⑧-b 扇区代表标记（--sector-output）：在画框之前标好哪些目标是扇区代表，
         #     由 draw_detections 把代表框直接画成红色（单框，不再另叠加），与
         #     main_GPU_webui 的 JSON 用同一份 aggregate_sectors 判定，保证一致。
-        if getattr(self.args, 'sector_output', False) and tracked:
-            _, rep_indices = aggregate_sectors(
+        _sectors = None
+        _show_sectors = getattr(self.args, 'show_sectors', False)
+        if (getattr(self.args, 'sector_output', False) or _show_sectors) and tracked:
+            _sectors, rep_indices = aggregate_sectors(
                 tracked, angle_info, getattr(self.args, 'num_sectors', 8)
             )
-            for i in rep_indices:
-                tracked[i]['_sector_rep'] = True
+            # 只有 --sector-output 才把代表框画红；--show-sectors 单独开时不改框色
+            if getattr(self.args, 'sector_output', False):
+                for i in rep_indices:
+                    tracked[i]['_sector_rep'] = True
 
         # ⑨ 画检测框（扇区代表为红框，其余按置信度色）
         annotated = draw_detections(panorama, tracked, self.tracker,
@@ -488,6 +502,12 @@ class FisheyePanoramaYOLOPose:
             for (px, py) in _recall_pts:
                 cv2.circle(annotated, (px, py), 6, (255, 0, 255), -1)
                 cv2.circle(annotated, (px, py), 8, (255, 255, 255), 2)
+
+        # ⑪ 扇区范围可视化（--show-sectors）：均匀竖线 + 编号/角度区间，
+        #    有目标的扇区顶部色带高亮（沿用 aggregate_sectors 的判定）
+        if _show_sectors:
+            annotated = draw_sector_grid(
+                annotated, getattr(self.args, 'num_sectors', 8), _sectors, inplace=True)
         t[8] = time.perf_counter()
 
         self._timing_counter += 1

@@ -19,6 +19,13 @@
 
 <br>
 
+> **↳ 同一场景 · 扇区角度可视化窗口** — 雷达图 + 半球视图实时显示各扇区方位角/仰角（与上方结果视频配套的本地 `angle_visualizer.py` 窗口）
+
+<!-- 内嵌播放器步骤：网页打开此 README → Edit → 把本地 docs/demo_coast_angle.mp4 拖入编辑框 → 用生成的 user-attachments 链接替换下面这一行占位 -->
+<!-- 在此粘贴上传 docs/demo_coast_angle.mp4 后得到的 user-attachments 链接 -->
+
+<br>
+
 > **小会议室 · 4 人黑板交流** — HybridSORT 跟踪 · OSNet ReID · 3 切片全景 · 960 × 630
 
 https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181

@@ -38,6 +38,7 @@ _lock = threading.Lock()
 _latest_targets: dict = {}   # {tid: {'azimuth': float, 'elevation': float, 'distance': float|None}}
 _conn_status: str = "未连接"
 _frame_count: int = 0
+_sector_mode: bool = False   # True：服务端为 --sector-output 扇区格式，标签显示「扇区 N」
 
 # 动态元素追踪（用于帧间精确清理，避免误删静态标注）
 _radar_dynamic_artists: list = []
@@ -74,6 +75,14 @@ def _id_color(tid: str) -> str:
         return _PALETTE[h % len(_PALETTE)]
 
 
+def _disp_label(tid: str, long: bool = False) -> str:
+    """扇区模式下显示「扇区 N」（long）/「扇N」（short，点旁）；否则原 ID。"""
+    if _sector_mode:
+        num = str(tid).lstrip('S')
+        return f'扇区 {num}' if long else f'扇{num}'
+    return f'ID {tid}' if long else f'{tid}'
+
+
 # ── Arrow3D ───────────────────────────────────────────────────────────
 class Arrow3D(FancyArrowPatch):
     def __init__(self, xs, ys, zs, *args, **kwargs):
@@ -89,23 +98,40 @@ class Arrow3D(FancyArrowPatch):
 
 # ── WebSocket 回调 ────────────────────────────────────────────────────
 def _on_message(ws, message):
-    global _latest_targets, _frame_count
+    global _latest_targets, _frame_count, _sector_mode
     try:
         data = json.loads(message)
-        targets_raw = data.get('targets', {})
-
         new_targets = {}
-        for tid, tdata in targets_raw.items():
-            az = tdata.get('azimuth')
-            el = tdata.get('elevation')
-            if az is None or el is None:
-                continue
-            dist = tdata.get('distance')
-            new_targets[str(tid)] = {
-                'azimuth':   float(az),
-                'elevation': float(el),
-                'distance':  float(dist) if dist is not None else None,
-            }
+        _sector_mode = ('sectors' in data)
+
+        if 'sectors' in data:
+            # 扇区聚合格式（--sector-output）：每个有目标的扇区贡献一个点
+            # （键用 S<编号>，扇区格式无距离 → distance=None）
+            for sid, sdata in data['sectors'].items():
+                if not sdata.get('has_target'):
+                    continue
+                az = sdata.get('azimuth')
+                el = sdata.get('elevation')
+                if az is None or el is None:
+                    continue
+                new_targets[f'S{sid}'] = {
+                    'azimuth':   float(az),
+                    'elevation': float(el),
+                    'distance':  None,
+                }
+        else:
+            # 兼容旧格式：按 track_id 输出
+            for tid, tdata in data.get('targets', {}).items():
+                az = tdata.get('azimuth')
+                el = tdata.get('elevation')
+                if az is None or el is None:
+                    continue
+                dist = tdata.get('distance')
+                new_targets[str(tid)] = {
+                    'azimuth':   float(az),
+                    'elevation': float(el),
+                    'distance':  float(dist) if dist is not None else None,
+                }
 
         with _lock:
             _latest_targets = new_targets
@@ -344,7 +370,7 @@ def update_radar(ax, points_dict: dict) -> None:
         ox   = (px / norm) * _RADAR_MAX_DIST * 0.06
         oy   = (py / norm) * _RADAR_MAX_DIST * 0.06
         txt = ax.text(px + ox, py + oy,
-                      f'{tid}',
+                      _disp_label(tid),
                       fontsize=9, color='#1e293b', zorder=14,
                       fontweight='bold')
         _radar_dynamic_artists.append(txt)
@@ -361,7 +387,8 @@ def update_legend(fig, points_dict: dict) -> None:
     _legend_artists.clear()
 
     # 标题
-    title = fig.text(0.5, 0.90, '目标信息', fontsize=12, ha='center',
+    title = fig.text(0.5, 0.90, '扇区信息' if _sector_mode else '目标信息',
+                     fontsize=12, ha='center',
                      color='#1e293b', fontweight='medium')
     _legend_artists.append(title)
 
@@ -390,8 +417,8 @@ def update_legend(fig, points_dict: dict) -> None:
         point = fig.text(x_start, y, '●', fontsize=14, color=c, va='center')
         _legend_artists.append(point)
 
-        # ID 标题
-        id_txt = fig.text(x_start + 0.025, y, f'ID {tid}', fontsize=10,
+        # 标题（扇区模式「扇区 N」，否则「ID xx」）
+        id_txt = fig.text(x_start + 0.025, y, _disp_label(tid, long=True), fontsize=10,
                           color='#1e293b', va='center', fontweight='bold')
         _legend_artists.append(id_txt)
 
@@ -469,7 +496,7 @@ def update_dynamic(ax, points_dict: dict) -> None:
 
         # 在点旁边只显示简单的ID编号，不显示完整信息
         txt = ax.text(x * 1.18, y * 1.18, z * 1.18,
-                      f'{tid}',
+                      _disp_label(tid),
                       fontsize=10, color='#1e293b',
                       fontweight='bold', zorder=35)
         _sphere_dynamic_artists.append(txt)
@@ -547,8 +574,9 @@ def main():
                 else:
                     status_color = '#f59e0b'
 
+                _cnt_label = '有目标扇区' if _sector_mode else '目标'
                 title_sub.set_text(
-                    f'状态: {status}  |  帧 #{fc}  |  目标: {n} 个'
+                    f'状态: {status}  |  帧 #{fc}  |  {_cnt_label}: {n} 个'
                 )
                 title_sub.set_color(status_color)
 
