@@ -302,7 +302,8 @@ def draw_detections(image: np.ndarray, detections: List[Dict],
                    kpt_bbox_conf: float = 0.3,
                    kpt_bbox_padding: float = 0.15,
                    kpt_bbox_upper_only: bool = True,
-                   kpt_bbox_padding_v: float = None) -> np.ndarray:
+                   kpt_bbox_padding_v: float = None,
+                   draw_kpt: bool = False) -> np.ndarray:
     """
     在图像上绘制检测结果（包括关键点）
 
@@ -326,7 +327,8 @@ def draw_detections(image: np.ndarray, detections: List[Dict],
                                     kpt_bbox_conf=kpt_bbox_conf, kpt_bbox_padding=kpt_bbox_padding,
                                     kpt_bbox_upper_only=kpt_bbox_upper_only,
                                     kpt_bbox_padding_v=kpt_bbox_padding_v)
-    annotated = draw_keypoints(annotated, detections)
+    if draw_kpt:
+        annotated = draw_keypoints(annotated, detections)
 
     return annotated
 

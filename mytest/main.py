@@ -112,6 +112,7 @@ class FisheyePanoramaYOLOPose:
         self.show_angle_overview = False
         self.show_id: bool = getattr(args, 'show_id', True)
         self.show_conf: bool = getattr(args, 'show_conf', True)
+        self.show_kpt: bool = getattr(args, 'show_kpt', False)
         self.show_angle: bool = getattr(args, 'show_angle', False)
         self.show_arrow: bool = getattr(args, 'show_arrow', False)
         self.kpt_display: bool = getattr(args, 'kpt_display', False)
@@ -184,6 +185,7 @@ class FisheyePanoramaYOLOPose:
                 use_hungarian=args.use_hungarian,
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
                 coast_frames=getattr(args, 'coast_frames', 0),
+                coast_hold=getattr(args, 'coast_hold', False),
                 **_boundary_kwargs,
             )
         elif args.tracker == 'hybridsort':
@@ -229,6 +231,7 @@ class FisheyePanoramaYOLOPose:
                 # ── Kalman 轨迹框 ────────────────────────────────────────────
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
                 coast_frames=getattr(args, 'coast_frames', 0),
+                coast_hold=getattr(args, 'coast_hold', False),
                 **_boundary_kwargs,
             )
         else:
@@ -586,7 +589,8 @@ class FisheyePanoramaYOLOPose:
                                              kpt_bbox_conf=self.kpt_bbox_conf,
                                              kpt_bbox_padding=self.kpt_bbox_padding,
                                              kpt_bbox_upper_only=self.kpt_bbox_upper_only,
-                                             kpt_bbox_padding_v=self.kpt_bbox_padding_v)
+                                             kpt_bbox_padding_v=self.kpt_bbox_padding_v,
+                                             draw_kpt=self.show_kpt)
         t[7] = time.perf_counter()
 
         # ⑧ 角度计算  [CPU]

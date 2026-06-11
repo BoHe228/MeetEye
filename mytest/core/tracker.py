@@ -672,9 +672,11 @@ class BoT_SORTTracker:
                  enable_left_boundary: bool = True,  # 是否启用左侧边界
                  enable_right_boundary: bool = True,  # 是否启用右侧边界
                  kalman_bbox: bool = False,  # 是否用 Kalman 状态框替代 YOLO 原始框 + 显示 lost 预测框
-                 coast_frames: int = 0):     # >0：丢失轨迹用 Kalman 预测框续命至多 N 帧（独立开关，不改正常框）
+                 coast_frames: int = 0,      # >0：丢失轨迹用 Kalman 预测框续命至多 N 帧（独立开关，不改正常框）
+                 coast_hold: bool = False):  # True：续命期间冻结在最后检测位置，不按速度外推
         self.kalman_bbox = kalman_bbox
         self.coast_frames = coast_frames
+        self.coast_hold = coast_hold
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
         self.removed_stracks: List[STrack] = []
@@ -1097,8 +1099,13 @@ class BoT_SORTTracker:
                 elif track.track_id in self.temp_id_map:
                     final_track_id = self.temp_id_map[track.track_id]
                 out_feat = track.smooth_feat if track.smooth_feat is not None else track.curr_feat
+                # --coast-hold：冻结在最后一次检测位置（original_xyxy），不用外推的 Kalman 框
+                if self.coast_hold and getattr(track, 'original_xyxy', None) is not None:
+                    coast_bbox = track.original_xyxy.tolist()
+                else:
+                    coast_bbox = track.tlbr.tolist()
                 output_detections.append({
-                    'bbox': track.tlbr.tolist(),
+                    'bbox': coast_bbox,
                     'confidence': track.score,
                     'class_id': track.cls,
                     'class_name': class_name,
@@ -1238,6 +1245,7 @@ class HybridSortTracker:
         kalman_bbox: bool = False,    # True → 输出 Kalman 状态框而非 YOLO 原始框
         # ── 丢失轨迹预测框续命（coasting，独立开关，不改正常框）──
         coast_frames: int = 0,        # >0：丢失轨迹用 Kalman 预测框续命至多 N 帧，N 帧内未重现即停止显示
+        coast_hold: bool = False,     # True：续命期间冻结在最后检测位置，不按速度外推
         # ── Round 3.5 中心距离兜底 ──
         cd_thresh: float = 0.5,       # 归一化中心点距离阈值（< 0 关闭）
         # ── 全景图尺寸 ──
@@ -1383,6 +1391,7 @@ class HybridSortTracker:
         self._bbox_size_cache: Dict[int, Tuple[float, float, float, float]] = {}  # track_id → (cx, cy, w, h)
         self.kalman_bbox = kalman_bbox
         self.coast_frames = coast_frames
+        self.coast_hold = coast_hold
 
     # ── 内部工具 ─────────────────────────────────────────────────────────────
 
@@ -1725,8 +1734,14 @@ class HybridSortTracker:
                 if tid in output_internal_ids:
                     continue  # 本帧已匹配，已在输出里
                 try:
-                    ks = trk.get_state()[0]
-                    out_bbox = [float(ks[0]), float(ks[1]), float(ks[2]), float(ks[3])]
+                    # --coast-hold：冻结在最后一次检测位置（last_observation），不按 Kalman
+                    # 速度外推；占位符 [-1,-1,-1,-1,-1] 时回退到预测框。
+                    lo = getattr(trk, 'last_observation', None)
+                    if self.coast_hold and lo is not None and float(lo[:4].sum()) >= 0:
+                        out_bbox = [float(lo[0]), float(lo[1]), float(lo[2]), float(lo[3])]
+                    else:
+                        ks = trk.get_state()[0]
+                        out_bbox = [float(ks[0]), float(ks[1]), float(ks[2]), float(ks[3])]
                 except Exception:
                     continue
                 final_tid = self.temp_id_map.get(tid, tid)

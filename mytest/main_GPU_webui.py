@@ -33,7 +33,7 @@ import config
 import webui.state as ws
 from webui.gpu_info import update_perf, start_gpu_monitor
 from webui.processor import FisheyePanoramaYOLOPose
-from webui.routes import app
+from webui.routes import app, _webrtc_pcs
 from utils.distance_estimator import HeadPoseDistanceEstimator
 from utils.sector import aggregate_sectors
 
@@ -207,21 +207,15 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
     _panorama, _yolo_only, annotated, tracked, angle_info = result
     pipeline_ms = (t_infer - t_decoded) * 1000
     decode_ms   = (t_decoded - t_start) * 1000
-    total_ms    = (t_infer - t_start) * 1000
-
-    _infer_log_counter += 1
-    if _infer_log_counter % 30 == 1:
-        fps_str = f"{1000/total_ms:.1f}" if total_ms > 0 else "∞"
-        print(f"[inference_and_encode] decode={decode_ms:.1f}ms  pipeline={pipeline_ms:.1f}ms"
-              f"  total={total_ms:.1f}ms  → 理论上限 {fps_str} FPS")
 
     detected_persons = len(tracked) if tracked else 0
     tracking_ids = [str(d.get('track_id', '?')) for d in tracked] if tracked else []
-    update_perf(total_ms, detected_persons, tracking_ids)
 
     # 推理线程内完成耗时操作，不占用 asyncio 事件循环
     infer_json  = _build_inference_json(tracked, angle_info)   # JSON 序列化
-    webrtc_vf   = _make_webrtc_frame(annotated)                # BGR→YUV420P
+    # WebRTC 帧仅在有活跃连接时生成：无人观看 WebRTC 时省掉每帧整帧 BGR→YUV420P
+    # 转换（3840 宽，非小开销）。recv() 在 latest_webrtc_frame 为 None 时自带空白帧兜底。
+    webrtc_vf   = _make_webrtc_frame(annotated) if _webrtc_pcs else None
 
     # ── JSONL 持久化（--save-json，每 30 帧 flush 一次，不影响推理耗时）──
     global _json_file, _json_write_counter
@@ -253,6 +247,21 @@ def inference_and_encode(jpeg_bytes: bytes) -> Optional[bytes]:
                     ws.record_filenames['annotated'], fourcc, 25.0, (aw, ah))
             ws._video_writer_original.write(frame)
             ws._video_writer_annotated.write(annotated)
+
+    # ── 一帧的全部串行工作（解码 + 推理 + JSON + WebRTC + 录制）至此结束 ──
+    # 用整段耗时（loop）而非仅推理段作为「理论上限」基准，使其反映真实循环周期，
+    # 否则该数会把 JSON/WebRTC/录制这条尾巴漏掉、一直偏乐观。
+    t_end   = time.perf_counter()
+    tail_ms = (t_end - t_infer) * 1000   # JSON / WebRTC / 帧缓冲 / 录制
+    loop_ms = (t_end - t_start) * 1000
+    update_perf(loop_ms, detected_persons, tracking_ids)
+
+    _infer_log_counter += 1
+    if _infer_log_counter % 30 == 1:
+        fps_str = f"{1000/loop_ms:.1f}" if loop_ms > 0 else "∞"
+        print(f"[inference_and_encode] decode={decode_ms:.1f}ms  pipeline={pipeline_ms:.1f}ms"
+              f"  tail={tail_ms:.1f}ms(json/webrtc/录制)  loop={loop_ms:.1f}ms"
+              f"  → 理论上限 {fps_str} FPS")
 
     # GPU 显存碎片清理（每 200 帧一次，原在 _encode_worker 中，现移至此）
     if _infer_log_counter % 200 == 0 and torch.cuda.is_available():

@@ -143,6 +143,11 @@ def parse_args():
                         help='是否在检测框上显示 Track ID (默认: True)')
     parser.add_argument('--show-conf', action=argparse.BooleanOptionalAction, default=True,
                         help='是否在检测框上显示置信度 (默认: True)')
+    parser.add_argument('--show-kpt', action=argparse.BooleanOptionalAction, default=False,
+                        help='是否在画面上绘制关键点（鼻/眼/肩等散点）(默认: False)')
+    parser.add_argument('--face-kpt', action='store_true', default=False,
+                        help='输入为人脸关键点模型（如 yolov8n-face，5 点：左眼/右眼/鼻子/左右嘴角）：'
+                             '角度特征点改用左右嘴角中点而非鼻子。模型名含 "face" 时自动开启 (默认: False)')
     parser.add_argument('--show-angle', action=argparse.BooleanOptionalAction, default=False,
                         help='是否在画面上显示角度文字标注 (默认: False)')
     parser.add_argument('--show-arrow', action=argparse.BooleanOptionalAction, default=False,
@@ -160,13 +165,14 @@ def parse_args():
                         help='丢失轨迹预测框续命帧数（独立开关，不改正常框）：>0 时目标某帧漏检后'
                              '继续用 Kalman 预测框显示至多 N 帧，N 帧内重现则接回真实框、否则停止显示，'
                              '用于平滑 1~2 帧瞬时漏检的闪烁。0=关闭。建议 2 (默认: 0)')
+    parser.add_argument('--coast-hold', action='store_true', default=False,
+                        help='续命时冻结而非外推（配合 --coast-frames）：漏检期间预测框停在最后一次'
+                             '检测到的位置，而不是按 Kalman 速度继续外推漂移。适合静止/小幅运动场景'
+                             '（如开会人脸），避免框漂进相邻扇区。(默认: False，保持外推)')
     parser.add_argument('--kpt-track', action='store_true', default=False,
                         help='跟踪层（IoU 匹配 + Kalman 初始化）使用关键点推导框，减少大框重叠误判 (默认: False)')
     parser.add_argument('--kpt-display', action='store_true', default=False,
                         help='显示层用关键点推导框替代原始框绘制，不影响跟踪逻辑 (默认: False)')
-    parser.add_argument('--face-kpt', action='store_true', default=False,
-                        help='输入为人脸关键点模型（如 yolov8n-face，5 点：左眼/右眼/鼻子/左右嘴角）：'
-                             '角度特征点改用左右嘴角中点而非鼻子。模型名含 "face" 时自动开启 (默认: False)')
 
     # 关键点框公共参数（--kpt-track 和 --kpt-display 共用）
     parser.add_argument('--kpt-bbox-conf', type=float, default=0.3,
@@ -181,6 +187,7 @@ def parse_args():
     # 跟踪器选择
     parser.add_argument('--tracker', type=str, default='hybridsort',
                         choices=['none', 'botsort', 'hybridsort'],
+                        
                         help='跟踪器类型：none=不使用跟踪，botsort=BoT-SORT，hybridsort=Hybrid-SORT (默认: hybridsort)')
 
     # 检测框平滑（对两种跟踪器均有效）

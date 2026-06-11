@@ -63,6 +63,7 @@ class FisheyePanoramaYOLOPose:
         self.show_angle_overview = False
         self.show_id: bool = getattr(args, 'show_id', True)
         self.show_conf: bool = getattr(args, 'show_conf', True)
+        self.show_kpt: bool = getattr(args, 'show_kpt', False)
         self.show_angle: bool = getattr(args, 'show_angle', True)
         self.show_arrow: bool = getattr(args, 'show_arrow', True)
         self.kpt_display: bool = getattr(args, 'kpt_display', False)
@@ -125,6 +126,7 @@ class FisheyePanoramaYOLOPose:
                 use_hungarian=args.use_hungarian,
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
                 coast_frames=getattr(args, 'coast_frames', 0),
+                coast_hold=getattr(args, 'coast_hold', False),
                 **_boundary_kwargs,
             )
         elif args.tracker == 'hybridsort':
@@ -137,9 +139,9 @@ class FisheyePanoramaYOLOPose:
                 track_buffer=500,          # WebUI 长时运行，保留更多历史
                 frame_rate=30,
                 # ── 关联阈值（与 main.py 对齐）────────────────────────────
-                match_thresh=0.2,
+                match_thresh=0.15,
                 # ── Hybrid-SORT 专有参数（与 main.py 对齐）───────────────
-                inertia=0.2,
+                inertia=0.1,
                 delta_t=3,
                 use_byte=True,
                 tcm_first_step=True,
@@ -163,6 +165,7 @@ class FisheyePanoramaYOLOPose:
                 # ── Kalman 轨迹框 ───────────────────────────────────────────
                 kalman_bbox=getattr(args, 'kalman_bbox', False),
                 coast_frames=getattr(args, 'coast_frames', 0),
+                coast_hold=getattr(args, 'coast_hold', False),
                 **_boundary_kwargs,
             )
         else:
@@ -485,7 +488,8 @@ class FisheyePanoramaYOLOPose:
                                     use_kpt_bbox=self.kpt_display,
                                     kpt_bbox_conf=self.kpt_bbox_conf,
                                     kpt_bbox_padding=self.kpt_bbox_padding,
-                                    kpt_bbox_upper_only=self.kpt_bbox_upper_only)
+                                    kpt_bbox_upper_only=self.kpt_bbox_upper_only,
+                                    draw_kpt=self.show_kpt)
         t[7] = time.perf_counter()
 
         # ⑩ 角度绘制（鼻子圈/箭头 + 补漏框合成点标记）
