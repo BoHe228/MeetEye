@@ -428,15 +428,23 @@ class FisheyePanoramaYOLOPose:
         current_ids = {d['track_id'] for d in tracked}
         new_ids = current_ids - self._prev_track_ids
         if self.face_rec is not None:
-            for det in tracked:
-                tid = det['track_id']
-                self.face_rec.process_detection(
-                    panorama, det.get('keypoints', []), tid,
-                    is_new_track=(tid in new_ids),
-                    face_name_map=self._face_name_map,
+            if hasattr(self.face_rec, 'process_frame'):
+                self.face_rec.process_frame(
+                    panorama, tracked, new_ids, self._face_name_map,
                     frame_id=self._timing_counter,
                 )
-            for gone in (set(self._face_name_map) - current_ids):
+            else:
+                for det in tracked:
+                    tid = det['track_id']
+                    self.face_rec.process_detection(
+                        panorama, det.get('keypoints', []), tid,
+                        is_new_track=(tid in new_ids),
+                        face_name_map=self._face_name_map,
+                        frame_id=self._timing_counter,
+                        bbox=det.get('bbox'),
+                        confidence=det.get('confidence'),
+                    )
+            for gone in ((self._prev_track_ids | set(self._face_name_map)) - current_ids):
                 self._face_name_map.pop(gone, None)
                 self.face_rec.cleanup_track(gone)
         self._prev_track_ids = current_ids
