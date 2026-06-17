@@ -82,3 +82,9 @@ face_rec_model/
 !docs/
 !docs/demo_compressed.mp4
 !docs/demo_preview.jpg
+
+
+2026.4.9_Calibrator_YoLoV8 (正畸+人脸识别+嘴部+角度)
+work
+debug_face_dump
+face_library_dynamic
