@@ -261,7 +261,8 @@ async def webrtc_signaling(websocket: WebSocket) -> None:
     await websocket.accept()
     pc = RTCPeerConnection()
     _webrtc_pcs.add(pc)
-    track = InferenceVideoTrack(fps=30)
+    fps = max(1, min(120, int(getattr(state, "webrtc_fps", 30))))
+    track = InferenceVideoTrack(fps=fps)
 
     @pc.on("connectionstatechange")
     async def _on_state() -> None:
@@ -291,7 +292,7 @@ async def webrtc_signaling(websocket: WebSocket) -> None:
             "sdp": pc.localDescription.sdp,
             "type": pc.localDescription.type,
         })
-        print(f"[webrtc] 信令完成，当前 {len(_webrtc_pcs)} 路连接")
+        print(f"[webrtc] 信令完成，fps={fps}，当前 {len(_webrtc_pcs)} 路连接")
     except asyncio.TimeoutError:
         print("[webrtc] 等待 Offer 超时")
     except Exception as e:
