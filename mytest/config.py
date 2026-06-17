@@ -90,6 +90,8 @@ def parse_args():
     parser.add_argument('--save-frames', action='store_true', help='保存处理后的帧')
     parser.add_argument('--save-crops', action='store_true', help='保存每个检测框的内容（抠图）')
     parser.add_argument('--show-fps', action='store_true', default=False, help='显示FPS')
+    parser.add_argument('--webrtc-fps', type=int, default=40,
+                        help='WebUI 浏览器推理画面 WebRTC 固定推流帧率，影响显示刷新率，不改变后端推理帧率 (默认: 30)')
 
     # 显示窗口参数
     parser.add_argument('--use-dual-windows', action='store_true', default=False,
@@ -123,12 +125,67 @@ def parse_args():
     parser.add_argument('--face-rec-model', type=str,
                         default='face_rec_model/adaface_ir18_vgg2.ckpt',
                         help='AdaFace IR-18 模型权重路径')
-    parser.add_argument('--face-rec-threshold', type=float, default=0.35,
+    parser.add_argument('--face-rec-threshold', type=float, default=0.55,
                         help='人脸识别余弦相似度阈值，低于此值视为未知（默认: 0.35）')
     parser.add_argument('--face-frontal-threshold', type=float, default=0.65,
                         help='正面人脸判断阈值（鼻子水平偏移/眼距），越小越严格（默认: 0.35）')
     parser.add_argument('--face-rec-cooldown', type=int, default=30,
                         help='未识别目标重试间隔帧数，避免每帧触发推理（默认: 30）')
+
+    # 动态人脸库参数（主要供 main_GPU_face_rc_webui.py 使用）
+    # 普通 main_GPU_webui.py 默认仍然不启用人脸识别，也不会自动启用动态库。
+    parser.add_argument('--dynamic-face-library-dir', type=str, default=None,
+                        help='动态人脸库保存目录；默认 face_library_dynamic/session_时间戳')
+    parser.add_argument('--dynamic-face-match-interval', type=int, default=None,
+                        help='动态人脸库后续匹配间隔帧数；默认沿用 --face-rec-cooldown')
+    parser.add_argument('--dynamic-face-max-samples', type=int, default=5,
+                        help='每个动态人脸身份最多保留多少个特征样本 (默认: 5)')
+    parser.add_argument('--dynamic-face-update-similarity', type=float, default=None,
+                        help='匹配分数达到该值才追加为同一身份的新样本；默认 max(0.15, threshold-0.05)')
+    parser.add_argument('--dynamic-face-min-sample-diversity', type=float, default=0.015,
+                        help='新样本与已有样本至少差异多少才保存，避免重复样本 (默认: 0.015)')
+    parser.add_argument('--dynamic-face-primary-max-yaw', type=float, default=20.0,
+                        help='动态库 primary 正脸样本最大 yaw 角；超过该角度进入 supplement (默认: 20)')
+    parser.add_argument('--dynamic-face-supplement-fallback-threshold', type=float, default=None,
+                        help='primary 最佳分数低于该值时才启用 supplement 兜底；默认 threshold+0.10')
+    parser.add_argument('--dynamic-face-match-margin', type=float, default=0.08,
+                        help='匹配时 top1 至少高出 top2 多少相似度才认可 (默认: 0.08)')
+    parser.add_argument('--dynamic-face-ambiguous-keep-bound', action=argparse.BooleanOptionalAction, default=True,
+                        help='已有 TrackID 绑定 faceid 时，被 match margin 拦住也允许沿用旧 faceid 显示；不更新人脸库 (默认: True)')
+    parser.add_argument('--dynamic-face-ambiguous-keep-min-score', type=float, default=None,
+                        help='沿用旧 faceid 的最低相似度；默认等于 --face-rec-threshold')
+    parser.add_argument('--dynamic-face-global-assignment', action=argparse.BooleanOptionalAction, default=True,
+                        help='同一帧内对 TrackID 与 FaceID 做全局一对一分配，避免先到先占 (默认: True)')
+    parser.add_argument('--dynamic-face-auto-alias', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否自动将后生成且高度相似的动态 faceid 映射到旧 faceid (默认: True)')
+    parser.add_argument('--dynamic-face-alias-threshold', type=float, default=None,
+                        help='自动 alias 的身份级相似度阈值；默认 max(0.50, threshold+0.20)')
+    parser.add_argument('--dynamic-face-alias-min-samples', type=int, default=2,
+                        help='新 faceid 至少累计多少样本后才允许自动 alias (默认: 2)')
+    parser.add_argument('--dynamic-face-alias-min-hits', type=int, default=2,
+                        help='同一 alias 候选连续命中多少次后生效 (默认: 2)')
+    parser.add_argument('--dynamic-face-alias-margin', type=float, default=0.03,
+                        help='最佳 alias 候选至少高出第二候选多少相似度才生效 (默认: 0.03)')
+    parser.add_argument('--dynamic-face-alias-probe-samples', type=int, default=30,
+                        help='每个动态 faceid 为自动 alias 额外保留多少近期探测特征，不影响识别库 (默认: 30)')
+    parser.add_argument('--dynamic-face-switch-margin', type=float, default=0.15,
+                        help='同一 TrackID 已绑定后，切换到其他 faceid 需高出当前绑定分数的 margin (默认: 0.15)')
+    parser.add_argument('--dynamic-face-min-height', type=int, default=64,
+                        help='检测框 bbox 宽或高低于该像素值时跳过 faceid 计算 (默认: 64)')
+    parser.add_argument('--dynamic-face-enroll-max-yaw', type=float, default=30.0,
+                        help='未匹配已有库时，只有头部偏转不超过该角度才新建 faceid (默认: 30)')
+    parser.add_argument('--dynamic-face-binding-mismatch-threshold', type=float, default=None,
+                        help='已绑定 TrackID 与原 faceid 分数低于该值才允许考虑切换；默认 threshold-0.12')
+    parser.add_argument('--dynamic-face-lock-to-track', action=argparse.BooleanOptionalAction, default=True,
+                        help='动态人脸库中 TrackID 一旦绑定 faceid 后是否锁定输出；'
+                             '--no-dynamic-face-lock-to-track 恢复旧的相似度切换逻辑 (默认: True)')
+    parser.add_argument('--face-debug-dump-dir', type=str, default=None,
+                        help='临时调试：保存每次人脸识别提取到的 face crop、512D 向量和元数据；'
+                             '不传则关闭，建议设为 debug_face_dump/session_xxx')
+    parser.add_argument('--face-debug-dump-every', type=int, default=1,
+                        help='临时调试：每 N 次有效人脸特征提取保存一次，配合 --face-debug-dump-dir 使用 (默认: 1)')
+    parser.add_argument('--face-debug-dump-max', type=int, default=0,
+                        help='临时调试：最多保存多少条样本；0 表示不限制，配合 --face-debug-dump-dir 使用')
 
     # 说话检测开关
     parser.add_argument('--talking-detection', action=argparse.BooleanOptionalAction, default=False,
