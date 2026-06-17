@@ -39,6 +39,7 @@ gpu_clean_counter: int = 0
 # ── 预转换好的 WebRTC 帧（av.VideoFrame yuv420p），由推理线程在 inference_executor 中准备好。
 # recv() 直接取用，无需在 asyncio 事件循环中做 BGR→YUV 转换，消除事件循环阻塞。
 latest_webrtc_frame = None   # type: Optional[Any]  (av.VideoFrame，避免此处 import av)
+webrtc_fps: int = 30
 
 # ── 推理结果 JSON 缓冲（inference 线程写，/inference/latest 和 /ws/inference 读）
 # 存储为 bytes（json.dumps 后 encode），方便 WebSocket 直接 send_bytes，避免重复序列化。
