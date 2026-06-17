@@ -375,6 +375,8 @@ def main() -> None:
 
     # 2. 注册推理回调 + 启动 GPU 监控线程
     ws.inference_fn = inference_and_encode
+    ws.webrtc_fps = max(1, min(120, int(getattr(args, 'webrtc_fps', 30))))
+    print(f"[WebRTC] 浏览器推理画面固定推流帧率: {ws.webrtc_fps} FPS")
     start_gpu_monitor()  # GPU/CPU 指标独立后台线程，不阻塞推理
 
     port = _find_free_port()
