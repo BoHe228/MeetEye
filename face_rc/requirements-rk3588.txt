@@ -1,0 +1,35 @@
+# RK3588 runtime requirements for face_rc/main.py.
+#
+# Install in the board virtual environment:
+#   python -m pip install -r face_rc/requirements-rk3588.txt
+#
+# Then install Rockchip RKNNLite from the local aarch64 cp38 wheel, for example:
+#   python -m pip install \
+#     rknn-toolkit2/rknn-toolkit-lite2/packages/rknn_toolkit_lite2-2.3.2-cp38-cp38-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+#
+# Python on the current Firefly board is 3.8.10, so package versions here avoid
+# requiring Python 3.9+ where practical.
+
+numpy>=1.23.0,<2.0.0
+opencv-python-headless>=4.8.0,<4.13.0
+scipy>=1.10.0,<1.11.0
+filterpy>=1.4.5
+lap>=0.4.0
+psutil>=5.9.0
+
+# Ultralytics is used as the wrapper around the *_rknn_model directory and for
+# YOLO pose post-processing. Keep this aligned with metadata.yaml when possible.
+ultralytics==8.4.37
+
+# Torch is required by the existing face_rc pipeline for panorama processing
+# and by Ultralytics. On aarch64 boards, install the wheel/index that matches
+# the board OS if pip cannot resolve this directly.
+torch>=2.0.0
+torchvision>=0.15.0
+
+# WebUI and WebRTC runtime.
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+websockets>=11.0
+aiortc>=1.6.0
+av>=10.0.0
