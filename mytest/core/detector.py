@@ -15,7 +15,7 @@ class YOLOPoseDetector:
     """YOLO姿态检测器"""
 
     def __init__(self, model_path: str, conf_threshold: float = 0.5,
-                 iou_threshold: float = 0.45):
+                 iou_threshold: float = 0.45, imgsz: int = 864):
         """
         初始化YOLO姿态检测器
         """
@@ -34,6 +34,7 @@ class YOLOPoseDetector:
         # self.model = self.model.half()
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+        self.imgsz = int(imgsz)
 
         # 性能统计
         self.inference_times = []
@@ -48,7 +49,7 @@ class YOLOPoseDetector:
         start_time = time.time()
         results = self.model.predict(
             images,
-            imgsz=864,
+            imgsz=self.imgsz,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             verbose=False,
@@ -86,7 +87,7 @@ class YOLOPoseDetector:
             # 纯检测（用于切片检测，避免多切片ID冲突）
             results = self.model.predict(
                 image,
-                imgsz=864,
+                imgsz=self.imgsz,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
                 verbose=False,

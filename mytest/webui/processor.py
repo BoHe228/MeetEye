@@ -190,6 +190,7 @@ class FisheyePanoramaYOLOPose:
             model_path=self.args.model_path,
             conf_threshold=self.args.conf_threshold,
             iou_threshold=self.args.iou_threshold,
+            imgsz=getattr(self.args, 'yolo_imgsz', 864),
         )
         if _CUDA:
             print(f"GPU 已就绪: {torch.cuda.get_device_name(0)}")
@@ -215,6 +216,7 @@ class FisheyePanoramaYOLOPose:
                     model_path=self.args.recall_model,
                     conf_threshold=_recall_conf,
                     iou_threshold=self.args.iou_threshold,
+                    imgsz=getattr(self.args, 'yolo_imgsz', 864),
                 )
                 if _CUDA and not self.args.recall_model.endswith('.engine'):
                     self.recall_detector.model.to('cuda')
