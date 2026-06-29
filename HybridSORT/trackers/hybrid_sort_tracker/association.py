@@ -1,5 +1,44 @@
 import os
+import time
 import numpy as np
+
+
+_ASSIGNMENT_PROFILE = {
+    "enabled": False,
+    "calls": 0,
+    "time_ms": 0.0,
+    "max_ms": 0.0,
+    "shapes": [],
+}
+
+
+def reset_assignment_profile(enabled=True):
+    _ASSIGNMENT_PROFILE["enabled"] = enabled
+    _ASSIGNMENT_PROFILE["calls"] = 0
+    _ASSIGNMENT_PROFILE["time_ms"] = 0.0
+    _ASSIGNMENT_PROFILE["max_ms"] = 0.0
+    _ASSIGNMENT_PROFILE["shapes"] = []
+
+
+def get_assignment_profile():
+    return {
+        "calls": _ASSIGNMENT_PROFILE["calls"],
+        "time_ms": _ASSIGNMENT_PROFILE["time_ms"],
+        "max_ms": _ASSIGNMENT_PROFILE["max_ms"],
+        "shapes": list(_ASSIGNMENT_PROFILE["shapes"]),
+    }
+
+
+def _record_assignment_profile(start_t, shape):
+    if start_t is None or not _ASSIGNMENT_PROFILE["enabled"]:
+        return
+    dt_ms = (time.perf_counter() - start_t) * 1000.0
+    _ASSIGNMENT_PROFILE["calls"] += 1
+    _ASSIGNMENT_PROFILE["time_ms"] += dt_ms
+    _ASSIGNMENT_PROFILE["max_ms"] = max(_ASSIGNMENT_PROFILE["max_ms"], dt_ms)
+    shapes = _ASSIGNMENT_PROFILE["shapes"]
+    if len(shapes) < 8:
+        shapes.append(tuple(int(v) for v in shape))
 
 def intersection_batch(bboxes1, bboxes2):
     bboxes2 = np.expand_dims(bboxes2, 0)
@@ -288,17 +327,21 @@ def speed_direction_batch(dets, tracks):
 
 
 def linear_assignment(cost_matrix, thresh=0.):
+    _profile_t0 = time.perf_counter() if _ASSIGNMENT_PROFILE["enabled"] else None
+    _profile_shape = getattr(cost_matrix, "shape", ())
     try:        # [hgx0411] goes here!
         import lap
         if thresh != 0:
             _, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
         else:
             _, x, y = lap.lapjv(cost_matrix, extend_cost=True)
-        return np.array([[y[i], i] for i in x if i >= 0])
+        result = np.array([[y[i], i] for i in x if i >= 0])
     except ImportError:
         from scipy.optimize import linear_sum_assignment
         x, y = linear_sum_assignment(cost_matrix)
-        return np.array(list(zip(x, y)))
+        result = np.array(list(zip(x, y)))
+    _record_assignment_profile(_profile_t0, _profile_shape)
+    return result
 
 
 def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):

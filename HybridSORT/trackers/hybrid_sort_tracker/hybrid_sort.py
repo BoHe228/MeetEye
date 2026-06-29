@@ -3,7 +3,9 @@
 """
 from __future__ import print_function
 
+import time
 import numpy as np
+from . import association as _association_profile
 from .association import *
 
 
@@ -85,6 +87,34 @@ def speed_direction_rb(bbox1, bbox2):
     speed = np.array([cy2-cy1, cx2-cx1])
     norm = np.sqrt((cy2-cy1)**2 + (cx2-cx1)**2) + 1e-6
     return speed / norm
+
+def speed_direction_corners(bbox1, bbox2):
+    speeds = np.empty((4, 2), dtype=float)
+
+    dy = bbox2[1] - bbox1[1]
+    dx = bbox2[0] - bbox1[0]
+    norm = np.sqrt(dy * dy + dx * dx) + 1e-6
+    speeds[0, 0] = dy / norm
+    speeds[0, 1] = dx / norm
+
+    dy = bbox2[3] - bbox1[3]
+    dx = bbox2[0] - bbox1[0]
+    norm = np.sqrt(dy * dy + dx * dx) + 1e-6
+    speeds[1, 0] = dy / norm
+    speeds[1, 1] = dx / norm
+
+    dy = bbox2[1] - bbox1[1]
+    dx = bbox2[2] - bbox1[2]
+    norm = np.sqrt(dy * dy + dx * dx) + 1e-6
+    speeds[2, 0] = dy / norm
+    speeds[2, 1] = dx / norm
+
+    dy = bbox2[3] - bbox1[3]
+    dx = bbox2[2] - bbox1[2]
+    norm = np.sqrt(dy * dy + dx * dx) + 1e-6
+    speeds[3, 0] = dy / norm
+    speeds[3, 1] = dx / norm
+    return speeds
 
 def _normalize_vel(vel):
     """将速度方向向量单位化（模长归一）。
@@ -169,6 +199,10 @@ class KalmanBoxTracker(object):
         self.kf.Q[-1, -1] *= 0.01
         self.kf.Q[-2, -2] *= 0.01
         self.kf.Q[5:, 5:] *= 0.01
+        self.kf._hybridsort_fast_predict = False
+        self.kf._hybridsort_fast_update = False
+        self.kf._hybridsort_skip_predict_prior_copy = True
+        self.kf._hybridsort_skip_update_snapshot_copy = True
 
         self.kf.x[:5] = convert_bbox_to_z(bbox)
 
@@ -228,25 +262,27 @@ class KalmanBoxTracker(object):
                     # dt = self.delta_t - i
                     if self.age - i - 1 in self.observations:
                         previous_box = self.observations[self.age - i - 1]
+                        speeds = speed_direction_corners(previous_box, bbox)
                         if velocity_lt is not None:
                             # velocity += speed_direction(previous_box, bbox)
-                            velocity_lt += speed_direction_lt(previous_box, bbox)
-                            velocity_rt += speed_direction_rt(previous_box, bbox)
-                            velocity_lb += speed_direction_lb(previous_box, bbox)
-                            velocity_rb += speed_direction_rb(previous_box, bbox)
+                            velocity_lt += speeds[0]
+                            velocity_rt += speeds[1]
+                            velocity_lb += speeds[2]
+                            velocity_rb += speeds[3]
                         else:
                             # velocity = speed_direction(previous_box, bbox)
-                            velocity_lt = speed_direction_lt(previous_box, bbox)
-                            velocity_rt = speed_direction_rt(previous_box, bbox)
-                            velocity_lb = speed_direction_lb(previous_box, bbox)
-                            velocity_rb = speed_direction_rb(previous_box, bbox)
+                            velocity_lt = speeds[0].copy()
+                            velocity_rt = speeds[1].copy()
+                            velocity_lb = speeds[2].copy()
+                            velocity_rb = speeds[3].copy()
                         # break
                 if previous_box is None:
                     previous_box = self.last_observation
-                    new_vel_lt = speed_direction_lt(previous_box, bbox)
-                    new_vel_rt = speed_direction_rt(previous_box, bbox)
-                    new_vel_lb = speed_direction_lb(previous_box, bbox)
-                    new_vel_rb = speed_direction_rb(previous_box, bbox)
+                    speeds = speed_direction_corners(previous_box, bbox)
+                    new_vel_lt = speeds[0]
+                    new_vel_rt = speeds[1]
+                    new_vel_lb = speeds[2]
+                    new_vel_rb = speeds[3]
                 else:
                     new_vel_lt = velocity_lt
                     new_vel_rt = velocity_rt
@@ -326,11 +362,35 @@ class KalmanBoxTracker(object):
         if(self.time_since_update > 0):
             self.hit_streak = 0
         self.time_since_update += 1
-        self.history.append(convert_x_to_bbox(self.kf.x))
+
+        x = self.kf.x
+        area = float(x[2, 0])
+        aspect = float(x[4, 0])
+        w = np.sqrt(area * aspect)
+        h = area / w
+        cx = float(x[0, 0])
+        cy = float(x[1, 0])
+        score = float(x[3, 0])
+        bbox = np.array([[cx - w / 2., cy - h / 2.,
+                          cx + w / 2., cy + h / 2., score]])
+        self.history = [bbox]
+        track_thresh = self.args.track_thresh
+        kalman_score = score
+        if kalman_score < track_thresh:
+            kalman_score = track_thresh
+        elif kalman_score > 1.0:
+            kalman_score = 1.0
+
         if not self.confidence_pre:
-            return self.history[-1], np.clip(self.kf.x[3], self.args.track_thresh, 1.0), np.clip(self.confidence, 0.1, self.args.track_thresh)
+            simple_score = float(self.confidence)
         else:
-            return self.history[-1], np.clip(self.kf.x[3], self.args.track_thresh, 1.0), np.clip(self.confidence - (self.confidence_pre - self.confidence), 0.1, self.args.track_thresh)
+            simple_score = float(self.confidence - (self.confidence_pre - self.confidence))
+        if simple_score < 0.1:
+            simple_score = 0.1
+        elif simple_score > track_thresh:
+            simple_score = track_thresh
+
+        return bbox, kalman_score, simple_score
 
     def get_state(self):
         """
@@ -379,6 +439,7 @@ class Hybrid_Sort(object):
         self.inertia = inertia
         self.use_byte = use_byte
         self.args = args
+        self.last_profile = {}
         KalmanBoxTracker.count = 0
 
     def update(self, output_results, img_info, img_size):
@@ -389,10 +450,36 @@ class Hybrid_Sort(object):
         Returns the a similar array, where the last column is the object ID.
         NOTE: The number of objects returned may differ from the number of detections provided.
         """
+        profile_t0 = time.perf_counter()
+        profile_last = profile_t0
+        profile = {
+            "n_input": 0,
+            "n_high": 0,
+            "n_second": 0,
+            "n_trackers_before": len(self.trackers),
+        }
+
+        def mark(name):
+            nonlocal profile_last
+            now = time.perf_counter()
+            profile[name] = (now - profile_last) * 1000.0
+            profile_last = now
+
+        def finish(result):
+            profile["total"] = (time.perf_counter() - profile_t0) * 1000.0
+            profile["assignment"] = _association_profile.get_assignment_profile()
+            profile["n_trackers_after"] = len(self.trackers)
+            self.last_profile = profile
+            return result
+
+        _association_profile.reset_assignment_profile(enabled=True)
+
         if output_results is None:
-            return np.empty((0, 5))
+            return finish(np.empty((0, 5)))
 
         self.frame_count += 1
+        profile["n_input"] = int(output_results.shape[0]) if hasattr(output_results, "shape") else 0
+
         # post_process detections
         if output_results.shape[1] == 5:
             scores = output_results[:, 4]
@@ -411,36 +498,52 @@ class Hybrid_Sort(object):
         dets_second = dets[inds_second]  # detections for second matching
         remain_inds = scores > self.det_thresh
         dets = dets[remain_inds]
+        profile["n_high"] = int(len(dets))
+        profile["n_second"] = int(len(dets_second))
+        mark("preprocess")
 
         # get predicted locations from existing trackers.
-        trks = np.zeros((len(self.trackers), 6))
+        trks = np.zeros((len(self.trackers), 6), dtype=float)
+        valid_trks = np.ones((len(self.trackers),), dtype=bool)
         to_del = []
         ret = []
         for t, trk in enumerate(trks):
             pos, kalman_score, simple_score = self.trackers[t].predict()
             # kalman_score / simple_score 可能是 shape-(1,) 数组（kf.x 是列向量），
             # 强制转为 Python float 避免 "sequence in array element" 错误
-            trk[:] = [pos[0][0], pos[0][1], pos[0][2], pos[0][3],
-                      float(kalman_score), float(simple_score)]
-            if np.any(np.isnan(pos)):
+            row = pos[0]
+            trk[:] = [row[0], row[1], row[2], row[3], kalman_score, simple_score]
+            if np.any(np.isnan(row)):
                 to_del.append(t)
-        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+                valid_trks[t] = False
+            elif not np.isfinite(trk).all():
+                valid_trks[t] = False
+        trks = trks[valid_trks]
         for t in reversed(to_del):
             self.trackers.pop(t)
+        mark("predict")
 
         # velocities = np.array(
         #     [trk.velocity if trk.velocity is not None else np.array((0, 0)) for trk in self.trackers])
-        velocities_lt = np.array(
-            [trk.velocity_lt if trk.velocity_lt is not None else np.array((0, 0)) for trk in self.trackers])
-        velocities_rt = np.array(
-            [trk.velocity_rt if trk.velocity_rt is not None else np.array((0, 0)) for trk in self.trackers])
-        velocities_lb = np.array(
-            [trk.velocity_lb if trk.velocity_lb is not None else np.array((0, 0)) for trk in self.trackers])
-        velocities_rb = np.array(
-            [trk.velocity_rb if trk.velocity_rb is not None else np.array((0, 0)) for trk in self.trackers])
-        last_boxes = np.array([trk.last_observation for trk in self.trackers])
-        k_observations = np.array(
-            [k_previous_obs(trk.observations, trk.age, self.delta_t) for trk in self.trackers])
+        track_count = len(self.trackers)
+        velocities_lt = np.zeros((track_count, 2), dtype=float)
+        velocities_rt = np.zeros((track_count, 2), dtype=float)
+        velocities_lb = np.zeros((track_count, 2), dtype=float)
+        velocities_rb = np.zeros((track_count, 2), dtype=float)
+        last_boxes = np.empty((track_count, 5), dtype=float)
+        k_observations = np.empty((track_count, 5), dtype=float)
+        for idx, tracker in enumerate(self.trackers):
+            if tracker.velocity_lt is not None:
+                velocities_lt[idx] = tracker.velocity_lt
+            if tracker.velocity_rt is not None:
+                velocities_rt[idx] = tracker.velocity_rt
+            if tracker.velocity_lb is not None:
+                velocities_lb[idx] = tracker.velocity_lb
+            if tracker.velocity_rb is not None:
+                velocities_rb[idx] = tracker.velocity_rb
+            last_boxes[idx] = tracker.last_observation
+            k_observations[idx] = k_previous_obs(tracker.observations, tracker.age, self.delta_t)
+        mark("state_vectors")
 
         """
             First round of association
@@ -452,14 +555,20 @@ class Hybrid_Sort(object):
         else:
             matched, unmatched_dets, unmatched_trks = associate_4_points(
                 dets, trks, self.iou_threshold, velocities_lt, velocities_rt, velocities_lb, velocities_rb, k_observations, self.inertia, self.asso_func, self.args)
+        profile["matches_first"] = int(len(matched))
+        profile["unmatched_dets_first"] = int(len(unmatched_dets))
+        profile["unmatched_trks_first"] = int(len(unmatched_trks))
+        mark("assoc_first")
 
         for m in matched:
             self.trackers[m[1]].update(dets[m[0], :])
+        mark("update_first")
 
         """
             Second round of associaton by OCR
         """
         # BYTE association
+        profile["matches_byte"] = 0
         if self.use_byte and len(dets_second) > 0 and unmatched_trks.shape[0] > 0:
             u_trks = trks[unmatched_trks]
             iou_left = self.asso_func(dets_second, u_trks)
@@ -480,8 +589,12 @@ class Hybrid_Sort(object):
                         continue
                     self.trackers[trk_ind].update(dets_second[det_ind, :])
                     to_remove_trk_indices.append(trk_ind)
-                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+                    profile["matches_byte"] += 1
+                unmatched_trks = np.setdiff1d(
+                    unmatched_trks, np.array(to_remove_trk_indices), assume_unique=True)
+        mark("assoc_byte")
 
+        profile["matches_ocr"] = 0
         if unmatched_dets.shape[0] > 0 and unmatched_trks.shape[0] > 0:
             left_dets = dets[unmatched_dets]
             left_trks = last_boxes[unmatched_trks]
@@ -504,13 +617,21 @@ class Hybrid_Sort(object):
                     self.trackers[trk_ind].update(dets[det_ind, :])
                     to_remove_det_indices.append(det_ind)
                     to_remove_trk_indices.append(trk_ind)
-                unmatched_dets = np.setdiff1d(unmatched_dets, np.array(to_remove_det_indices))
-                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+                    profile["matches_ocr"] += 1
+                unmatched_dets = np.setdiff1d(
+                    unmatched_dets, np.array(to_remove_det_indices), assume_unique=True)
+                unmatched_trks = np.setdiff1d(
+                    unmatched_trks, np.array(to_remove_trk_indices), assume_unique=True)
+        profile["unmatched_dets_after"] = int(len(unmatched_dets))
+        profile["unmatched_trks_after"] = int(len(unmatched_trks))
+        mark("assoc_ocr")
 
         for m in unmatched_trks:
             self.trackers[m].update(None)
+        mark("mark_unmatched")
 
         # create and initialise new trackers for unmatched detections
+        created_tracks = 0
         for i in unmatched_dets:
             if dets[i, 4] < self.new_track_thresh:
                 continue  # 置信度低于新轨迹阈值，不生成新 ID
@@ -522,6 +643,10 @@ class Hybrid_Sort(object):
                     continue
             trk = KalmanBoxTracker(dets[i, :], delta_t=self.delta_t, args=self.args)
             self.trackers.append(trk)
+            created_tracks += 1
+        profile["created_tracks"] = created_tracks
+        mark("new_tracks")
+
         i = len(self.trackers)
         for trk in reversed(self.trackers):
             if trk.last_observation.sum() < 0:
@@ -551,9 +676,12 @@ class Hybrid_Sort(object):
             # 杜绝闪烁式误检（检到-丢-检到）在多帧后侥幸累积确认并占用新 ID。
             elif trk.id < 0 and trk.time_since_update >= 1:
                 self.trackers.pop(i)
+        profile["ret"] = int(len(ret))
+        mark("collect_cleanup")
+
         if(len(ret) > 0):
-            return np.concatenate(ret)
-        return np.empty((0, 5))
+            return finish(np.concatenate(ret))
+        return finish(np.empty((0, 5)))
 
     def update_public(self, dets, cates, scores):
         self.frame_count += 1
@@ -658,5 +786,3 @@ class Hybrid_Sort(object):
         if(len(ret)>0):
             return np.concatenate(ret)
         return np.empty((0, 7))
-
-

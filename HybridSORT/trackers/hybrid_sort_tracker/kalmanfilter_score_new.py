@@ -335,6 +335,29 @@ class KalmanFilterNew_score_new(object):
         self.attr_saved = None
         self.observed = False
         self.args = args
+        self._hybridsort_fast_predict = False
+        self._hybridsort_fast_update = False
+        self._hybridsort_skip_predict_prior_copy = False
+        self._hybridsort_skip_update_snapshot_copy = False
+
+    def _save_predict_prior(self):
+        if self._hybridsort_skip_predict_prior_copy:
+            # HybridSORT runtime never reads x_prior/P_prior for assignment or
+            # update. Keep the attributes valid without paying per-track copies.
+            self.x_prior = self.x
+            self.P_prior = self.P
+        else:
+            self.x_prior = self.x.copy()
+            self.P_prior = self.P.copy()
+
+    def _save_update_posterior(self):
+        if self._hybridsort_skip_update_snapshot_copy:
+            # x_post/P_post are not used by HybridSORT's matching/update path.
+            self.x_post = self.x
+            self.P_post = self.P
+        else:
+            self.x_post = self.x.copy()
+            self.P_post = self.P.copy()
 
 
     def predict(self, u=None, B=None, F=None, Q=None):
@@ -365,6 +388,24 @@ class KalmanFilterNew_score_new(object):
         elif isscalar(Q):
             Q = eye(self.dim_x) * Q
 
+        if (self._hybridsort_fast_predict
+                and u is None
+                and B is None
+                and F is self.F
+                and Q is self.Q
+                and self.dim_x == 9
+                and self._alpha_sq == 1.):
+            # HybridSORT uses a fixed 9D constant-velocity transition:
+            # x[0:4] += x[5:9], x[4] unchanged, velocities unchanged.
+            # This is algebraically identical to F @ x and F @ P @ F.T + Q,
+            # but avoids two small dense matrix multiplies per live track.
+            self.x[:4] += self.x[5:9]
+            self.P[:4, :] += self.P[5:9, :]
+            self.P[:, :4] += self.P[:, 5:9]
+            self.P += self.Q
+            self._save_predict_prior()
+            return
+
 
         # x = Fx + Bu
         if B is not None and u is not None:
@@ -376,8 +417,7 @@ class KalmanFilterNew_score_new(object):
         self.P = self._alpha_sq * dot(dot(F, self.P), F.T) + Q
 
         # save prior
-        self.x_prior = self.x.copy()
-        self.P_prior = self.P.copy()
+        self._save_predict_prior()
 
 
 
@@ -477,8 +517,7 @@ class KalmanFilterNew_score_new(object):
                 self.freeze()
             self.observed = False 
             self.z = np.array([[None]*self.dim_z]).T
-            self.x_post = self.x.copy()
-            self.P_post = self.P.copy()
+            self._save_update_posterior()
             self.y = zeros((self.dim_z, 1))
             return
         
@@ -504,6 +543,28 @@ class KalmanFilterNew_score_new(object):
         if H is None:
             z = reshape_z(z, self.dim_z, self.x.ndim)
             H = self.H
+
+        if (self._hybridsort_fast_update
+                and H is self.H
+                and R is self.R
+                and self.dim_x == 9
+                and self.dim_z == 5):
+            # HybridSORT uses H = [I5, 0]. The generic equations below reduce
+            # to direct slices, avoiding several small dense H multiplications.
+            self.y = z - self.x[:5]
+            PHT = self.P[:, :5]
+            self.S = self.P[:5, :5] + R
+            self.SI = self.inv(self.S)
+            self.K = dot(PHT, self.SI)
+            self.x = self.x + dot(self.K, self.y)
+
+            I_KH = self._I.copy()
+            I_KH[:, :5] -= self.K
+            self.P = dot(dot(I_KH, self.P), I_KH.T) + dot(dot(self.K, R), self.K.T)
+
+            self.z = z if self._hybridsort_skip_update_snapshot_copy else deepcopy(z)
+            self._save_update_posterior()
+            return
 
         # y = z - Hx
         # error (residual) between measurement and prediction
@@ -533,9 +594,8 @@ class KalmanFilterNew_score_new(object):
         self.P = dot(dot(I_KH, self.P), I_KH.T) + dot(dot(self.K, R), self.K.T)
 
         # save measurement and posterior state
-        self.z = deepcopy(z)
-        self.x_post = self.x.copy()
-        self.P_post = self.P.copy()
+        self.z = z if self._hybridsort_skip_update_snapshot_copy else deepcopy(z)
+        self._save_update_posterior()
 
     def predict_steadystate(self, u=0, B=None):
         """
