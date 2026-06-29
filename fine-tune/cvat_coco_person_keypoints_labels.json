@@ -1,0 +1,113 @@
+[
+  {
+    "name": "person",
+    "color": "#1f77b4",
+    "attributes": [],
+    "type": "skeleton",
+    "sublabels": [
+      {
+        "name": "nose",
+        "color": "#ff0000",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_eye",
+        "color": "#ff7f0e",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_eye",
+        "color": "#2ca02c",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_ear",
+        "color": "#d62728",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_ear",
+        "color": "#9467bd",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_shoulder",
+        "color": "#8c564b",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_shoulder",
+        "color": "#e377c2",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_elbow",
+        "color": "#7f7f7f",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_elbow",
+        "color": "#bcbd22",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_wrist",
+        "color": "#17becf",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_wrist",
+        "color": "#1f77b4",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_hip",
+        "color": "#aec7e8",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_hip",
+        "color": "#ffbb78",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_knee",
+        "color": "#98df8a",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_knee",
+        "color": "#ff9896",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "left_ankle",
+        "color": "#c5b0d5",
+        "attributes": [],
+        "type": "points"
+      },
+      {
+        "name": "right_ankle",
+        "color": "#c49c94",
+        "attributes": [],
+        "type": "points"
+      }
+    ],
+    "svg": "<line x1=\"38\" y1=\"96\" x2=\"40\" y2=\"78\" stroke=\"black\" data-type=\"edge\" data-node-from=\"16\" stroke-width=\"0.5\" data-node-to=\"14\"></line><line x1=\"40\" y1=\"78\" x2=\"42\" y2=\"58\" stroke=\"black\" data-type=\"edge\" data-node-from=\"14\" stroke-width=\"0.5\" data-node-to=\"12\"></line><line x1=\"62\" y1=\"96\" x2=\"60\" y2=\"78\" stroke=\"black\" data-type=\"edge\" data-node-from=\"17\" stroke-width=\"0.5\" data-node-to=\"15\"></line><line x1=\"60\" y1=\"78\" x2=\"58\" y2=\"58\" stroke=\"black\" data-type=\"edge\" data-node-from=\"15\" stroke-width=\"0.5\" data-node-to=\"13\"></line><line x1=\"42\" y1=\"58\" x2=\"58\" y2=\"58\" stroke=\"black\" data-type=\"edge\" data-node-from=\"12\" stroke-width=\"0.5\" data-node-to=\"13\"></line><line x1=\"35\" y1=\"25\" x2=\"42\" y2=\"58\" stroke=\"black\" data-type=\"edge\" data-node-from=\"6\" stroke-width=\"0.5\" data-node-to=\"12\"></line><line x1=\"65\" y1=\"25\" x2=\"58\" y2=\"58\" stroke=\"black\" data-type=\"edge\" data-node-from=\"7\" stroke-width=\"0.5\" data-node-to=\"13\"></line><line x1=\"35\" y1=\"25\" x2=\"65\" y2=\"25\" stroke=\"black\" data-type=\"edge\" data-node-from=\"6\" stroke-width=\"0.5\" data-node-to=\"7\"></line><line x1=\"35\" y1=\"25\" x2=\"28\" y2=\"45\" stroke=\"black\" data-type=\"edge\" data-node-from=\"6\" stroke-width=\"0.5\" data-node-to=\"8\"></line><line x1=\"65\" y1=\"25\" x2=\"72\" y2=\"45\" stroke=\"black\" data-type=\"edge\" data-node-from=\"7\" stroke-width=\"0.5\" data-node-to=\"9\"></line><line x1=\"28\" y1=\"45\" x2=\"22\" y2=\"65\" stroke=\"black\" data-type=\"edge\" data-node-from=\"8\" stroke-width=\"0.5\" data-node-to=\"10\"></line><line x1=\"72\" y1=\"45\" x2=\"78\" y2=\"65\" stroke=\"black\" data-type=\"edge\" data-node-from=\"9\" stroke-width=\"0.5\" data-node-to=\"11\"></line><line x1=\"44\" y1=\"6\" x2=\"56\" y2=\"6\" stroke=\"black\" data-type=\"edge\" data-node-from=\"2\" stroke-width=\"0.5\" data-node-to=\"3\"></line><line x1=\"50\" y1=\"8\" x2=\"44\" y2=\"6\" stroke=\"black\" data-type=\"edge\" data-node-from=\"1\" stroke-width=\"0.5\" data-node-to=\"2\"></line><line x1=\"50\" y1=\"8\" x2=\"56\" y2=\"6\" stroke=\"black\" data-type=\"edge\" data-node-from=\"1\" stroke-width=\"0.5\" data-node-to=\"3\"></line><line x1=\"44\" y1=\"6\" x2=\"38\" y2=\"8\" stroke=\"black\" data-type=\"edge\" data-node-from=\"2\" stroke-width=\"0.5\" data-node-to=\"4\"></line><line x1=\"56\" y1=\"6\" x2=\"62\" y2=\"8\" stroke=\"black\" data-type=\"edge\" data-node-from=\"3\" stroke-width=\"0.5\" data-node-to=\"5\"></line><line x1=\"38\" y1=\"8\" x2=\"35\" y2=\"25\" stroke=\"black\" data-type=\"edge\" data-node-from=\"4\" stroke-width=\"0.5\" data-node-to=\"6\"></line><line x1=\"62\" y1=\"8\" x2=\"65\" y2=\"25\" stroke=\"black\" data-type=\"edge\" data-node-from=\"5\" stroke-width=\"0.5\" data-node-to=\"7\"></line><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"50\" cy=\"8\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"1\" data-node-id=\"1\" data-label-name=\"nose\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"44\" cy=\"6\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"2\" data-node-id=\"2\" data-label-name=\"left_eye\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"56\" cy=\"6\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"3\" data-node-id=\"3\" data-label-name=\"right_eye\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"38\" cy=\"8\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"4\" data-node-id=\"4\" data-label-name=\"left_ear\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"62\" cy=\"8\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"5\" data-node-id=\"5\" data-label-name=\"right_ear\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"35\" cy=\"25\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"6\" data-node-id=\"6\" data-label-name=\"left_shoulder\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"65\" cy=\"25\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"7\" data-node-id=\"7\" data-label-name=\"right_shoulder\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"28\" cy=\"45\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"8\" data-node-id=\"8\" data-label-name=\"left_elbow\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"72\" cy=\"45\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"9\" data-node-id=\"9\" data-label-name=\"right_elbow\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"22\" cy=\"65\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"10\" data-node-id=\"10\" data-label-name=\"left_wrist\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"78\" cy=\"65\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"11\" data-node-id=\"11\" data-label-name=\"right_wrist\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"42\" cy=\"58\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"12\" data-node-id=\"12\" data-label-name=\"left_hip\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"58\" cy=\"58\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"13\" data-node-id=\"13\" data-label-name=\"right_hip\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"40\" cy=\"78\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"14\" data-node-id=\"14\" data-label-name=\"left_knee\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"60\" cy=\"78\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"15\" data-node-id=\"15\" data-label-name=\"right_knee\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"38\" cy=\"96\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"16\" data-node-id=\"16\" data-label-name=\"left_ankle\"></circle><circle r=\"1.5\" stroke=\"black\" fill=\"#b3b3b3\" cx=\"62\" cy=\"96\" stroke-width=\"0.1\" data-type=\"element node\" data-element-id=\"17\" data-node-id=\"17\" data-label-name=\"right_ankle\"></circle>"
+  }
+]
