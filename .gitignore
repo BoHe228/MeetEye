@@ -8,6 +8,8 @@ node_modules/
 # ======================
 venv/
 .venv/
+.venv*/
+venv*/
 ENV/
 
 # ======================
@@ -43,7 +45,29 @@ eggs/
 *.onnx
 *.pth
 *.pt
+*.rknn
+*.tflite
+*.trt
 imagenet.pyth/
+
+# ======================
+# 大体积媒体 / 数据 / 推理输出
+# ======================
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.tmp.mp4
+*.jsonl
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
 
 # ======================
 # 编辑器与工具配置
@@ -61,20 +85,47 @@ Thumbs.db
 # ======================
 # PyTorch / YOLO 权重和输出
 # ======================
-runs/
-weights/
-yolo*/
+/runs/
+/weights/
+/yolo*/
 
 # ======================
 # 不需要入库的文件夹
 # ======================
-recordings/
-screenshots/
-yolo_pose_output/
-data/
-maps/
-yolo_model/
-face_rec_model/
+/recordings/
+/screenshots/
+/yolo_pose_output/
+/data/
+/maps/*.npz
+/yolo_model/
+/face_rec_model/
+
+# ======================
+# RK3588 / YOLO 微调本地产物
+# ======================
+.venv-rknn/
+RKSDK/
+rknn_model_zoo/
+mediapipe/
+Wide-Angle_test/
+VGDSE/ASR/
+face_rc_output/
+face_rc/data/*
+!face_rc/data/README.md
+face_rc/maps/*.npz
+face_rc/tools/bin/
+face_rc/yolo_model/
+face_rc/benchmark_results/*
+!face_rc/benchmark_results/README*.md
+fine-tune/.matplotlib/
+fine-tune/.ultralytics_config/
+fine-tune/datasets/*
+!fine-tune/datasets/README.md
+fine-tune/label_check_samples/
+fine-tune/models/
+fine-tune/runs/
+mytest/face_rec/face_photos/
+mytest/models/
 
 # ======================
 # docs 下的演示素材保留
