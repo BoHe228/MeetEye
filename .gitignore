@@ -118,6 +118,18 @@ face_rc/yolo_model/
 face_rc/benchmark_results/*
 !face_rc/benchmark_results/README*.md
 fine-tune/.matplotlib/
+
+# RK3588 board local deployment artifacts
+face_rc/board_backup*/
+face_rc/board备份*/
+face_rc_model_备份/
+face_rc/board/board_output/
+face_rc/board/tools/bin/
+face_rc/board/tools/__pycache__/
+face_rc/board_cpp/bin/
+face_rc/board_cpp/board_output/
+face_rc/board_cpp/test_frames/
+face_rc/board_cpp/frame.jpg
 fine-tune/.ultralytics_config/
 fine-tune/datasets/*
 !fine-tune/datasets/README.md

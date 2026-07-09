@@ -30,11 +30,64 @@ face_rc/
   tools/
     build_rknn_capi_parallel.sh   # 构建 librknn_capi_parallel.so
     build_merge_fast.sh           # 构建 libmerge_fast.so
+  board/
+    tools/                        # 板端 native 库源码与 RKNN/OpenCL probe
+  board_cpp/
+    meeteye_cpp_smoke.cpp         # Buildroot 优先的纯 C++ 闭环
+    run_smoke.sh                  # C++ 运行入口
+    maps/                         # C++ 可读 direct-slice/base-map 二进制映射
   maps/
     6.22_2560_yolo_slices_608.npz # headless direct-slice 608 映射
   yolo_model/RK3588/
     yolov8n-face_608_b1_int8_split_rknn_model/
 ```
+
+## Buildroot C++ 路径
+
+`face_rc/board_cpp/` 是给 libc 环境很精简的 RK3588 Buildroot 设备准备的纯 C++ 运行链路，不依赖 Python、torch、ultralytics、numpy 或 scipy。当前闭环包括：
+
+- libjpeg-turbo 解码 JPEG/MJPEG 帧
+- OpenCL fused direct-slice 展开并写入 RKNN 输入
+- RKNN C API 推理
+- native HybridSORT 跟踪和最终去重
+- fit_4 角度计算、扇区 JSON 聚合、WebSocket JSON 推送
+- image-list decode prefetch、camera decode prefetch、RKNN bound input/zero-copy 尝试与回退
+
+典型摄像头命令：
+
+```bash
+cd face_rc/board_cpp
+
+taskset -c 0-6 bash run_smoke.sh \
+  --camera-device /dev/video0 \
+  --camera-width 1920 \
+  --camera-height 1080 \
+  --camera-fps 30 \
+  --track-buffer 120 \
+  --sector-output \
+  --num-sectors 8 \
+  --ws-host 0.0.0.0 \
+  --ws-port 8001 \
+  --print-profile-summary \
+  --profile-interval 30 \
+  --no-stdout-json
+```
+
+离线帧序列 benchmark 建议显式打开 `--decode-prefetch`，这样 JPEG 解码可以和 OpenCL/RKNN 主线程重叠：
+
+```bash
+taskset -c 0-6 bash run_smoke.sh \
+  --image-list test_frames/frames_3s.txt \
+  --decode-prefetch \
+  --track-buffer 120 \
+  --sector-output \
+  --num-sectors 8 \
+  --print-profile-summary \
+  --profile-interval 30 \
+  --no-stdout-json
+```
+
+详细文件清单、运行时库要求和 profiling 字段见 [`board_cpp/README.md`](board_cpp/README.md)。RKNN bound input / OpenCL DMABUF 能力探测见 [`board/tools/README.md`](board/tools/README.md)。
 
 ## 板端依赖
 

@@ -87,7 +87,7 @@ Fisheye Camera (360°)
 | **Face ID / speaking detection** | Optional AdaFace face recognition (`--use-face-rec`) labels names per track_id; MediaPipe mouth-aspect-ratio speaking detection (`--talking-detection`) |
 | **Two run modes** | **Local** (`main.py`): camera/video/folder + OpenCV display. **WebUI** (`webui/`): FastAPI server + browser dashboard + JSON WebSocket |
 | **TensorRT support** | Export YOLO `.pt` → `.engine` with `export_trt.py`; ~3× speedup over PyTorch on Jetson / desktop GPU |
-| **RK3588 edge deployment** | Board-side RKNN INT8 runtime, headless video/camera JSONL, WebUI, sector output, OpenCL direct-slice remap, and NPU slice parallelism live in [`face_rc/`](face_rc/). See [`face_rc/README.md`](face_rc/README.md) |
+| **RK3588 edge deployment** | Board-side RKNN INT8 runtime, headless video/camera JSONL, WebUI, sector output, OpenCL direct-slice remap, NPU slice parallelism, and a Buildroot-oriented pure C++ runtime live in [`face_rc/`](face_rc/). See [`face_rc/README.md`](face_rc/README.md) |
 | **YOLO fine-tuning workspace** | Dataset conversion, pose fine-tuning, meeting-video auto-label review, INT8 calibration slice export, and server-side TensorRT INT8 checks live in [`fine-tune/`](fine-tune/). See [`fine-tune/README.md`](fine-tune/README.md) |
 
 ---
@@ -170,7 +170,9 @@ python angle_visualizer.py --test
 
 ### 4 · RK3588 edge deployment
 
-The RK3588 deployment path is maintained separately under [`face_rc/`](face_rc/). It includes the board runtime, RKNN INT8 model loading, three-core slice parallel inference, direct-slice fisheye remap, C++ merge/NMS acceleration, headless JSONL output, camera input, WebUI preview, video recording, and sector-format output.
+The RK3588 deployment path is maintained separately under [`face_rc/`](face_rc/). It includes the Python board runtime, RKNN INT8 model loading, three-core slice parallel inference, direct-slice fisheye remap, C++ merge/NMS acceleration, headless JSONL output, camera input, WebUI preview, video recording, and sector-format output.
+
+For very small Buildroot systems, [`face_rc/board_cpp`](face_rc/board_cpp/) contains the pure C++ board path: libjpeg-turbo MJPEG/JPEG decode, OpenCL slice remap, RKNN inference, native HybridSORT tracking, sector JSON, WebSocket push, profiling, camera decode prefetch, and RKNN bound-input fallback handling.
 
 For board setup, runtime commands, lock-frequency checks, and troubleshooting, see [`face_rc/README.md`](face_rc/README.md).
 
