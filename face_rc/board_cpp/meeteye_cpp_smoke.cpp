@@ -12,8 +12,11 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
+#include <future>
+#include <ifaddrs.h>
 #include <iomanip>
 #include <iostream>
 #include <linux/videodev2.h>
@@ -21,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <ostream>
 #include <sstream>
@@ -41,6 +45,7 @@
 extern "C" {
 using tjhandle = void*;
 tjhandle tjInitDecompress(void);
+tjhandle tjInitCompress(void);
 int tjDestroy(tjhandle handle);
 int tjDecompressHeader3(tjhandle handle,
                         const unsigned char* jpeg_buf,
@@ -58,6 +63,18 @@ int tjDecompress2(tjhandle handle,
                   int height,
                   int pixel_format,
                   int flags);
+int tjCompress2(tjhandle handle,
+                const unsigned char* src_buf,
+                int width,
+                int pitch,
+                int height,
+                int pixel_format,
+                unsigned char** jpeg_buf,
+                unsigned long* jpeg_size,
+                int jpeg_subsamp,
+                int jpeg_quality,
+                int flags);
+void tjFree(unsigned char* buffer);
 char* tjGetErrorStr2(tjhandle handle);
 
 int ds_opencl_fused_create(const float* map_x,
@@ -215,6 +232,7 @@ int hybrid_sort_native_create(float det_thresh,
                               float tcm_byte_step_weight,
                               float new_track_thresh,
                               float new_track_overlap_thresh,
+                              float lost_velocity_decay,
                               void** out_handle,
                               char* err,
                               int err_len);
@@ -248,6 +266,7 @@ void hybrid_sort_native_destroy(void* handle);
 namespace {
 
 constexpr int kTurboJpegPixelFormatBgr = 1;
+constexpr int kTurboJpegSubsample420 = 2;
 constexpr int kDetectionFields = 20;
 constexpr int kDefaultMaxDet = 100;
 constexpr int kDefaultMaxNms = 300;
@@ -255,6 +274,7 @@ constexpr int kDefaultMaxOutputDets = 300;
 constexpr double kPi = 3.14159265358979323846;
 
 static double steady_seconds();
+static double wall_time_seconds();
 
 enum ProfileSlot {
   kProfileDecode = 0,
@@ -268,6 +288,7 @@ enum ProfileSlot {
   kProfileRknnTotalOuter,
   kProfileBoundPrepare,
   kProfileBoundImport,
+  kProfileStagingCopy,
   kProfileTrackerOuter,
   kProfileAngleTargets,
   kProfileBuildPayload,
@@ -292,16 +313,21 @@ struct Config {
       "models/yolov8n-face-640-b1-int8-hybrid-split-kptconf-rk3588.rknn";
   std::string ws_host = "0.0.0.0";
   std::string ws_path = "/ws/inference";
+  std::string webui_host = "0.0.0.0";
   bool no_stdout_json = false;
   bool stdout_debug_json = false;
   bool no_output_jsonl = false;
   bool ws_json = true;
+  bool webui = false;
   bool json_debug_keypoints = false;
   bool sector_output = false;
   bool print_profile_summary = false;
+  bool profile_system_load = false;
   bool decode_prefetch = false;
   bool camera_prefetch = true;
   bool bound_input = true;
+  bool staging_copy_input = true;
+  bool staging_pipeline = true;
   bool angle_vectorized = false;
   bool force_build = false;
   int camera_width = 1920;
@@ -309,10 +335,13 @@ struct Config {
   int camera_fps = 30;
   int camera_buffers = 4;
   int camera_timeout_ms = 3000;
-  int max_frames = 1;
+  int max_frames = 0;
   int ws_port = 8001;
+  int webui_port = 8080;
+  int webui_jpeg_quality = 80;
   int num_sectors = 8;
   int profile_interval = 30;
+  int system_load_interval_ms = 200;
   int fit_degree = 4;
   float conf_threshold = 0.1f;
   float decode_iou_threshold = 0.99f;
@@ -340,9 +369,12 @@ struct Config {
   float tracker_new_thresh = 0.5f;
   float new_track_overlap_thresh = 0.4f;
   float tracker_inertia = 0.1f;
-  float smooth_bbox_alpha = 0.5f;
+  float lost_velocity_decay = 0.85f;
+  float smooth_bbox_alpha = 0.6f;
   float max_width_ratio = 0.6f;
   float inherit_center_dist_thresh = 1.0f;
+  float inherit_size_ratio_thresh = 0.5f;
+  float inherit_ambiguity_margin = 0.25f;
   float boundary_margin = 0.04f;
   float boundary_size_ratio_thresh = 0.45f;
   float boundary_center_dist_thresh = 1.8f;
@@ -413,6 +445,20 @@ struct FrameResult {
   bool tracker_enabled = false;
 };
 
+struct PreparedStagingFrame {
+  bool valid = false;
+  Image image;
+  std::string image_path;
+  int frame_index = 0;
+  double frame_start_s = 0.0;
+  double file_read_ms = 0.0;
+  double camera_read_ms = 0.0;
+  double jpeg_decode_ms = 0.0;
+  double decode_wait_ms = 0.0;
+  float original_width = 0.0f;
+  FrameResult result;
+};
+
 struct FrameRateStats {
   double frame_ms = 0.0;
   double instant_fps = 0.0;
@@ -445,6 +491,8 @@ static const char* profile_slot_name(int slot) {
       return "bound_prepare";
     case kProfileBoundImport:
       return "bound_import";
+    case kProfileStagingCopy:
+      return "staging_copy";
     case kProfileTrackerOuter:
       return "tracker_outer";
     case kProfileAngleTargets:
@@ -547,6 +595,74 @@ static bool file_exists(const std::string& path) {
   return static_cast<bool>(f);
 }
 
+static std::string dirname_of(const std::string& path) {
+  const size_t pos = path.find_last_of('/');
+  if (pos == std::string::npos) {
+    return "";
+  }
+  if (pos == 0) {
+    return "/";
+  }
+  return path.substr(0, pos);
+}
+
+static std::string stem_without_ext(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  const size_t begin = slash == std::string::npos ? 0 : slash + 1;
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos || dot < begin) {
+    return path;
+  }
+  return path.substr(0, dot);
+}
+
+static std::string read_text_file(const std::string& path) {
+  std::ifstream f(path.c_str(), std::ios::in);
+  if (!f) {
+    return "";
+  }
+  std::ostringstream oss;
+  oss << f.rdbuf();
+  return trim(oss.str());
+}
+
+static bool read_first_number(const std::string& text, double* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  const char* begin = text.c_str();
+  char* end = nullptr;
+  while (*begin != '\0') {
+    if ((*begin >= '0' && *begin <= '9') || *begin == '-' || *begin == '+') {
+      const double parsed = std::strtod(begin, &end);
+      if (end != begin && std::isfinite(parsed)) {
+        *value = parsed;
+        return true;
+      }
+    }
+    ++begin;
+  }
+  return false;
+}
+
+static std::vector<std::string> list_dir_paths(const std::string& dir) {
+  std::vector<std::string> out;
+  DIR* dp = opendir(dir.c_str());
+  if (dp == nullptr) {
+    return out;
+  }
+  while (dirent* ent = readdir(dp)) {
+    const std::string name = ent->d_name;
+    if (name == "." || name == "..") {
+      continue;
+    }
+    out.push_back(join_path(dir, name));
+  }
+  closedir(dp);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 static std::string json_escape(const std::string& value) {
   std::ostringstream oss;
   for (char ch : value) {
@@ -573,6 +689,424 @@ static std::string json_escape(const std::string& value) {
   }
   return oss.str();
 }
+
+struct CpuTimes {
+  uint64_t user = 0;
+  uint64_t nice = 0;
+  uint64_t system = 0;
+  uint64_t idle = 0;
+  uint64_t iowait = 0;
+  uint64_t irq = 0;
+  uint64_t softirq = 0;
+  uint64_t steal = 0;
+
+  uint64_t idle_all() const { return idle + iowait; }
+  uint64_t total() const { return user + nice + system + idle + iowait + irq + softirq + steal; }
+};
+
+struct SystemLoadSnapshot {
+  double timestamp = 0.0;
+  double time_s = 0.0;
+  int sample_id = 0;
+  bool cpu_valid = false;
+  double cpu_percent = 0.0;
+  std::vector<double> cpu_per_core_percent;
+  bool memory_valid = false;
+  double memory_percent = 0.0;
+  double memory_available_mb = 0.0;
+  bool gpu_valid = false;
+  double gpu_percent = 0.0;
+  std::string gpu_load_raw;
+  int64_t gpu_freq_hz = -1;
+  bool npu_valid = false;
+  double npu_percent = 0.0;
+  std::string npu_load_raw;
+  int64_t npu_freq_hz = -1;
+  std::vector<double> thermal_c;
+  double thermal_max_c = 0.0;
+};
+
+static bool parse_cpu_line(const std::string& line, CpuTimes* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  std::istringstream iss(line);
+  std::string label;
+  iss >> label;
+  if (label.compare(0, 3, "cpu") != 0) {
+    return false;
+  }
+  CpuTimes t;
+  iss >> t.user >> t.nice >> t.system >> t.idle >> t.iowait >> t.irq >> t.softirq >> t.steal;
+  if (!iss && t.total() == 0) {
+    return false;
+  }
+  *out = t;
+  return true;
+}
+
+static std::vector<CpuTimes> read_proc_stat_cpu_times() {
+  std::vector<CpuTimes> times;
+  std::ifstream f("/proc/stat");
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.compare(0, 3, "cpu") != 0) {
+      break;
+    }
+    CpuTimes t;
+    if (parse_cpu_line(line, &t)) {
+      times.push_back(t);
+    }
+  }
+  return times;
+}
+
+static double cpu_delta_percent(const CpuTimes& prev, const CpuTimes& cur) {
+  const uint64_t prev_total = prev.total();
+  const uint64_t cur_total = cur.total();
+  const uint64_t prev_idle = prev.idle_all();
+  const uint64_t cur_idle = cur.idle_all();
+  if (cur_total <= prev_total) {
+    return 0.0;
+  }
+  const double total_delta = static_cast<double>(cur_total - prev_total);
+  const double idle_delta = cur_idle >= prev_idle ? static_cast<double>(cur_idle - prev_idle) : 0.0;
+  return std::max(0.0, std::min(100.0, 100.0 * (total_delta - idle_delta) / total_delta));
+}
+
+static bool read_meminfo(double* memory_percent, double* available_mb) {
+  std::ifstream f("/proc/meminfo");
+  if (!f) {
+    return false;
+  }
+  std::string key;
+  double value = 0.0;
+  std::string unit;
+  double total_kb = 0.0;
+  double available_kb = 0.0;
+  while (f >> key >> value >> unit) {
+    if (key == "MemTotal:") {
+      total_kb = value;
+    } else if (key == "MemAvailable:") {
+      available_kb = value;
+    }
+  }
+  if (total_kb <= 0.0 || available_kb < 0.0) {
+    return false;
+  }
+  if (memory_percent != nullptr) {
+    *memory_percent = std::max(0.0, std::min(100.0, 100.0 * (1.0 - available_kb / total_kb)));
+  }
+  if (available_mb != nullptr) {
+    *available_mb = available_kb / 1024.0;
+  }
+  return true;
+}
+
+static bool parse_load_percent(const std::string& text, double* percent) {
+  if (percent == nullptr || text.empty()) {
+    return false;
+  }
+  const size_t pct_pos = text.find('%');
+  if (pct_pos != std::string::npos) {
+    size_t begin = pct_pos;
+    while (begin > 0) {
+      const char ch = text[begin - 1];
+      if (!((ch >= '0' && ch <= '9') || ch == '.')) {
+        break;
+      }
+      --begin;
+    }
+    if (begin < pct_pos) {
+      const double value = std::strtod(text.substr(begin, pct_pos - begin).c_str(), nullptr);
+      if (std::isfinite(value)) {
+        *percent = std::max(0.0, std::min(100.0, value));
+        return true;
+      }
+    }
+  }
+  const size_t at_pos = text.find('@');
+  if (at_pos != std::string::npos) {
+    double value = 0.0;
+    if (read_first_number(text.substr(0, at_pos), &value) && value >= 0.0 && value <= 100.0) {
+      *percent = value;
+      return true;
+    }
+  }
+  double first = 0.0;
+  if (read_first_number(text, &first) && first >= 0.0 && first <= 100.0) {
+    *percent = first;
+    return true;
+  }
+  return false;
+}
+
+static bool name_contains_any(const std::string& text, const std::vector<std::string>& needles) {
+  std::string lower = text;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  for (const std::string& needle : needles) {
+    if (lower.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static std::vector<std::string> find_devfreq_dirs(const std::vector<std::string>& needles) {
+  std::vector<std::string> dirs;
+  for (const std::string& path : list_dir_paths("/sys/class/devfreq")) {
+    if (name_contains_any(path, needles)) {
+      dirs.push_back(path);
+    }
+  }
+  return dirs;
+}
+
+static bool sample_devfreq_kind(const std::vector<std::string>& needles,
+                                double* percent,
+                                int64_t* freq_hz,
+                                std::string* raw) {
+  const std::vector<std::string> dirs = find_devfreq_dirs(needles);
+  bool any = false;
+  if (freq_hz != nullptr) {
+    *freq_hz = -1;
+  }
+  for (const std::string& dir : dirs) {
+    const std::string load_path = join_path(dir, "load");
+    const std::string load_text = read_text_file(load_path);
+    double load_percent = 0.0;
+    if (!load_text.empty() && parse_load_percent(load_text, &load_percent)) {
+      if (percent != nullptr) {
+        *percent = load_percent;
+      }
+      if (raw != nullptr) {
+        *raw = load_text;
+      }
+      any = true;
+    }
+    const std::string freq_text = read_text_file(join_path(dir, "cur_freq"));
+    double freq = 0.0;
+    if (!freq_text.empty() && read_first_number(freq_text, &freq) && freq_hz != nullptr) {
+      *freq_hz = static_cast<int64_t>(freq);
+    }
+    if (any) {
+      return true;
+    }
+  }
+  return any;
+}
+
+static std::vector<double> sample_thermal_c() {
+  std::vector<double> values;
+  for (const std::string& zone : list_dir_paths("/sys/class/thermal")) {
+    if (zone.find("thermal_zone") == std::string::npos) {
+      continue;
+    }
+    double raw = 0.0;
+    if (!read_first_number(read_text_file(join_path(zone, "temp")), &raw)) {
+      continue;
+    }
+    if (raw > 1000.0) {
+      raw /= 1000.0;
+    }
+    if (raw > -80.0 && raw < 180.0) {
+      values.push_back(raw);
+    }
+  }
+  return values;
+}
+
+static void write_json_nullable(std::ostream& os, bool valid, double value, int precision = 2) {
+  if (!valid || !std::isfinite(value)) {
+    os << "null";
+    return;
+  }
+  os << std::fixed << std::setprecision(precision) << value;
+}
+
+static std::string system_snapshot_json(const SystemLoadSnapshot& s) {
+  std::ostringstream os;
+  os << "{";
+  os << "\"timestamp\":" << std::fixed << std::setprecision(3) << s.timestamp;
+  os << ",\"time_s\":" << std::fixed << std::setprecision(3) << s.time_s;
+  os << ",\"sample_id\":" << s.sample_id;
+  os << ",\"cpu_percent\":";
+  write_json_nullable(os, s.cpu_valid, s.cpu_percent);
+  os << ",\"cpu_per_core_percent\":";
+  if (s.cpu_per_core_percent.empty()) {
+    os << "null";
+  } else {
+    os << "[";
+    for (size_t i = 0; i < s.cpu_per_core_percent.size(); ++i) {
+      if (i > 0) {
+        os << ",";
+      }
+      os << std::fixed << std::setprecision(2) << s.cpu_per_core_percent[i];
+    }
+    os << "]";
+  }
+  os << ",\"memory_percent\":";
+  write_json_nullable(os, s.memory_valid, s.memory_percent);
+  os << ",\"memory_available_mb\":";
+  write_json_nullable(os, s.memory_valid, s.memory_available_mb, 1);
+  os << ",\"gpu_percent\":";
+  write_json_nullable(os, s.gpu_valid, s.gpu_percent);
+  os << ",\"gpu_freq_hz\":";
+  if (s.gpu_freq_hz >= 0) {
+    os << s.gpu_freq_hz;
+  } else {
+    os << "null";
+  }
+  os << ",\"gpu_load_raw\":";
+  if (!s.gpu_load_raw.empty()) {
+    os << "\"" << json_escape(s.gpu_load_raw) << "\"";
+  } else {
+    os << "null";
+  }
+  os << ",\"npu_percent\":";
+  write_json_nullable(os, s.npu_valid, s.npu_percent);
+  os << ",\"npu_freq_hz\":";
+  if (s.npu_freq_hz >= 0) {
+    os << s.npu_freq_hz;
+  } else {
+    os << "null";
+  }
+  os << ",\"npu_load_raw\":";
+  if (!s.npu_load_raw.empty()) {
+    os << "\"" << json_escape(s.npu_load_raw) << "\"";
+  } else {
+    os << "null";
+  }
+  os << ",\"thermal_max_c\":";
+  write_json_nullable(os, !s.thermal_c.empty(), s.thermal_max_c);
+  os << ",\"thermal_c\":";
+  if (s.thermal_c.empty()) {
+    os << "null";
+  } else {
+    os << "[";
+    for (size_t i = 0; i < s.thermal_c.size(); ++i) {
+      if (i > 0) {
+        os << ",";
+      }
+      os << std::fixed << std::setprecision(2) << s.thermal_c[i];
+    }
+    os << "]";
+  }
+  os << "}";
+  return os.str();
+}
+
+class SystemLoadSampler {
+ public:
+  SystemLoadSampler(int interval_ms, const std::string& output_jsonl)
+      : interval_ms_(std::max(50, interval_ms)), output_jsonl_(output_jsonl) {}
+
+  void start() {
+    if (running_) {
+      return;
+    }
+    if (!output_jsonl_.empty()) {
+      const std::string dir = dirname_of(output_jsonl_);
+      if (!dir.empty()) {
+        mkdir(dir.c_str(), 0775);
+      }
+      out_.open(output_jsonl_.c_str(), std::ios::out | std::ios::trunc);
+      if (!out_) {
+        throw std::runtime_error("cannot open system profile jsonl: " + output_jsonl_);
+      }
+    }
+    run_start_wall_s_ = wall_time_seconds();
+    prev_cpu_times_ = read_proc_stat_cpu_times();
+    running_ = true;
+    worker_ = std::thread(&SystemLoadSampler::run_loop, this);
+  }
+
+  void stop() {
+    if (!running_) {
+      return;
+    }
+    stop_.store(true);
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    running_ = false;
+    if (out_) {
+      out_.close();
+    }
+  }
+
+  ~SystemLoadSampler() { stop(); }
+
+  const std::string& output_jsonl() const { return output_jsonl_; }
+  int samples() const { return sample_count_; }
+  std::string latest_json() const {
+    std::lock_guard<std::mutex> lock(latest_mutex_);
+    return latest_json_;
+  }
+
+ private:
+  void run_loop() {
+    while (!stop_.load()) {
+      const double t0 = steady_seconds();
+      SystemLoadSnapshot snap = sample_once();
+      const std::string payload = system_snapshot_json(snap);
+      {
+        std::lock_guard<std::mutex> lock(latest_mutex_);
+        latest_json_ = payload;
+      }
+      if (out_) {
+        out_ << payload << "\n";
+      }
+      const double elapsed_ms = (steady_seconds() - t0) * 1000.0;
+      const int wait_ms = std::max(1, interval_ms_ - static_cast<int>(elapsed_ms));
+      for (int slept = 0; slept < wait_ms && !stop_.load(); slept += 10) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(10, wait_ms - slept)));
+      }
+    }
+  }
+
+  SystemLoadSnapshot sample_once() {
+    SystemLoadSnapshot snap;
+    snap.timestamp = wall_time_seconds();
+    snap.time_s = std::max(0.0, snap.timestamp - run_start_wall_s_);
+    snap.sample_id = ++sample_count_;
+
+    std::vector<CpuTimes> cur_times = read_proc_stat_cpu_times();
+    if (!prev_cpu_times_.empty() && cur_times.size() == prev_cpu_times_.size()) {
+      snap.cpu_valid = true;
+      snap.cpu_percent = cpu_delta_percent(prev_cpu_times_[0], cur_times[0]);
+      for (size_t i = 1; i < cur_times.size(); ++i) {
+        snap.cpu_per_core_percent.push_back(cpu_delta_percent(prev_cpu_times_[i], cur_times[i]));
+      }
+    }
+    if (!cur_times.empty()) {
+      prev_cpu_times_ = cur_times;
+    }
+
+    snap.memory_valid = read_meminfo(&snap.memory_percent, &snap.memory_available_mb);
+    snap.gpu_valid = sample_devfreq_kind({"gpu", "mali"}, &snap.gpu_percent, &snap.gpu_freq_hz, &snap.gpu_load_raw);
+    snap.npu_valid = sample_devfreq_kind({"npu", "rknpu"}, &snap.npu_percent, &snap.npu_freq_hz, &snap.npu_load_raw);
+    snap.thermal_c = sample_thermal_c();
+    if (!snap.thermal_c.empty()) {
+      snap.thermal_max_c = *std::max_element(snap.thermal_c.begin(), snap.thermal_c.end());
+    }
+    return snap;
+  }
+
+  int interval_ms_ = 200;
+  std::string output_jsonl_;
+  std::ofstream out_;
+  std::thread worker_;
+  std::atomic<bool> stop_{false};
+  bool running_ = false;
+  int sample_count_ = 0;
+  double run_start_wall_s_ = 0.0;
+  std::vector<CpuTimes> prev_cpu_times_;
+  mutable std::mutex latest_mutex_;
+  std::string latest_json_;
+};
 
 static std::vector<uint8_t> read_bytes(const std::string& path) {
   std::ifstream f(path.c_str(), std::ios::binary);
@@ -757,6 +1291,62 @@ class TurboJpegDecoder {
       throw std::runtime_error("tjDecompress2 failed: " + error_string());
     }
     return image;
+  }
+
+ private:
+  std::string error_string() const {
+    const char* err = tjGetErrorStr2(handle_);
+    return err ? std::string(err) : std::string("unknown");
+  }
+
+  tjhandle handle_ = nullptr;
+};
+
+class TurboJpegEncoder {
+ public:
+  TurboJpegEncoder() {
+    handle_ = tjInitCompress();
+    if (!handle_) {
+      throw std::runtime_error("tjInitCompress failed");
+    }
+  }
+
+  ~TurboJpegEncoder() {
+    if (handle_) {
+      tjDestroy(handle_);
+    }
+  }
+
+  std::vector<uint8_t> encode_bgr(const Image& image, int quality) {
+    if (image.width <= 0 || image.height <= 0 ||
+        image.bgr.size() != static_cast<size_t>(image.width) * image.height * 3) {
+      throw std::runtime_error("invalid image for jpeg encode");
+    }
+    quality = std::max(1, std::min(100, quality));
+    unsigned char* jpeg_buf = nullptr;
+    unsigned long jpeg_size = 0;
+    const int ret = tjCompress2(
+        handle_,
+        image.bgr.data(),
+        image.width,
+        0,
+        image.height,
+        kTurboJpegPixelFormatBgr,
+        &jpeg_buf,
+        &jpeg_size,
+        kTurboJpegSubsample420,
+        quality,
+        0);
+    if (ret != 0) {
+      std::string err = error_string();
+      if (jpeg_buf) {
+        tjFree(jpeg_buf);
+      }
+      throw std::runtime_error("tjCompress2 failed: " + err);
+    }
+    std::vector<uint8_t> out(jpeg_buf, jpeg_buf + jpeg_size);
+    tjFree(jpeg_buf);
+    return out;
   }
 
  private:
@@ -1117,7 +1707,7 @@ class CameraDecodePrefetcher {
           cfg_.camera_timeout_ms);
       camera.open();
 
-      for (int i = 0; i < cfg_.max_frames; ++i) {
+      for (int i = 0; cfg_.max_frames == 0 || i < cfg_.max_frames; ++i) {
         {
           std::unique_lock<std::mutex> lock(mutex_);
           cv_.wait(lock, [&]() { return stop_ || queue_.size() < kMaxQueue; });
@@ -1207,19 +1797,28 @@ static void print_usage(const char* argv0) {
       << "  --camera-fps N         camera FPS request, default: 30\n"
       << "  --camera-buffers N     mmap capture buffers, default: 4\n"
       << "  --camera-timeout-ms N  camera select timeout, default: 3000\n"
-      << "  --max-frames N         frames to read in camera mode, default: 1\n"
+      << "  --max-frames N         frames to read in camera mode, default: unlimited\n"
       << "  --output-jsonl PATH    write Python-compatible targets JSONL\n"
       << "  --debug-jsonl PATH     write full debug detection JSONL\n"
       << "  --no-output-jsonl      do not create default board_output JSONL\n"
       << "  --ws-host HOST         JSON WebSocket bind host, default: 0.0.0.0\n"
       << "  --ws-port PORT         JSON WebSocket port, default: 8001\n"
       << "  --no-ws-json          disable /ws/inference JSON WebSocket server\n"
+      << "  --webui               enable C++ WebUI with annotated frame stream\n"
+      << "  --webui-host HOST     WebUI bind host, default: 0.0.0.0\n"
+      << "  --webui-port PORT     WebUI HTTP port, default: 8080\n"
+      << "  --webui-jpeg-quality N  annotated JPEG quality, default: 80\n"
       << "  --sector-output       emit Python-compatible sector aggregate JSON\n"
       << "  --num-sectors N       sector count for --sector-output, default: 8\n"
       << "  --print-profile-summary  print average per-stage timings to stderr\n"
+      << "  --profile-system-load write background CPU/GPU/NPU/memory load JSONL\n"
+      << "  --system-load-interval-ms N  hardware load sample interval, default: 200\n"
       << "  --decode-prefetch     pre-decode next image-list frame in a worker thread\n"
       << "  --no-camera-prefetch  disable camera read/decode worker pipeline\n"
       << "  --no-bound-input      disable RKNN bound-input/OpenCL imported-output path\n"
+      << "  --staging-copy-input  OpenCL writes staging buffers, then CPU copies to RKNN input\n"
+      << "  --staging-pipeline    overlap next OpenCL staging with current blocking RKNN, default: on\n"
+      << "  --no-staging-pipeline disable staging overlap pipeline\n"
       << "  --no-stdout-json       suppress JSON results on stdout\n"
       << "  --stdout-debug-json    print full debug detection JSON to stdout\n"
       << "  --map-dir DIR          exported map directory, default: map_export\n"
@@ -1238,6 +1837,10 @@ static void print_usage(const char* argv0) {
       << "  --tracker-match-thresh VALUE  tracker association IoU threshold, default: 0.15\n"
       << "  --tracker-new-thresh VALUE    new track confidence threshold, default: 0.5\n"
       << "  --new-track-overlap-thresh VALUE  avoid duplicate new tracks, default: 0.4\n"
+      << "  --lost-velocity-decay VALUE   multiply unmatched track velocity each frame, default: 0.85\n"
+      << "  --inherit-center-dist-thresh VALUE  short occlusion ID inheritance gate, default: 1.0\n"
+      << "  --inherit-size-ratio-thresh VALUE   short occlusion size gate, default: 0.5\n"
+      << "  --inherit-ambiguity-margin VALUE    short occlusion unique-best gate, default: 0.25\n"
       << "  --no-smooth-bbox       disable tracker bbox EMA smoothing\n"
       << "  --smooth-bbox-alpha VALUE  tracker bbox EMA alpha, default: 0.5\n"
       << "  --coast-frames N       output lost tracks for N frames, default: 0\n"
@@ -1294,6 +1897,14 @@ static Config parse_args(int argc, char** argv) {
       cfg.ws_port = std::stoi(need_value(arg));
     } else if (arg == "--no-ws-json") {
       cfg.ws_json = false;
+    } else if (arg == "--webui") {
+      cfg.webui = true;
+    } else if (arg == "--webui-host") {
+      cfg.webui_host = need_value(arg);
+    } else if (arg == "--webui-port" || arg == "--port") {
+      cfg.webui_port = std::stoi(need_value(arg));
+    } else if (arg == "--webui-jpeg-quality") {
+      cfg.webui_jpeg_quality = std::stoi(need_value(arg));
     } else if (arg == "--sector-output") {
       cfg.sector_output = true;
     } else if (arg == "--num-sectors") {
@@ -1306,6 +1917,16 @@ static Config parse_args(int argc, char** argv) {
       cfg.camera_prefetch = false;
     } else if (arg == "--no-bound-input") {
       cfg.bound_input = false;
+    } else if (arg == "--staging-copy-input") {
+      cfg.staging_copy_input = true;
+    } else if (arg == "--no-staging-copy-input") {
+      cfg.staging_copy_input = false;
+      cfg.staging_pipeline = false;
+    } else if (arg == "--staging-pipeline") {
+      cfg.staging_pipeline = true;
+      cfg.staging_copy_input = true;
+    } else if (arg == "--no-staging-pipeline") {
+      cfg.staging_pipeline = false;
     } else if (arg == "--no-stdout-json") {
       cfg.no_stdout_json = true;
     } else if (arg == "--stdout-debug-json") {
@@ -1346,6 +1967,14 @@ static Config parse_args(int argc, char** argv) {
       cfg.tracker_new_thresh = std::stof(need_value(arg));
     } else if (arg == "--new-track-overlap-thresh") {
       cfg.new_track_overlap_thresh = std::stof(need_value(arg));
+    } else if (arg == "--lost-velocity-decay") {
+      cfg.lost_velocity_decay = std::stof(need_value(arg));
+    } else if (arg == "--inherit-center-dist-thresh") {
+      cfg.inherit_center_dist_thresh = std::stof(need_value(arg));
+    } else if (arg == "--inherit-size-ratio-thresh") {
+      cfg.inherit_size_ratio_thresh = std::stof(need_value(arg));
+    } else if (arg == "--inherit-ambiguity-margin") {
+      cfg.inherit_ambiguity_margin = std::stof(need_value(arg));
     } else if (arg == "--tracker-high-thresh") {
       cfg.tracker_high_thresh = std::stof(need_value(arg));
     } else if (arg == "--tracker-low-thresh") {
@@ -1391,9 +2020,9 @@ static Config parse_args(int argc, char** argv) {
     } else if (arg == "--profile-interval") {
       cfg.profile_interval = std::stoi(need_value(arg));
     } else if (arg == "--profile-system-load" || arg == "--json-system-load") {
-      // Accepted for Python CLI compatibility. C++ system-load sampling is handled separately.
+      cfg.profile_system_load = true;
     } else if (arg == "--system-load-interval-ms") {
-      (void)need_value(arg);
+      cfg.system_load_interval_ms = std::stoi(need_value(arg));
     } else if (arg == "--angle-vectorized") {
       cfg.angle_vectorized = true;
     } else if (arg == "--force-build") {
@@ -1428,6 +2057,10 @@ static Config parse_args(int argc, char** argv) {
   if (!cfg.image_paths.empty() && !cfg.camera_device.empty()) {
     throw std::runtime_error("--camera-device cannot be combined with --image/--image-list");
   }
+  if (cfg.staging_pipeline) {
+    cfg.staging_copy_input = true;
+    cfg.bound_input = true;
+  }
   for (const std::string& image_path : cfg.image_paths) {
     if (!file_exists(image_path)) {
       throw std::runtime_error("image not found: " + image_path);
@@ -1442,8 +2075,18 @@ static Config parse_args(int argc, char** argv) {
   if (cfg.ws_port <= 0 || cfg.ws_port > 65535) {
     throw std::runtime_error("--ws-port must be in 1..65535");
   }
-  if (cfg.max_frames <= 0) {
-    throw std::runtime_error("--max-frames must be positive");
+  if (cfg.webui_port <= 0 || cfg.webui_port > 65535) {
+    throw std::runtime_error("--webui-port must be in 1..65535");
+  }
+  if (cfg.webui && cfg.ws_json && cfg.webui_port == cfg.ws_port &&
+      (cfg.webui_host == cfg.ws_host || cfg.webui_host == "0.0.0.0" || cfg.ws_host == "0.0.0.0")) {
+    throw std::runtime_error("--webui-port must differ from --ws-port when both servers are enabled");
+  }
+  if (cfg.webui_jpeg_quality < 1 || cfg.webui_jpeg_quality > 100) {
+    throw std::runtime_error("--webui-jpeg-quality must be in 1..100");
+  }
+  if (cfg.max_frames < 0) {
+    throw std::runtime_error("--max-frames must be non-negative");
   }
   if (cfg.num_sectors <= 0) {
     throw std::runtime_error("--num-sectors must be positive");
@@ -1454,10 +2097,18 @@ static Config parse_args(int argc, char** argv) {
   if (cfg.coast_frames < 0) {
     throw std::runtime_error("--coast-frames must be non-negative");
   }
+  cfg.system_load_interval_ms = std::max(50, cfg.system_load_interval_ms);
   if (cfg.fit_degree != 4 && cfg.fit_degree != 5) {
     throw std::runtime_error("--fit-degree must be 4 or 5");
   }
   cfg.smooth_bbox_alpha = std::max(0.0f, std::min(cfg.smooth_bbox_alpha, 0.99f));
+  cfg.lost_velocity_decay = std::max(0.0f, std::min(cfg.lost_velocity_decay, 1.0f));
+  cfg.inherit_center_dist_thresh =
+      std::max(0.0f, std::min(cfg.inherit_center_dist_thresh, 5.0f));
+  cfg.inherit_size_ratio_thresh =
+      std::max(0.0f, std::min(cfg.inherit_size_ratio_thresh, 1.0f));
+  cfg.inherit_ambiguity_margin =
+      std::max(0.0f, std::min(cfg.inherit_ambiguity_margin, 5.0f));
   cfg.boundary_margin = std::max(0.01f, std::min(cfg.boundary_margin, 0.4f));
   cfg.max_width_ratio = std::max(0.05f, std::min(cfg.max_width_ratio, 1.0f));
   cfg.final_boundary_dedup_iou_thresh =
@@ -1516,12 +2167,424 @@ static std::string default_output_jsonl_path() {
   return std::string(buf);
 }
 
+static std::string system_profile_path_for(const Config& cfg) {
+  std::string base = !cfg.debug_jsonl_path.empty() ? cfg.debug_jsonl_path : cfg.output_jsonl_path;
+  if (base.empty()) {
+    mkdir("board_output", 0775);
+    base = "board_output/board_cpp_system.jsonl";
+  }
+  return stem_without_ext(base) + "_system_profile.jsonl";
+}
+
+static std::string system_summary_path_for(const std::string& system_profile_path) {
+  return stem_without_ext(system_profile_path) + "_summary.json";
+}
+
+struct MetricStats {
+  int count = 0;
+  double sum = 0.0;
+  double min = 0.0;
+  double max = 0.0;
+
+  void add(double value) {
+    if (!std::isfinite(value)) {
+      return;
+    }
+    if (count == 0) {
+      min = value;
+      max = value;
+    } else {
+      min = std::min(min, value);
+      max = std::max(max, value);
+    }
+    sum += value;
+    count += 1;
+  }
+};
+
+static bool extract_json_number(const std::string& line, const std::string& key, double* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string marker = "\"" + key + "\":";
+  size_t pos = line.find(marker);
+  if (pos == std::string::npos) {
+    return false;
+  }
+  pos += marker.size();
+  while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) {
+    ++pos;
+  }
+  if (line.compare(pos, 4, "null") == 0) {
+    return false;
+  }
+  char* end = nullptr;
+  const double parsed = std::strtod(line.c_str() + pos, &end);
+  if (end == line.c_str() + pos || !std::isfinite(parsed)) {
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+static void write_metric_stats_json(std::ostream& os, const MetricStats& stats) {
+  if (stats.count <= 0) {
+    os << "{\"avg\":null,\"max\":null,\"min\":null}";
+    return;
+  }
+  os << "{\"avg\":" << std::fixed << std::setprecision(2) << (stats.sum / stats.count)
+     << ",\"max\":" << stats.max
+     << ",\"min\":" << stats.min << "}";
+}
+
+static void write_system_load_summary(const std::string& system_profile_path,
+                                      const std::string& output_jsonl_path,
+                                      double elapsed_s,
+                                      int frames) {
+  if (system_profile_path.empty() || !file_exists(system_profile_path)) {
+    return;
+  }
+  std::ifstream in(system_profile_path.c_str());
+  if (!in) {
+    return;
+  }
+  std::map<std::string, MetricStats> stats;
+  const std::vector<std::string> keys = {
+      "cpu_percent", "memory_percent", "memory_available_mb",
+      "gpu_percent", "gpu_freq_hz", "npu_percent", "npu_freq_hz", "thermal_max_c"};
+  std::string line;
+  int samples = 0;
+  std::string first_sample;
+  std::string last_sample;
+  while (std::getline(in, line)) {
+    line = trim(line);
+    if (line.empty()) {
+      continue;
+    }
+    if (first_sample.empty()) {
+      first_sample = line;
+    }
+    last_sample = line;
+    samples += 1;
+    for (const std::string& key : keys) {
+      double value = 0.0;
+      if (extract_json_number(line, key, &value)) {
+        stats[key].add(value);
+      }
+    }
+  }
+  if (samples <= 0) {
+    return;
+  }
+  const std::string summary_path = system_summary_path_for(system_profile_path);
+  std::ofstream out(summary_path.c_str(), std::ios::out | std::ios::trunc);
+  if (!out) {
+    std::cerr << "[system-load] cannot write summary: " << summary_path << "\n";
+    return;
+  }
+  out << "{\n";
+  out << "  \"output_jsonl\": \"" << json_escape(output_jsonl_path) << "\",\n";
+  out << "  \"system_profile_jsonl\": \"" << json_escape(system_profile_path) << "\",\n";
+  out << "  \"frames\": " << frames << ",\n";
+  out << "  \"elapsed_s\": " << std::fixed << std::setprecision(3) << elapsed_s << ",\n";
+  out << "  \"avg_fps\": " << (elapsed_s > 0.0 ? static_cast<double>(frames) / elapsed_s : 0.0) << ",\n";
+  out << "  \"samples\": " << samples << ",\n";
+  for (size_t i = 0; i < keys.size(); ++i) {
+    out << "  \"" << keys[i] << "\": ";
+    write_metric_stats_json(out, stats[keys[i]]);
+    out << ",\n";
+  }
+  out << "  \"first_sample\": " << (first_sample.empty() ? "{}" : first_sample) << ",\n";
+  out << "  \"last_sample\": " << (last_sample.empty() ? "{}" : last_sample) << "\n";
+  out << "}\n";
+  std::cerr << "[system-load] summary JSON: " << summary_path << "\n";
+  auto print_stat = [&](const std::string& key, const std::string& unit) {
+    const MetricStats& s = stats[key];
+    if (s.count <= 0) {
+      return std::string(key + "=N/A");
+    }
+    std::ostringstream oss;
+    oss << key << "=avg " << std::fixed << std::setprecision(2) << (s.sum / s.count)
+        << unit << " max " << s.max << unit;
+    return oss.str();
+  };
+  std::cerr << "[system-load] summary "
+            << print_stat("cpu_percent", "%") << " | "
+            << print_stat("gpu_percent", "%") << " | "
+            << print_stat("npu_percent", "%") << " | "
+            << print_stat("memory_percent", "%") << " | "
+            << print_stat("thermal_max_c", "C") << "\n";
+}
+
 static bool finite_point(float x, float y) {
   return std::isfinite(x) && std::isfinite(y) && !(x == 0.0f && y == 0.0f);
 }
 
 static bool valid_keypoint(const float* kp) {
   return finite_point(kp[0], kp[1]) && kp[2] > 0.0f;
+}
+
+static void put_pixel(Image& image, int x, int y, uint8_t b, uint8_t g, uint8_t r) {
+  if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
+    return;
+  }
+  const size_t idx = (static_cast<size_t>(y) * image.width + static_cast<size_t>(x)) * 3;
+  image.bgr[idx + 0] = b;
+  image.bgr[idx + 1] = g;
+  image.bgr[idx + 2] = r;
+}
+
+static void draw_line(Image& image,
+                      int x0,
+                      int y0,
+                      int x1,
+                      int y1,
+                      uint8_t b,
+                      uint8_t g,
+                      uint8_t r) {
+  const int dx = std::abs(x1 - x0);
+  const int sx = x0 < x1 ? 1 : -1;
+  const int dy = -std::abs(y1 - y0);
+  const int sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  while (true) {
+    put_pixel(image, x0, y0, b, g, r);
+    if (x0 == x1 && y0 == y1) {
+      break;
+    }
+    const int e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x0 += sx;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
+static void draw_rect(Image& image,
+                      int x1,
+                      int y1,
+                      int x2,
+                      int y2,
+                      uint8_t b,
+                      uint8_t g,
+                      uint8_t r,
+                      int thickness) {
+  x1 = std::max(0, std::min(x1, image.width - 1));
+  x2 = std::max(0, std::min(x2, image.width - 1));
+  y1 = std::max(0, std::min(y1, image.height - 1));
+  y2 = std::max(0, std::min(y2, image.height - 1));
+  if (x2 < x1) {
+    std::swap(x1, x2);
+  }
+  if (y2 < y1) {
+    std::swap(y1, y2);
+  }
+  for (int t = 0; t < std::max(1, thickness); ++t) {
+    draw_line(image, x1, y1 + t, x2, y1 + t, b, g, r);
+    draw_line(image, x1, y2 - t, x2, y2 - t, b, g, r);
+    draw_line(image, x1 + t, y1, x1 + t, y2, b, g, r);
+    draw_line(image, x2 - t, y1, x2 - t, y2, b, g, r);
+  }
+}
+
+static void fill_rect(Image& image,
+                      int x1,
+                      int y1,
+                      int x2,
+                      int y2,
+                      uint8_t b,
+                      uint8_t g,
+                      uint8_t r) {
+  x1 = std::max(0, std::min(x1, image.width - 1));
+  x2 = std::max(0, std::min(x2, image.width - 1));
+  y1 = std::max(0, std::min(y1, image.height - 1));
+  y2 = std::max(0, std::min(y2, image.height - 1));
+  if (x2 < x1) {
+    std::swap(x1, x2);
+  }
+  if (y2 < y1) {
+    std::swap(y1, y2);
+  }
+  for (int y = y1; y <= y2; ++y) {
+    for (int x = x1; x <= x2; ++x) {
+      put_pixel(image, x, y, b, g, r);
+    }
+  }
+}
+
+static void fill_rect_alpha(Image& image,
+                            int x1,
+                            int y1,
+                            int x2,
+                            int y2,
+                            uint8_t b,
+                            uint8_t g,
+                            uint8_t r,
+                            float alpha) {
+  if (image.width <= 0 || image.height <= 0 || image.bgr.empty()) {
+    return;
+  }
+  alpha = std::max(0.0f, std::min(1.0f, alpha));
+  x1 = std::max(0, std::min(x1, image.width - 1));
+  x2 = std::max(0, std::min(x2, image.width - 1));
+  y1 = std::max(0, std::min(y1, image.height - 1));
+  y2 = std::max(0, std::min(y2, image.height - 1));
+  if (x2 < x1) {
+    std::swap(x1, x2);
+  }
+  if (y2 < y1) {
+    std::swap(y1, y2);
+  }
+  const float inv_alpha = 1.0f - alpha;
+  for (int y = y1; y <= y2; ++y) {
+    for (int x = x1; x <= x2; ++x) {
+      const size_t idx = (static_cast<size_t>(y) * image.width + x) * 3U;
+      image.bgr[idx + 0] = static_cast<uint8_t>(image.bgr[idx + 0] * inv_alpha + b * alpha);
+      image.bgr[idx + 1] = static_cast<uint8_t>(image.bgr[idx + 1] * inv_alpha + g * alpha);
+      image.bgr[idx + 2] = static_cast<uint8_t>(image.bgr[idx + 2] * inv_alpha + r * alpha);
+    }
+  }
+}
+
+static const char* glyph5x7(char c) {
+  switch (c) {
+    case '0': return "111101101101101101111";
+    case '1': return "010110010010010010111";
+    case '2': return "111001001111100100111";
+    case '3': return "111001001111001001111";
+    case '4': return "101101101111001001001";
+    case '5': return "111100100111001001111";
+    case '6': return "111100100111101101111";
+    case '7': return "111001001010010010010";
+    case '8': return "111101101111101101111";
+    case '9': return "111101101111001001111";
+    case 'A': return "010101101111101101101";
+    case 'B': return "110101101110101101110";
+    case 'C': return "111100100100100100111";
+    case 'D': return "110101101101101101110";
+    case 'E': return "111100100111100100111";
+    case 'F': return "111100100111100100100";
+    case 'I': return "111010010010010010111";
+    case 'L': return "100100100100100100111";
+    case 'M': return "101111111101101101101";
+    case 'P': return "110101101110100100100";
+    case 'S': return "111100100111001001111";
+    case 'T': return "111010010010010010010";
+    case 'Z': return "111001001010100100111";
+    case ':': return "000010010000010010000";
+    case '.': return "000000000000000010010";
+    case '-': return "000000000111000000000";
+    case ' ': return "000000000000000000000";
+    default: return "111001010010010000010";
+  }
+}
+
+static void draw_text(Image& image,
+                      int x,
+                      int y,
+                      const std::string& text,
+                      uint8_t b,
+                      uint8_t g,
+                      uint8_t r,
+                      int scale) {
+  scale = std::max(1, scale);
+  int cursor = x;
+  for (char raw : text) {
+    const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(raw)));
+    const char* bits = glyph5x7(c);
+    for (int row = 0; row < 7; ++row) {
+      for (int col = 0; col < 3; ++col) {
+        if (bits[row * 3 + col] != '1') {
+          continue;
+        }
+        fill_rect(
+            image,
+            cursor + col * scale,
+            y + row * scale,
+            cursor + (col + 1) * scale - 1,
+            y + (row + 1) * scale - 1,
+            b,
+            g,
+            r);
+      }
+    }
+    cursor += 4 * scale;
+  }
+}
+
+static int text_pixel_width(const std::string& text, int scale) {
+  scale = std::max(1, scale);
+  if (text.empty()) {
+    return 0;
+  }
+  return static_cast<int>(text.size()) * 4 * scale - scale;
+}
+
+static void draw_vertical_dashed_line(Image& image,
+                                      int x,
+                                      int y1,
+                                      int y2,
+                                      int dash,
+                                      int gap,
+                                      uint8_t b,
+                                      uint8_t g,
+                                      uint8_t r) {
+  if (image.width <= 0 || image.height <= 0) {
+    return;
+  }
+  x = std::max(0, std::min(x, image.width - 1));
+  y1 = std::max(0, std::min(y1, image.height - 1));
+  y2 = std::max(0, std::min(y2, image.height - 1));
+  if (y2 < y1) {
+    std::swap(y1, y2);
+  }
+  dash = std::max(1, dash);
+  gap = std::max(0, gap);
+  for (int y = y1; y <= y2; y += dash + gap) {
+    draw_line(image, x, y, x, std::min(y + dash - 1, y2), b, g, r);
+  }
+}
+
+static Image remap_panorama_cpu(const Image& source,
+                                const MapMeta& meta,
+                                const std::vector<float>* base_map_x,
+                                const std::vector<float>* base_map_y) {
+  if (base_map_x == nullptr || base_map_y == nullptr ||
+      meta.base_map_width <= 0 || meta.base_map_height <= 0 ||
+      base_map_x->size() != static_cast<size_t>(meta.base_map_width) * meta.base_map_height ||
+      base_map_y->size() != static_cast<size_t>(meta.base_map_width) * meta.base_map_height) {
+    return source;
+  }
+
+  Image panorama;
+  panorama.width = meta.base_map_width;
+  panorama.height = meta.base_map_height;
+  panorama.bgr.assign(static_cast<size_t>(panorama.width) * panorama.height * 3, 0);
+  for (int y = 0; y < panorama.height; ++y) {
+    for (int x = 0; x < panorama.width; ++x) {
+      const size_t out_idx = (static_cast<size_t>(y) * panorama.width + x) * 3;
+      const size_t map_idx = static_cast<size_t>(y) * panorama.width + x;
+      const float sx_f = (*base_map_x)[map_idx];
+      const float sy_f = (*base_map_y)[map_idx];
+      if (!std::isfinite(sx_f) || !std::isfinite(sy_f)) {
+        continue;
+      }
+      const int sx = static_cast<int>(std::lround(sx_f));
+      const int sy = static_cast<int>(std::lround(sy_f));
+      if (sx < 0 || sy < 0 || sx >= source.width || sy >= source.height) {
+        continue;
+      }
+      const size_t src_idx = (static_cast<size_t>(sy) * source.width + sx) * 3;
+      panorama.bgr[out_idx + 0] = source.bgr[src_idx + 0];
+      panorama.bgr[out_idx + 1] = source.bgr[src_idx + 1];
+      panorama.bgr[out_idx + 2] = source.bgr[src_idx + 2];
+    }
+  }
+  return panorama;
 }
 
 static double round_to(double value, double scale) {
@@ -1560,6 +2623,123 @@ struct TargetInfo {
   double eye_pixel_dist = 0.0;
   double distance = 0.0;
 };
+
+static void draw_sector_overlay(Image& image,
+                                const Config& cfg,
+                                const std::vector<TargetInfo>& targets) {
+  if (!cfg.sector_output || cfg.num_sectors <= 0 || image.width <= 0 || image.height <= 0) {
+    return;
+  }
+  const int sectors = std::max(1, cfg.num_sectors);
+  const double sector_size = 360.0 / static_cast<double>(sectors);
+  std::vector<bool> active(static_cast<size_t>(sectors), false);
+  for (const TargetInfo& target : targets) {
+    if (!target.has_azimuth || !std::isfinite(target.azimuth)) {
+      continue;
+    }
+    double azimuth = std::fmod(target.azimuth, 360.0);
+    if (azimuth < 0.0) {
+      azimuth += 360.0;
+    }
+    const int sector =
+        ((static_cast<int>(std::floor(azimuth / sector_size)) % sectors) + sectors) % sectors;
+    active[static_cast<size_t>(sector)] = true;
+  }
+
+  for (int s = 0; s < sectors; ++s) {
+    const int x0 = static_cast<int>(std::lround(static_cast<double>(image.width) * s / sectors));
+    const int x1 = static_cast<int>(std::lround(static_cast<double>(image.width) * (s + 1) / sectors)) - 1;
+    const bool has_target = active[static_cast<size_t>(s)];
+    std::ostringstream label;
+    label << "S" << s;
+    draw_text(image, std::max(2, x0 + 4), 10, label.str(),
+              has_target ? 0 : 160,
+              has_target ? 0 : 160,
+              has_target ? 255 : 160,
+              2);
+  }
+  for (int s = 1; s < sectors; ++s) {
+    const int x = static_cast<int>(std::lround(static_cast<double>(image.width) * s / sectors));
+    draw_vertical_dashed_line(image, x, 0, image.height - 1, 12, 8, 110, 110, 110);
+  }
+}
+
+static void draw_annotation(Image& image,
+                            const Config& cfg,
+                            const FrameResult& result,
+                            const std::vector<TargetInfo>& targets,
+                            const FrameRateStats& fps) {
+  draw_text(image, 12, 12, "FPS:" + std::to_string(static_cast<int>(fps.average_fps + 0.5)),
+            32, 255, 255, 3);
+  draw_sector_overlay(image, cfg, targets);
+  for (int i = 0; i < result.detection_count; ++i) {
+    const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+    const int track_id =
+        (i < static_cast<int>(result.track_ids.size()) && result.track_ids[static_cast<size_t>(i)] > 0)
+            ? result.track_ids[static_cast<size_t>(i)]
+            : i + 1;
+    const int x1 = static_cast<int>(std::lround(det[0]));
+    const int y1 = static_cast<int>(std::lround(det[1]));
+    const int x2 = static_cast<int>(std::lround(det[2]));
+    const int y2 = static_cast<int>(std::lround(det[3]));
+    bool sector_target = false;
+    if (cfg.sector_output && i < static_cast<int>(targets.size())) {
+      const TargetInfo& target = targets[static_cast<size_t>(i)];
+      sector_target = target.has_azimuth && target.has_elevation &&
+                      std::isfinite(target.azimuth) && std::isfinite(target.elevation);
+    }
+    const uint8_t b = sector_target ? 0 : static_cast<uint8_t>((track_id * 53) % 180 + 60);
+    const uint8_t g = sector_target ? 0 : static_cast<uint8_t>((track_id * 97) % 180 + 60);
+    const uint8_t r = sector_target ? 255 : static_cast<uint8_t>((track_id * 131) % 180 + 60);
+    draw_rect(image, x1, y1, x2, y2, b, g, r, 3);
+    const float* left_mouth = det + 5 + 3 * 3;
+    const float* right_mouth = det + 5 + 4 * 3;
+    if (valid_keypoint(left_mouth)) {
+      const int kx = static_cast<int>(std::lround(left_mouth[0]));
+      const int ky = static_cast<int>(std::lround(left_mouth[1]));
+      fill_rect(image, kx - 3, ky - 3, kx + 3, ky + 3, 0, 255, 255);
+    }
+    if (valid_keypoint(right_mouth)) {
+      const int kx = static_cast<int>(std::lround(right_mouth[0]));
+      const int ky = static_cast<int>(std::lround(right_mouth[1]));
+      fill_rect(image, kx - 3, ky - 3, kx + 3, ky + 3, 0, 255, 255);
+    }
+    if (valid_keypoint(left_mouth) && valid_keypoint(right_mouth)) {
+      const int cx = static_cast<int>(std::lround((left_mouth[0] + right_mouth[0]) * 0.5f));
+      const int cy = static_cast<int>(std::lround((left_mouth[1] + right_mouth[1]) * 0.5f));
+      fill_rect(image, cx - 4, cy - 4, cx + 4, cy + 4, 0, 255, 0);
+    }
+    std::ostringstream label;
+    label << "ID:" << track_id;
+    const TargetInfo* target =
+        i < static_cast<int>(targets.size()) ? &targets[static_cast<size_t>(i)] : nullptr;
+    if (target != nullptr && target->has_azimuth && std::isfinite(target->azimuth)) {
+      label << " A:" << static_cast<int>(std::lround(target->azimuth));
+    }
+    if (target != nullptr && target->has_elevation && std::isfinite(target->elevation)) {
+      label << " E:" << static_cast<int>(std::lround(target->elevation));
+    }
+    const std::string label_text = label.str();
+    const int label_scale = 2;
+    const int label_pad_x = 4;
+    const int label_pad_y = 3;
+    const int label_w = std::max(28, text_pixel_width(label_text, label_scale) + label_pad_x * 2);
+    const int label_h = 7 * label_scale + label_pad_y * 2;
+    const int max_label_x = std::max(0, image.width - label_w - 1);
+    const int label_x = std::max(0, std::min(x1, max_label_x));
+    const int label_y = std::max(0, y1 - label_h - 2);
+    fill_rect_alpha(image,
+                    label_x,
+                    label_y,
+                    label_x + label_w - 1,
+                    label_y + label_h - 1,
+                    24,
+                    28,
+                    34,
+                    0.72f);
+    draw_text(image, label_x + label_pad_x, label_y + label_pad_y, label_text, b, g, r, label_scale);
+  }
+}
 
 class AngleAndDistanceRuntime {
  public:
@@ -1790,12 +2970,19 @@ class AngleAndDistanceRuntime {
 static std::string build_inference_json(const std::vector<TargetInfo>& targets,
                                         int frame_id,
                                         bool debug_keypoints,
-                                        const FrameResult& result) {
+                                        const FrameResult& result,
+                                        const FrameRateStats& fps) {
   (void)debug_keypoints;
   (void)result;
   std::ostringstream os;
   os << "{\"timestamp\":" << std::fixed << std::setprecision(3) << wall_time_seconds()
      << ",\"frame_id\":" << frame_id
+     << ",\"fps\":{\"instant\":" << fps.instant_fps
+     << ",\"average\":" << fps.average_fps
+     << ",\"frame_ms\":" << fps.frame_ms
+     << ",\"elapsed_s\":" << fps.elapsed_s
+     << ",\"frames\":" << fps.frames << "}"
+     << ",\"timings_ms\":{\"frame_total\":" << fps.frame_ms << "}"
      << ",\"targets\":{";
   for (size_t i = 0; i < targets.size(); ++i) {
     if (i > 0) {
@@ -1819,7 +3006,8 @@ static std::string build_inference_json(const std::vector<TargetInfo>& targets,
 static std::string build_sector_json(const std::vector<TargetInfo>& targets,
                                      int frame_id,
                                      int num_sectors,
-                                     const FrameResult& result) {
+                                     const FrameResult& result,
+                                     const FrameRateStats& fps) {
   const int sectors_count = std::max(1, num_sectors);
   const double sector_size = 360.0 / static_cast<double>(sectors_count);
 
@@ -1864,6 +3052,12 @@ static std::string build_sector_json(const std::vector<TargetInfo>& targets,
   std::ostringstream os;
   os << "{\"timestamp\":" << std::fixed << std::setprecision(3) << wall_time_seconds()
      << ",\"frame_id\":" << frame_id
+     << ",\"fps\":{\"instant\":" << fps.instant_fps
+     << ",\"average\":" << fps.average_fps
+     << ",\"frame_ms\":" << fps.frame_ms
+     << ",\"elapsed_s\":" << fps.elapsed_s
+     << ",\"frames\":" << fps.frames << "}"
+     << ",\"timings_ms\":{\"frame_total\":" << fps.frame_ms << "}"
      << ",\"num_sectors\":" << sectors_count
      << ",\"sectors\":{";
   for (int s = 0; s < sectors_count; ++s) {
@@ -1885,11 +3079,12 @@ static std::string build_sector_json(const std::vector<TargetInfo>& targets,
 static std::string build_output_json(const Config& cfg,
                                      const std::vector<TargetInfo>& targets,
                                      int frame_id,
-                                     const FrameResult& result) {
+                                     const FrameResult& result,
+                                     const FrameRateStats& fps) {
   if (cfg.sector_output) {
-    return build_sector_json(targets, frame_id, cfg.num_sectors, result);
+    return build_sector_json(targets, frame_id, cfg.num_sectors, result, fps);
   }
-  return build_inference_json(targets, frame_id, cfg.json_debug_keypoints, result);
+  return build_inference_json(targets, frame_id, cfg.json_debug_keypoints, result, fps);
 }
 
 static void print_inference_jsonl(std::ostream& os,
@@ -1897,7 +3092,8 @@ static void print_inference_jsonl(std::ostream& os,
                                   int frame_id,
                                   bool debug_keypoints,
                                   const FrameResult& result) {
-  os << build_inference_json(targets, frame_id, debug_keypoints, result) << "\n";
+  FrameRateStats empty_fps;
+  os << build_inference_json(targets, frame_id, debug_keypoints, result, empty_fps) << "\n";
 }
 
 static void print_result_json(std::ostream& os,
@@ -1949,6 +3145,7 @@ static void print_result_json(std::ostream& os,
             << ", \"rknn_total_outer\": " << result.profile_ms[kProfileRknnTotalOuter]
             << ", \"bound_prepare\": " << result.profile_ms[kProfileBoundPrepare]
             << ", \"bound_import\": " << result.profile_ms[kProfileBoundImport]
+            << ", \"staging_copy\": " << result.profile_ms[kProfileStagingCopy]
             << ", \"rknn_wall_inner\": " << result.rknn_timings[0]
             << ", \"rknn_run_max\": " << result.rknn_timings[1]
             << ", \"rknn_output_max\": " << result.rknn_timings[2]
@@ -2051,6 +3248,7 @@ static void print_result_jsonl(std::ostream& os,
      << ",\"rknn_total_outer\":" << result.profile_ms[kProfileRknnTotalOuter]
      << ",\"bound_prepare\":" << result.profile_ms[kProfileBoundPrepare]
      << ",\"bound_import\":" << result.profile_ms[kProfileBoundImport]
+     << ",\"staging_copy\":" << result.profile_ms[kProfileStagingCopy]
      << ",\"rknn_wall_inner\":" << result.rknn_timings[0]
      << ",\"rknn_run_max\":" << result.rknn_timings[1]
      << ",\"rknn_output_max\":" << result.rknn_timings[2]
@@ -2251,6 +3449,7 @@ class NativeHybridSortTracker {
         1.0f,
         cfg_.tracker_new_thresh,
         cfg_.new_track_overlap_thresh,
+        cfg_.lost_velocity_decay,
         handle_.out(),
         err,
         sizeof(err));
@@ -2536,6 +3735,7 @@ class NativeHybridSortTracker {
       const std::array<float, 4> new_bbox = bbox4_from_ptr(det);
       int best_old_raw = -1;
       float best_dist = cfg_.inherit_center_dist_thresh;
+      float second_best_dist = std::numeric_limits<float>::infinity();
       for (const auto& item : lost_confirmed) {
         const int old_raw = item.first;
         if (old_raw == raw_id || public_id_map_.find(old_raw) == public_id_map_.end()) {
@@ -2544,15 +3744,30 @@ class NativeHybridSortTracker {
         const NativeTrackSnapshot& old_track = item.second;
         const std::array<float, 4> obs_bbox = bbox_from_last_observation(old_track);
         float d = center_distance_norm(new_bbox, obs_bbox);
+        float size_score = size_ratio_score(new_bbox, obs_bbox);
         if (finite_bbox(old_track.state)) {
-          d = std::min(d, center_distance_norm(new_bbox, old_track.state));
+          const float state_dist = center_distance_norm(new_bbox, old_track.state);
+          if (state_dist < d) {
+            d = state_dist;
+            size_score = size_ratio_score(new_bbox, old_track.state);
+          }
+        }
+        if (size_score < cfg_.inherit_size_ratio_thresh) {
+          continue;
         }
         if (d < best_dist) {
+          second_best_dist = best_dist;
           best_dist = d;
           best_old_raw = old_raw;
+        } else if (d < second_best_dist) {
+          second_best_dist = d;
         }
       }
       if (best_old_raw > 0) {
+        if (std::isfinite(second_best_dist) &&
+            (second_best_dist - best_dist) < cfg_.inherit_ambiguity_margin) {
+          continue;
+        }
         const int old_public = public_id_map_[best_old_raw];
         public_id_map_.erase(best_old_raw);
         public_id_map_[raw_id] = old_public;
@@ -3150,6 +4365,70 @@ class MeetEyeRuntime {
     return base_map_y_.empty() ? nullptr : &base_map_y_;
   }
 
+  PreparedStagingFrame prepare_staging_frame(PreparedStagingFrame frame) {
+    const Image& image = frame.image;
+    if (meta_.img_width > 0 && meta_.img_height > 0 &&
+        (image.width != meta_.img_width || image.height != meta_.img_height)) {
+      std::ostringstream oss;
+      oss << "image shape " << image.width << "x" << image.height
+          << " does not match exported map source " << meta_.img_width << "x" << meta_.img_height;
+      throw std::runtime_error(oss.str());
+    }
+
+    frame.valid = true;
+    frame.result = FrameResult();
+    frame.result.frame_index = frame.frame_index;
+    frame.result.image_path = frame.image_path;
+    frame.result.frame_width = image.width;
+    frame.result.frame_height = image.height;
+    frame.result.detections.assign(
+        static_cast<size_t>(cfg_.max_output_dets) * kDetectionFields, 0.0f);
+
+    double t0 = steady_seconds();
+    ensure_opencl(image);
+    double t1 = steady_seconds();
+    frame.result.profile_ms[kProfileOpenclEnsure] = (t1 - t0) * 1000.0;
+
+    frame.original_width =
+        meta_.slices.empty() ? static_cast<float>(meta_.process_width)
+                             : static_cast<float>(meta_.slices[0].original_width);
+
+    if (!prepare_bound_inputs(frame.result)) {
+      throw std::runtime_error("staging pipeline requires RKNN bound input memory");
+    }
+
+    ensure_staging_buffers();
+    char err[4096] = {0};
+    t0 = steady_seconds();
+    const int ret = ds_opencl_fused_run_split(
+        opencl_.get(),
+        image.bgr.data(),
+        staging_ptrs_.data(),
+        meta_.num_slices,
+        frame.result.remap_timings,
+        err,
+        sizeof(err));
+    t1 = steady_seconds();
+    frame.result.profile_ms[kProfileOpenclRunOuter] = (t1 - t0) * 1000.0;
+    if (ret != 0) {
+      throw std::runtime_error(std::string("ds_opencl_fused_run_split(staging) failed: ") + err);
+    }
+    return frame;
+  }
+
+  std::future<PreparedStagingFrame> start_staging_inference(PreparedStagingFrame frame) {
+    if (!frame.valid) {
+      throw std::runtime_error("cannot infer invalid staging frame");
+    }
+    copy_staging_to_bound_inputs(frame.result);
+    return std::async(std::launch::async, [this, frame = std::move(frame)]() mutable {
+      run_bound_inference(frame.original_width, false, frame.result);
+      frame.result.detection_count =
+          std::max(0, std::min(frame.result.detection_count, cfg_.max_output_dets));
+      return frame;
+    });
+  }
+
   FrameResult process(const Image& image, const std::string& image_path, int frame_index) {
     if (meta_.img_width > 0 && meta_.img_height > 0 &&
         (image.width != meta_.img_width || image.height != meta_.img_height)) {
@@ -3315,6 +4594,12 @@ class MeetEyeRuntime {
       return true;
     }
 
+    if (cfg_.staging_copy_input) {
+      bound_imported_ = false;
+      bound_import_failed_ = true;
+      return true;
+    }
+
     std::fill(bound_fds_, bound_fds_ + 3, -1);
     std::fill(bound_sizes_, bound_sizes_ + 3, 0);
     const double t0 = steady_seconds();
@@ -3356,6 +4641,48 @@ class MeetEyeRuntime {
 
     bound_imported_ = true;
     return true;
+  }
+
+  void ensure_staging_buffers() {
+    const size_t slice_bytes =
+        static_cast<size_t>(meta_.imgsz) * static_cast<size_t>(meta_.imgsz) * 3U;
+    if (staging_buffers_.size() == static_cast<size_t>(meta_.num_slices) &&
+        staging_ptrs_.size() == static_cast<size_t>(meta_.num_slices)) {
+      bool ready = true;
+      for (int i = 0; i < meta_.num_slices; ++i) {
+        ready = ready &&
+                staging_buffers_[static_cast<size_t>(i)].size() == slice_bytes &&
+                staging_ptrs_[static_cast<size_t>(i)] ==
+                    staging_buffers_[static_cast<size_t>(i)].data();
+      }
+      if (ready) {
+        return;
+      }
+    }
+
+    staging_buffers_.assign(static_cast<size_t>(meta_.num_slices), std::vector<uint8_t>());
+    staging_ptrs_.assign(static_cast<size_t>(meta_.num_slices), nullptr);
+    for (int i = 0; i < meta_.num_slices; ++i) {
+      staging_buffers_[static_cast<size_t>(i)].assign(slice_bytes, 114);
+      staging_ptrs_[static_cast<size_t>(i)] = staging_buffers_[static_cast<size_t>(i)].data();
+    }
+  }
+
+  void copy_staging_to_bound_inputs(FrameResult& result) {
+    const size_t slice_bytes =
+        static_cast<size_t>(meta_.imgsz) * static_cast<size_t>(meta_.imgsz) * 3U;
+    const double t0 = steady_seconds();
+    for (int i = 0; i < meta_.num_slices; ++i) {
+      if (bound_ptrs_[i] == nullptr || bound_ptr_sizes_[i] < slice_bytes ||
+          staging_ptrs_[static_cast<size_t>(i)] == nullptr) {
+        std::ostringstream oss;
+        oss << "invalid staging/bound input ptr for slice " << i;
+        throw std::runtime_error(oss.str());
+      }
+      std::memcpy(bound_ptrs_[i], staging_ptrs_[static_cast<size_t>(i)], slice_bytes);
+    }
+    const double t1 = steady_seconds();
+    result.profile_ms[kProfileStagingCopy] = (t1 - t0) * 1000.0;
   }
 
   bool run_bound_inference(float original_width, bool external_device_input, FrameResult& result) {
@@ -3440,6 +4767,26 @@ class MeetEyeRuntime {
     char err[4096] = {0};
     double t0 = steady_seconds();
     int ret = 0;
+    if (cfg_.staging_copy_input) {
+      ensure_staging_buffers();
+      ret = ds_opencl_fused_run_split(
+          opencl_.get(),
+          image.bgr.data(),
+          staging_ptrs_.data(),
+          meta_.num_slices,
+          result.remap_timings,
+          err,
+          sizeof(err));
+      const double t1 = steady_seconds();
+      result.profile_ms[kProfileOpenclRunOuter] = (t1 - t0) * 1000.0;
+      if (ret != 0) {
+        throw std::runtime_error(
+            std::string("ds_opencl_fused_run_split(staging) failed: ") + err);
+      }
+      copy_staging_to_bound_inputs(result);
+      return run_bound_inference(original_width, false, result);
+    }
+
     if (bound_imported_) {
       ret = ds_opencl_fused_run_imported(
           opencl_.get(),
@@ -3559,6 +4906,8 @@ class MeetEyeRuntime {
   uint64_t bound_sizes_[3] = {0, 0, 0};
   uint8_t* bound_ptrs_[3] = {nullptr, nullptr, nullptr};
   uint64_t bound_ptr_sizes_[3] = {0, 0, 0};
+  std::vector<std::vector<uint8_t>> staging_buffers_;
+  std::vector<uint8_t*> staging_ptrs_;
 };
 
 static uint32_t sha1_rotl(uint32_t value, int bits) {
@@ -3713,6 +5062,836 @@ static bool send_all(int fd, const std::string& data) {
   return send_all(fd, reinterpret_cast<const uint8_t*>(data.data()), data.size());
 }
 
+static bool set_fd_nonblocking(int fd) {
+  const int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return false;
+  }
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static void set_socket_send_buffer(int fd, int bytes) {
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
+}
+
+static void set_socket_recv_timeout(int fd, int timeout_ms) {
+  timeval tv {};
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+static bool send_all_nonblocking(int fd,
+                                 const uint8_t* data,
+                                 size_t size,
+                                 int timeout_ms = 50) {
+  size_t sent = 0;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (sent < size) {
+    const ssize_t n = ::send(fd, data + sent, size - sent,
+                             MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (n > 0) {
+      sent += static_cast<size_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        return false;
+      }
+      const auto remaining_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+      timeval tv {};
+      tv.tv_sec = 0;
+      tv.tv_usec = static_cast<suseconds_t>(
+          std::max<int64_t>(1000, std::min<int64_t>(remaining_us, 5000)));
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(fd, &wfds);
+      const int ret = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+      if (ret > 0) {
+        continue;
+      }
+      if (ret < 0 && errno == EINTR) {
+        continue;
+      }
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool send_all_nonblocking(int fd, const std::vector<uint8_t>& data) {
+  return send_all_nonblocking(fd, data.data(), data.size());
+}
+
+static std::vector<uint8_t> make_websocket_frame(const uint8_t* data,
+                                                 size_t size,
+                                                 uint8_t opcode) {
+  std::vector<uint8_t> frame;
+  frame.reserve(size + 10);
+  frame.push_back(static_cast<uint8_t>(0x80 | (opcode & 0x0f)));
+  const uint64_t len = static_cast<uint64_t>(size);
+  if (len <= 125) {
+    frame.push_back(static_cast<uint8_t>(len));
+  } else if (len <= 0xffff) {
+    frame.push_back(126);
+    frame.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(len & 0xff));
+  } else {
+    frame.push_back(127);
+    for (int i = 7; i >= 0; --i) {
+      frame.push_back(static_cast<uint8_t>((len >> (i * 8)) & 0xff));
+    }
+  }
+  frame.insert(frame.end(), data, data + size);
+  return frame;
+}
+
+static int create_tcp_listener(const std::string& host, int port, int backlog) {
+  struct addrinfo hints {};
+  hints.ai_family = (host.empty() || host == "0.0.0.0") ? AF_INET : AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+  struct addrinfo* result = nullptr;
+  const std::string port_text = std::to_string(port);
+  const char* node = (host.empty() || host == "0.0.0.0") ? nullptr : host.c_str();
+  const int gai = getaddrinfo(node, port_text.c_str(), &hints, &result);
+  if (gai != 0) {
+    throw std::runtime_error(std::string("getaddrinfo failed for bind: ") + gai_strerror(gai));
+  }
+
+  int fd = -1;
+  for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+    fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (fd < 0) {
+      continue;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (::bind(fd, rp->ai_addr, rp->ai_addrlen) == 0 && ::listen(fd, backlog) == 0) {
+      break;
+    }
+    ::close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(result);
+  if (fd < 0) {
+    throw std::runtime_error("cannot bind socket on " + host + ":" + std::to_string(port));
+  }
+  return fd;
+}
+
+static std::vector<std::string> local_ipv4_addresses() {
+  std::vector<std::string> addrs;
+  struct ifaddrs* ifaddr = nullptr;
+  if (getifaddrs(&ifaddr) != 0) {
+    return addrs;
+  }
+  for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
+      continue;
+    }
+    if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+      continue;
+    }
+    char host[INET_ADDRSTRLEN] = {0};
+    const sockaddr_in* addr = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+    if (inet_ntop(AF_INET, &addr->sin_addr, host, sizeof(host)) != nullptr) {
+      addrs.push_back(host);
+    }
+  }
+  freeifaddrs(ifaddr);
+  std::sort(addrs.begin(), addrs.end());
+  addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+  return addrs;
+}
+
+class BoardWebUiServer {
+ public:
+  BoardWebUiServer(const std::string& host, int port)
+      : host_(host), port_(port) {}
+
+  ~BoardWebUiServer() { stop(); }
+
+  void start() {
+    if (running_.load()) {
+      return;
+    }
+    listen_fd_ = create_tcp_listener(host_, port_, 64);
+    running_.store(true);
+    sender_thread_ = std::thread(&BoardWebUiServer::sender_loop, this);
+    accept_thread_ = std::thread(&BoardWebUiServer::accept_loop, this);
+    std::cerr << "[board_cpp-webui] listening: http://" << host_ << ":" << port_ << "/\n";
+    if (host_.empty() || host_ == "0.0.0.0") {
+      const std::vector<std::string> addrs = local_ipv4_addresses();
+      if (addrs.empty()) {
+        std::cerr << "[board_cpp-webui] open: http://<board-ip>:" << port_ << "/\n";
+      } else {
+        for (const std::string& addr : addrs) {
+          std::cerr << "[board_cpp-webui] open: http://" << addr << ":" << port_ << "/\n";
+        }
+      }
+    } else {
+      std::cerr << "[board_cpp-webui] open: http://" << host_ << ":" << port_ << "/\n";
+    }
+  }
+
+  void stop() {
+    if (!running_.load() && listen_fd_ < 0) {
+      return;
+    }
+    running_.store(false);
+    if (listen_fd_ >= 0) {
+      ::shutdown(listen_fd_, SHUT_RDWR);
+      ::close(listen_fd_);
+      listen_fd_ = -1;
+    }
+    sender_cv_.notify_all();
+    if (accept_thread_.joinable()) {
+      accept_thread_.join();
+    }
+    if (sender_thread_.joinable()) {
+      sender_thread_.join();
+    }
+    std::vector<int> json_clients;
+    std::vector<int> system_clients;
+    std::vector<int> frame_clients;
+    std::vector<int> mjpeg_clients;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      json_clients.swap(json_clients_);
+      system_clients.swap(system_clients_);
+      frame_clients.swap(frame_clients_);
+      mjpeg_clients.swap(mjpeg_clients_);
+    }
+    close_all(json_clients);
+    close_all(system_clients);
+    close_all(frame_clients);
+    close_all(mjpeg_clients);
+  }
+
+  bool has_frame_clients() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !frame_clients_.empty() || !mjpeg_clients_.empty();
+  }
+
+  void publish_json(const std::string& payload) {
+    if (!running_.load()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_json_ = payload;
+      json_dirty_ = true;
+    }
+    sender_cv_.notify_one();
+  }
+
+  void publish_system(const std::string& payload) {
+    if (!running_.load() || payload.empty()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_system_ = payload;
+      system_dirty_ = true;
+    }
+    sender_cv_.notify_one();
+  }
+
+  void publish_jpeg(const std::vector<uint8_t>& jpeg) {
+    if (!running_.load() || jpeg.empty()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_jpeg_ = jpeg;
+      jpeg_dirty_ = true;
+    }
+    sender_cv_.notify_one();
+  }
+
+ private:
+  static void close_all(const std::vector<int>& fds) {
+    for (int fd : fds) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+    }
+  }
+
+  void remove_failed(std::vector<int>& owned,
+                     const std::vector<int>& candidates,
+                     const std::vector<uint8_t>& payload) {
+    std::vector<int> failed;
+    for (int fd : candidates) {
+      if (!send_all_nonblocking(fd, payload)) {
+        failed.push_back(fd);
+      }
+    }
+    if (failed.empty()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int> kept;
+    kept.reserve(owned.size());
+    for (int fd : owned) {
+      if (std::find(failed.begin(), failed.end(), fd) == failed.end()) {
+        kept.push_back(fd);
+      } else {
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+      }
+    }
+    owned.swap(kept);
+  }
+
+  void sender_loop() {
+    while (true) {
+      std::string json_payload;
+      std::string system_payload;
+      std::vector<uint8_t> jpeg_payload;
+      std::vector<int> json_clients;
+      std::vector<int> system_clients;
+      std::vector<int> frame_clients;
+      std::vector<int> mjpeg_clients;
+      bool send_json = false;
+      bool send_system = false;
+      bool send_jpeg = false;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        sender_cv_.wait(lock, [&] {
+          return !running_.load() || json_dirty_ || system_dirty_ || jpeg_dirty_;
+        });
+        if (!running_.load() && !json_dirty_ && !system_dirty_ && !jpeg_dirty_) {
+          break;
+        }
+        if (json_dirty_) {
+          json_payload = latest_json_;
+          json_clients = json_clients_;
+          json_dirty_ = false;
+          send_json = !json_payload.empty() && !json_clients.empty();
+        }
+        if (system_dirty_) {
+          system_payload = latest_system_;
+          system_clients = system_clients_;
+          system_dirty_ = false;
+          send_system = !system_payload.empty() && !system_clients.empty();
+        }
+        if (jpeg_dirty_) {
+          jpeg_payload = latest_jpeg_;
+          frame_clients = frame_clients_;
+          mjpeg_clients = mjpeg_clients_;
+          jpeg_dirty_ = false;
+          send_jpeg = !jpeg_payload.empty() &&
+                      (!frame_clients.empty() || !mjpeg_clients.empty());
+        }
+      }
+
+      if (send_json) {
+        std::vector<uint8_t> frame = make_websocket_frame(
+            reinterpret_cast<const uint8_t*>(json_payload.data()), json_payload.size(), 0x2);
+        remove_failed(json_clients_, json_clients, frame);
+      }
+      if (send_system) {
+        std::vector<uint8_t> frame = make_websocket_frame(
+            reinterpret_cast<const uint8_t*>(system_payload.data()), system_payload.size(), 0x2);
+        remove_failed(system_clients_, system_clients, frame);
+      }
+      if (send_jpeg) {
+        if (!frame_clients.empty()) {
+          std::vector<uint8_t> frame = make_websocket_frame(
+              jpeg_payload.data(), jpeg_payload.size(), 0x2);
+          remove_failed(frame_clients_, frame_clients, frame);
+        }
+        if (!mjpeg_clients.empty()) {
+          std::ostringstream header;
+          header << "--frame\r\n"
+                 << "Content-Type: image/jpeg\r\n"
+                 << "Content-Length: " << jpeg_payload.size() << "\r\n\r\n";
+          const std::string header_text = header.str();
+          std::vector<uint8_t> chunk(header_text.begin(), header_text.end());
+          chunk.insert(chunk.end(), jpeg_payload.begin(), jpeg_payload.end());
+          chunk.push_back('\r');
+          chunk.push_back('\n');
+          remove_failed(mjpeg_clients_, mjpeg_clients, chunk);
+        }
+      }
+    }
+  }
+
+  void accept_loop() {
+    while (running_.load()) {
+      sockaddr_storage addr {};
+      socklen_t addr_len = sizeof(addr);
+      const int fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &addr_len);
+      if (fd < 0) {
+        if (running_.load() && errno != EINTR) {
+          std::cerr << "[board_cpp-webui] accept failed: " << std::strerror(errno) << "\n";
+        }
+        continue;
+      }
+      set_socket_recv_timeout(fd, 1000);
+      handle_client(fd);
+    }
+  }
+
+  void handle_client(int fd) {
+    std::string request;
+    char buffer[1024];
+    while (request.find("\r\n\r\n") == std::string::npos && request.size() < 8192) {
+      const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
+      if (n <= 0) {
+        ::close(fd);
+        return;
+      }
+      request.append(buffer, buffer + n);
+    }
+
+    const size_t first_line_end = request.find("\r\n");
+    const std::string first_line =
+        first_line_end == std::string::npos ? request : request.substr(0, first_line_end);
+    std::istringstream iss(first_line);
+    std::string method;
+    std::string path;
+    std::string version;
+    iss >> method >> path >> version;
+    if (method != "GET") {
+      send_simple_response(fd, "405 Method Not Allowed", "text/plain", "method not allowed");
+      ::close(fd);
+      return;
+    }
+    const size_t query_pos = path.find('?');
+    if (query_pos != std::string::npos) {
+      path = path.substr(0, query_pos);
+    }
+    const std::string upgrade = get_http_header(request, "Upgrade");
+    if (!upgrade.empty()) {
+      if (path == "/ws/inference") {
+        std::string latest;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          latest = latest_json_;
+        }
+        accept_websocket(fd, request, json_clients_, latest);
+        return;
+      }
+      if (path == "/ws/system") {
+        std::string latest;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          latest = latest_system_;
+        }
+        accept_websocket(fd, request, system_clients_, latest);
+        return;
+      }
+      if (path == "/ws/frame") {
+        accept_websocket(fd, request, frame_clients_, std::string());
+        return;
+      }
+      send_simple_response(fd, "404 Not Found", "text/plain", "not found");
+      ::close(fd);
+      return;
+    }
+    if (path == "/" || path == "/index.html") {
+      send_simple_response(fd, "200 OK", "text/html; charset=utf-8", index_html());
+      ::close(fd);
+      return;
+    }
+    if (path == "/inference/latest") {
+      std::string payload;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        payload = latest_json_;
+      }
+      if (payload.empty()) {
+        send_simple_response(fd, "503 Service Unavailable", "application/json",
+                             "{\"error\":\"no inference result yet\"}");
+      } else {
+        send_simple_response(fd, "200 OK", "application/json", payload);
+      }
+      ::close(fd);
+      return;
+    }
+    if (path == "/system/latest") {
+      std::string payload;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        payload = latest_system_;
+      }
+      if (payload.empty()) {
+        send_simple_response(fd, "503 Service Unavailable", "application/json",
+                             "{\"error\":\"no system load sample yet\"}");
+      } else {
+        send_simple_response(fd, "200 OK", "application/json", payload);
+      }
+      ::close(fd);
+      return;
+    }
+    if (path == "/video/infer") {
+      const std::string header =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+          "Cache-Control: no-store\r\n"
+          "Connection: close\r\n\r\n";
+      if (!send_all(fd, header)) {
+        ::close(fd);
+        return;
+      }
+      if (!set_fd_nonblocking(fd)) {
+        ::close(fd);
+        return;
+      }
+      set_socket_send_buffer(fd, 1024 * 1024);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        mjpeg_clients_.push_back(fd);
+      }
+      return;
+    }
+    send_simple_response(fd, "404 Not Found", "text/plain", "not found");
+    ::close(fd);
+  }
+
+  bool accept_websocket(int fd,
+                        const std::string& request,
+                        std::vector<int>& client_list,
+                        const std::string& latest_payload) {
+    const std::string key = get_http_header(request, "Sec-WebSocket-Key");
+    if (key.empty()) {
+      send_simple_response(fd, "400 Bad Request", "text/plain", "missing websocket key");
+      ::close(fd);
+      return false;
+    }
+    std::ostringstream response;
+    response << "HTTP/1.1 101 Switching Protocols\r\n"
+             << "Upgrade: websocket\r\n"
+             << "Connection: Upgrade\r\n"
+             << "Sec-WebSocket-Accept: " << websocket_accept_key(key) << "\r\n"
+             << "\r\n";
+    if (!send_all(fd, response.str())) {
+      ::close(fd);
+      return false;
+    }
+    if (!set_fd_nonblocking(fd)) {
+      ::close(fd);
+      return false;
+    }
+    set_socket_send_buffer(fd, 1024 * 1024);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      client_list.push_back(fd);
+    }
+    if (!latest_payload.empty()) {
+      std::vector<uint8_t> frame = make_websocket_frame(
+          reinterpret_cast<const uint8_t*>(latest_payload.data()), latest_payload.size(), 0x2);
+      if (!send_all_nonblocking(fd, frame)) {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          client_list.erase(std::remove(client_list.begin(), client_list.end(), fd),
+                            client_list.end());
+        }
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+      }
+    }
+    return true;
+  }
+
+  static void send_simple_response(int fd,
+                                   const std::string& status,
+                                   const std::string& content_type,
+                                   const std::string& body) {
+    std::ostringstream os;
+    os << "HTTP/1.1 " << status << "\r\n"
+       << "Content-Type: " << content_type << "\r\n"
+       << "Content-Length: " << body.size() << "\r\n"
+       << "Cache-Control: no-store\r\n"
+       << "Connection: close\r\n\r\n"
+       << body;
+    send_all(fd, os.str());
+  }
+
+  static std::string index_html() {
+    return R"HTML(<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MeetEye C++ WebUI</title>
+  <style>
+    body{margin:0;background:#101214;color:#e5e7eb;font-family:Arial,"Microsoft YaHei",sans-serif;}
+    header{height:48px;display:flex;align-items:center;gap:18px;padding:0 18px;background:#171b20;border-bottom:1px solid #2a313a;}
+    h1{font-size:18px;margin:0;font-weight:600;}
+    .status{font-size:13px;color:#9ca3af;}
+    main{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:8px;padding:8px;}
+    .view{background:#050608;border:1px solid #29313a;min-height:60vh;display:flex;align-items:center;justify-content:center;}
+    img{width:100%;height:auto;display:block;object-fit:contain;}
+    aside{background:#171b20;border:1px solid #29313a;padding:6px;overflow:auto;max-height:calc(100vh - 64px);}
+    h2{font-size:12px;margin:6px 0 4px;color:#f3f4f6;}
+    .metric-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin-bottom:6px;}
+    .metric{background:#0f1318;border:1px solid #29313a;padding:4px;min-height:30px;font-size:10px;}
+    .metric span{display:block;color:#9ca3af;white-space:nowrap;margin-bottom:2px;}
+    .metric b{display:block;font-size:13px;color:#f9fafb;white-space:nowrap;}
+    .grid{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin-bottom:5px;}
+    .card{background:#0f1318;border:1px solid #29313a;padding:4px;min-height:32px;}
+    .label{font-size:9px;color:#9ca3af;margin-bottom:2px;white-space:nowrap;}
+    .value{font-size:13px;font-weight:700;color:#f9fafb;white-space:nowrap;}
+    .bar{height:3px;background:#28313b;margin-top:3px;overflow:hidden;}
+    .fill{height:100%;width:0;background:#38bdf8;}
+    .warn .fill{background:#f59e0b;}
+    .hot .fill{background:#ef4444;}
+    .cores{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin-top:4px;}
+    .core{font-size:9px;color:#d1d5db;background:#0b0e12;border:1px solid #26303a;padding:2px;text-align:center;}
+    .sector-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:3px;margin:4px 0 6px;}
+    .sector{font-size:9px;line-height:1.25;color:#9ca3af;background:#0b0e12;border:1px solid #26303a;padding:3px;text-align:center;}
+    .sector.on{color:#fee2e2;border-color:#ef4444;background:#3a1010;box-shadow:inset 0 0 0 1px #ef4444;}
+    pre{white-space:pre-wrap;word-break:break-word;font-size:10px;line-height:1.3;color:#d1d5db;}
+    @media(max-width:900px){main{grid-template-columns:1fr;}aside{max-height:none;}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MeetEye C++ WebUI</h1>
+    <div class="status" id="status">连接中...</div>
+  </header>
+  <main>
+    <section class="view"><img id="infer" src="/video/infer" alt="等待推理画面"></section>
+    <aside>
+      <h2>运行状态</h2>
+      <div class="metric-grid">
+        <div class="metric"><span>帧号</span><b id="frame">-</b></div>
+        <div class="metric"><span>目标数</span><b id="count">-</b></div>
+        <div class="metric"><span>FPS</span><b id="fps">-</b></div>
+        <div class="metric"><span>JSON WS</span><b id="ws">-</b></div>
+        <div class="metric"><span>硬件 WS</span><b id="sysws">-</b></div>
+      </div>
+      <h2>硬件负载</h2>
+      <div class="grid">
+        <div class="card"><div class="label">CPU 总占用</div><div class="value" id="cpu">-</div><div class="bar"><div id="cpu-bar" class="fill"></div></div></div>
+        <div class="card"><div class="label">NPU 占用</div><div class="value" id="npu">-</div><div class="bar"><div id="npu-bar" class="fill"></div></div></div>
+        <div class="card"><div class="label">GPU 占用</div><div class="value" id="gpu">-</div><div class="bar"><div id="gpu-bar" class="fill"></div></div></div>
+        <div class="card"><div class="label">内存占用</div><div class="value" id="mem">-</div><div class="bar"><div id="mem-bar" class="fill"></div></div></div>
+        <div class="card"><div class="label">最高温度</div><div class="value" id="thermal">-</div><div class="bar"><div id="thermal-bar" class="fill"></div></div></div>
+        <div class="card"><div class="label">可用内存</div><div class="value" id="memfree">-</div></div>
+      </div>
+      <div class="cores" id="cores"></div>
+      <h2>扇区</h2>
+      <div class="sector-grid" id="sectorGrid"></div>
+      <h2>推理 JSON</h2>
+      <pre id="json">{}</pre>
+    </aside>
+  </main>
+  <script>
+    const statusEl=document.getElementById('status');
+    const wsEl=document.getElementById('ws');
+    const frameEl=document.getElementById('frame');
+    const countEl=document.getElementById('count');
+    const fpsEl=document.getElementById('fps');
+    const sysWsEl=document.getElementById('sysws');
+    const jsonEl=document.getElementById('json');
+    const coresEl=document.getElementById('cores');
+    const sectorGridEl=document.getElementById('sectorGrid');
+    function fmtPct(v){return Number.isFinite(v)?`${v.toFixed(1)}%`:'-';}
+    function fmtFreq(v){return Number.isFinite(v)&&v>0?`${(v/1000000).toFixed(0)}MHz`:'';}
+    function fmtDeg(v){
+      if(v===null||v===undefined)return '-';
+      const n=Number(v);
+      return Number.isFinite(n)?`${n.toFixed(0)}°`:'-';
+    }
+    function setMetric(id,barId,value,suffix='%',extra=''){
+      const el=document.getElementById(id);
+      const bar=document.getElementById(barId);
+      if(!Number.isFinite(value)){el.textContent='-'; if(bar)bar.style.width='0%'; return;}
+      el.textContent=`${value.toFixed(1)}${suffix}${extra}`;
+      if(bar)bar.style.width=`${Math.max(0,Math.min(100,value))}%`;
+    }
+    function connect(){
+      const proto=location.protocol==='https:'?'wss':'ws';
+      const ws=new WebSocket(`${proto}://${location.host}/ws/inference`);
+      ws.binaryType='arraybuffer';
+      ws.onopen=()=>{statusEl.textContent='已连接';wsEl.textContent='online';};
+      ws.onclose=()=>{statusEl.textContent='已断开，重连中...';wsEl.textContent='offline';setTimeout(connect,1000);};
+      ws.onerror=()=>{statusEl.textContent='连接异常';};
+      ws.onmessage=(ev)=>{
+        const decode=(data)=> data instanceof ArrayBuffer ? new TextDecoder().decode(data) : data;
+        const text=decode(ev.data);
+        try{
+          const obj=JSON.parse(text);
+          frameEl.textContent=obj.frame_id ?? '-';
+          if(obj.fps && Number.isFinite(obj.fps.average)){fpsEl.textContent=obj.fps.average.toFixed(1);}
+          if(obj.targets){
+            const entries=Object.entries(obj.targets).sort((a,b)=>Number(a[0])-Number(b[0]));
+            countEl.textContent=entries.length;
+            sectorGridEl.style.gridTemplateColumns=`repeat(${Math.max(1,Math.min(4,entries.length||1))},1fr)`;
+            sectorGridEl.innerHTML=entries.map(([k,t])=>{
+              const az=fmtDeg(t&&t.azimuth);
+              const el=fmtDeg(t&&t.elevation);
+              return `<div class="sector on">ID${k}<br><b>A ${az}</b><br><b>E ${el}</b></div>`;
+            }).join('');
+          }
+          else if(obj.sectors){
+            const keys=Object.keys(obj.sectors).sort((a,b)=>Number(a)-Number(b));
+            countEl.textContent=Object.values(obj.sectors).filter(s=>s.has_target).length;
+            sectorGridEl.style.gridTemplateColumns=`repeat(${Math.max(1,keys.length)},1fr)`;
+            sectorGridEl.innerHTML=keys.map(k=>{
+              const s=obj.sectors[k]||{};
+              const az=fmtDeg(s.azimuth);
+              const el=fmtDeg(s.elevation);
+              return `<div class="sector ${s.has_target?'on':''}">S${k}<br><b>A ${az}</b><br><b>E ${el}</b></div>`;
+            }).join('');
+          }
+          jsonEl.textContent=JSON.stringify(obj,null,2);
+        }catch(e){jsonEl.textContent=text;}
+      };
+    }
+    function connectSystem(){
+      const proto=location.protocol==='https:'?'wss':'ws';
+      const ws=new WebSocket(`${proto}://${location.host}/ws/system`);
+      ws.binaryType='arraybuffer';
+      ws.onopen=()=>{sysWsEl.textContent='online';};
+      ws.onclose=()=>{sysWsEl.textContent='offline';setTimeout(connectSystem,1000);};
+      ws.onerror=()=>{sysWsEl.textContent='error';};
+      ws.onmessage=(ev)=>{
+        const decode=(data)=> data instanceof ArrayBuffer ? new TextDecoder().decode(data) : data;
+        try{
+          const obj=JSON.parse(decode(ev.data));
+          setMetric('cpu','cpu-bar',obj.cpu_percent);
+          setMetric('npu','npu-bar',obj.npu_percent,'%',fmtFreq(obj.npu_freq_hz)?` ${fmtFreq(obj.npu_freq_hz)}`:'');
+          setMetric('gpu','gpu-bar',obj.gpu_percent,'%',fmtFreq(obj.gpu_freq_hz)?` ${fmtFreq(obj.gpu_freq_hz)}`:'');
+          setMetric('mem','mem-bar',obj.memory_percent);
+          setMetric('thermal','thermal-bar',obj.thermal_max_c,'°C');
+          document.getElementById('memfree').textContent=Number.isFinite(obj.memory_available_mb)?`${obj.memory_available_mb.toFixed(0)}MB`:'-';
+          if(Array.isArray(obj.cpu_per_core_percent)){
+            coresEl.innerHTML=obj.cpu_per_core_percent.map((v,i)=>`<div class="core">C${i} <b>${fmtPct(v)}</b></div>`).join('');
+          }
+        }catch(e){}
+      };
+    }
+    connect();
+    connectSystem();
+  </script>
+</body>
+</html>)HTML";
+  }
+
+  std::string host_;
+  int port_ = 0;
+  int listen_fd_ = -1;
+  std::atomic<bool> running_{false};
+  std::thread accept_thread_;
+  std::thread sender_thread_;
+  mutable std::mutex mutex_;
+  std::condition_variable sender_cv_;
+  std::vector<int> json_clients_;
+  std::vector<int> system_clients_;
+  std::vector<int> frame_clients_;
+  std::vector<int> mjpeg_clients_;
+  std::string latest_json_;
+  std::string latest_system_;
+  std::vector<uint8_t> latest_jpeg_;
+  bool json_dirty_ = false;
+  bool system_dirty_ = false;
+  bool jpeg_dirty_ = false;
+};
+
+class AsyncWebUiFramePublisher {
+ public:
+  AsyncWebUiFramePublisher(const Config& cfg,
+                           const MeetEyeRuntime& runtime,
+                           BoardWebUiServer* webui_server)
+      : cfg_(cfg), runtime_(runtime), webui_server_(webui_server) {}
+
+  ~AsyncWebUiFramePublisher() { stop(); }
+
+  void start() {
+    if (running_.load()) {
+      return;
+    }
+    running_.store(true);
+    worker_ = std::thread(&AsyncWebUiFramePublisher::run_loop, this);
+  }
+
+  void stop() {
+    if (!running_.load()) {
+      return;
+    }
+    running_.store(false);
+    cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  bool submit(const Image& source,
+              const FrameResult& result,
+              const std::vector<TargetInfo>& targets,
+              const FrameRateStats& fps) {
+    if (!running_.load() || webui_server_ == nullptr || !webui_server_->has_frame_clients()) {
+      return false;
+    }
+    std::unique_ptr<Job> job(new Job);
+    job->source = source;
+    job->result = result;
+    job->targets = targets;
+    job->fps = fps;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_job_ = std::move(job);
+    }
+    cv_.notify_one();
+    return true;
+  }
+
+ private:
+  struct Job {
+    Image source;
+    FrameResult result;
+    std::vector<TargetInfo> targets;
+    FrameRateStats fps;
+  };
+
+  void run_loop() {
+    TurboJpegEncoder encoder;
+    while (true) {
+      std::unique_ptr<Job> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] {
+          return !running_.load() || latest_job_ != nullptr;
+        });
+        if (!running_.load() && latest_job_ == nullptr) {
+          break;
+        }
+        job = std::move(latest_job_);
+      }
+      if (!job || webui_server_ == nullptr || !webui_server_->has_frame_clients()) {
+        continue;
+      }
+      Image annotated = remap_panorama_cpu(
+          job->source, runtime_.meta(), runtime_.base_map_x(), runtime_.base_map_y());
+      draw_annotation(annotated, cfg_, job->result, job->targets, job->fps);
+      const std::vector<uint8_t> jpeg =
+          encoder.encode_bgr(annotated, cfg_.webui_jpeg_quality);
+      webui_server_->publish_jpeg(jpeg);
+    }
+  }
+
+  const Config& cfg_;
+  const MeetEyeRuntime& runtime_;
+  BoardWebUiServer* webui_server_ = nullptr;
+  std::atomic<bool> running_{false};
+  std::thread worker_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::unique_ptr<Job> latest_job_;
+};
+
 class WebSocketServer {
  public:
   WebSocketServer(const std::string& host, int port, const std::string& path)
@@ -3726,6 +5905,7 @@ class WebSocketServer {
     }
     listen_fd_ = create_listen_socket();
     running_.store(true);
+    sender_thread_ = std::thread(&WebSocketServer::sender_loop, this);
     accept_thread_ = std::thread(&WebSocketServer::accept_loop, this);
     std::cerr << "[board_cpp-ws] JSON WebSocket listening: ws://" << host_ << ":"
               << port_ << path_ << "\n";
@@ -3741,8 +5921,12 @@ class WebSocketServer {
       ::close(listen_fd_);
       listen_fd_ = -1;
     }
+    sender_cv_.notify_all();
     if (accept_thread_.joinable()) {
       accept_thread_.join();
+    }
+    if (sender_thread_.joinable()) {
+      sender_thread_.join();
     }
     std::vector<int> clients;
     {
@@ -3759,25 +5943,12 @@ class WebSocketServer {
     if (!running_.load()) {
       return;
     }
-    std::vector<int> clients;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_payload_ = payload;
-      clients = clients_;
+      payload_dirty_ = true;
     }
-    if (clients.empty()) {
-      return;
-    }
-    std::vector<uint8_t> frame = make_frame(payload);
-    std::vector<int> failed;
-    for (int fd : clients) {
-      if (!send_all(fd, frame.data(), frame.size())) {
-        failed.push_back(fd);
-      }
-    }
-    if (!failed.empty()) {
-      remove_clients(failed);
-    }
+    sender_cv_.notify_one();
   }
 
  private:
@@ -3803,7 +5974,7 @@ class WebSocketServer {
       }
       int one = 1;
       setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-      if (::bind(fd, rp->ai_addr, rp->ai_addrlen) == 0 && ::listen(fd, 8) == 0) {
+      if (::bind(fd, rp->ai_addr, rp->ai_addrlen) == 0 && ::listen(fd, 16) == 0) {
         break;
       }
       ::close(fd);
@@ -3828,6 +5999,7 @@ class WebSocketServer {
         }
         continue;
       }
+      set_socket_recv_timeout(fd, 1000);
       if (!handle_handshake(fd)) {
         ::close(fd);
         continue;
@@ -3838,11 +6010,48 @@ class WebSocketServer {
         clients_.push_back(fd);
         latest = latest_payload_;
       }
+      if (!set_fd_nonblocking(fd)) {
+        remove_clients(std::vector<int>{fd});
+        continue;
+      }
+      set_socket_send_buffer(fd, 1024 * 1024);
       if (!latest.empty()) {
         std::vector<uint8_t> frame = make_frame(latest);
-        if (!send_all(fd, frame.data(), frame.size())) {
+        if (!send_all_nonblocking(fd, frame)) {
           remove_clients(std::vector<int>{fd});
         }
+      }
+    }
+  }
+
+  void sender_loop() {
+    while (true) {
+      std::string payload;
+      std::vector<int> clients;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        sender_cv_.wait(lock, [&] {
+          return !running_.load() || payload_dirty_;
+        });
+        if (!running_.load() && !payload_dirty_) {
+          break;
+        }
+        payload = latest_payload_;
+        clients = clients_;
+        payload_dirty_ = false;
+      }
+      if (payload.empty() || clients.empty()) {
+        continue;
+      }
+      const std::vector<uint8_t> frame = make_frame(payload);
+      std::vector<int> failed;
+      for (int fd : clients) {
+        if (!send_all_nonblocking(fd, frame)) {
+          failed.push_back(fd);
+        }
+      }
+      if (!failed.empty()) {
+        remove_clients(failed);
       }
     }
   }
@@ -3925,9 +6134,12 @@ class WebSocketServer {
   int listen_fd_ = -1;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  std::thread sender_thread_;
   std::mutex mutex_;
+  std::condition_variable sender_cv_;
   std::vector<int> clients_;
   std::string latest_payload_;
+  bool payload_dirty_ = false;
 };
 
 static void write_outputs(const Config& cfg,
@@ -3936,6 +6148,10 @@ static void write_outputs(const Config& cfg,
                           std::ofstream& jsonl,
                           std::ofstream& debug_jsonl,
                           WebSocketServer* ws_server,
+                          BoardWebUiServer* webui_server,
+                          AsyncWebUiFramePublisher* webui_frame_publisher,
+                          SystemLoadSampler* system_sampler,
+                          const Image* source_image,
                           FrameResult& result,
                           const FrameRateStats& fps,
                           int frame_id,
@@ -3947,7 +6163,7 @@ static void write_outputs(const Config& cfg,
   result.profile_ms[kProfileAngleTargets] = (t1 - t0) * 1000.0;
 
   t0 = steady_seconds();
-  const std::string payload = build_output_json(cfg, targets, frame_id, result);
+  const std::string payload = build_output_json(cfg, targets, frame_id, result, fps);
   t1 = steady_seconds();
   result.profile_ms[kProfileBuildPayload] = (t1 - t0) * 1000.0;
 
@@ -3976,6 +6192,18 @@ static void write_outputs(const Config& cfg,
     t1 = steady_seconds();
     result.profile_ms[kProfileWebSocket] = (t1 - t0) * 1000.0;
   }
+  if (webui_server != nullptr) {
+    t0 = steady_seconds();
+    webui_server->publish_json(payload);
+    if (system_sampler != nullptr) {
+      webui_server->publish_system(system_sampler->latest_json());
+    }
+    if (webui_frame_publisher != nullptr && source_image != nullptr) {
+      webui_frame_publisher->submit(*source_image, result, targets, fps);
+    }
+    t1 = steady_seconds();
+    result.profile_ms[kProfileWebSocket] += (t1 - t0) * 1000.0;
+  }
   if (debug_jsonl) {
     t0 = steady_seconds();
     print_result_jsonl(debug_jsonl, runtime.meta(), runtime.channels(), runtime.anchors(), result, fps);
@@ -3983,6 +6211,74 @@ static void write_outputs(const Config& cfg,
     result.profile_ms[kProfileDebugJsonl] = (t1 - t0) * 1000.0;
   }
   result.profile_ms[kProfileWriteOutputs] = (steady_seconds() - write_start_s) * 1000.0;
+}
+
+static void finish_and_write_frame(const Config& cfg,
+                                   const MeetEyeRuntime& runtime,
+                                   AngleAndDistanceRuntime& angle_runtime,
+                                   NativeHybridSortTracker* tracker,
+                                   std::ofstream& jsonl,
+                                   std::ofstream& debug_jsonl,
+                                   WebSocketServer* ws_server,
+                                   BoardWebUiServer* webui_server,
+                                   AsyncWebUiFramePublisher* webui_frame_publisher,
+                                   SystemLoadSampler* system_sampler,
+                                   PreparedStagingFrame& frame,
+                                   int& frame_id,
+                                   double run_start_s,
+                                   ProfileSummary& profile_summary,
+                                   bool& first_stdout) {
+  FrameResult& result = frame.result;
+  result.profile_ms[kProfileFileRead] = frame.file_read_ms;
+  result.profile_ms[kProfileCameraRead] = frame.camera_read_ms;
+  result.profile_ms[kProfileJpegDecode] = frame.jpeg_decode_ms;
+  result.profile_ms[kProfileDecodeWait] = frame.decode_wait_ms;
+  result.profile_ms[kProfileDecode] =
+      frame.file_read_ms + frame.camera_read_ms + frame.jpeg_decode_ms;
+
+  double t0 = steady_seconds();
+  if (tracker != nullptr) {
+    tracker->update(result);
+    const double t1 = steady_seconds();
+    result.profile_ms[kProfileTrackerOuter] = (t1 - t0) * 1000.0;
+  } else {
+    result.raw_detection_count = result.detection_count;
+    result.track_ids.assign(static_cast<size_t>(result.detection_count), -1);
+  }
+
+  frame_id += 1;
+  const double now_s = steady_seconds();
+  FrameRateStats fps;
+  fps.frame_ms = (now_s - frame.frame_start_s) * 1000.0;
+  fps.instant_fps = fps.frame_ms > 0.0 ? 1000.0 / fps.frame_ms : 0.0;
+  fps.elapsed_s = std::max(0.0, now_s - run_start_s);
+  fps.frames = frame_id;
+  fps.average_fps = fps.elapsed_s > 0.0 ? static_cast<double>(fps.frames) / fps.elapsed_s : 0.0;
+  result.profile_ms[kProfileFrameTotal] = fps.frame_ms;
+
+  if (cfg.print_profile_summary) {
+    profile_summary.add(result, fps);
+    if (cfg.profile_interval > 0 && frame_id % cfg.profile_interval == 0) {
+      profile_summary.print(std::cerr, "running");
+    }
+  }
+
+  write_outputs(
+      cfg,
+      runtime,
+      angle_runtime,
+      jsonl,
+      debug_jsonl,
+      ws_server,
+      webui_server,
+      webui_frame_publisher,
+      system_sampler,
+      &frame.image,
+      result,
+      fps,
+      frame_id,
+      first_stdout);
+  first_stdout = false;
 }
 
 static int run(Config cfg) {
@@ -4016,6 +6312,30 @@ static int run(Config cfg) {
     ws_server.reset(new WebSocketServer(cfg.ws_host, cfg.ws_port, cfg.ws_path));
     ws_server->start();
   }
+  std::unique_ptr<BoardWebUiServer> webui_server;
+  std::unique_ptr<AsyncWebUiFramePublisher> webui_frame_publisher;
+  if (cfg.webui) {
+    webui_server.reset(new BoardWebUiServer(cfg.webui_host, cfg.webui_port));
+    webui_server->start();
+    webui_frame_publisher.reset(
+        new AsyncWebUiFramePublisher(cfg, runtime, webui_server.get()));
+    webui_frame_publisher->start();
+  }
+
+  std::string system_profile_path;
+  std::unique_ptr<SystemLoadSampler> system_sampler;
+  if (cfg.profile_system_load || cfg.webui) {
+    if (cfg.profile_system_load) {
+      system_profile_path = system_profile_path_for(cfg);
+    }
+    system_sampler.reset(new SystemLoadSampler(cfg.system_load_interval_ms, system_profile_path));
+    system_sampler->start();
+    std::cerr << "[system-load] background sampler enabled: interval="
+              << cfg.system_load_interval_ms << "ms\n";
+    if (!system_profile_path.empty()) {
+      std::cerr << "[system-load] profile JSONL: " << system_profile_path << "\n";
+    }
+  }
 
   bool first_stdout = true;
   int frame_id = 0;
@@ -4026,6 +6346,81 @@ static int run(Config cfg) {
   if (cfg.decode_prefetch && !cfg.image_paths.empty()) {
     image_prefetcher.reset(new ImageDecodePrefetcher(cfg.image_paths));
   }
+  if (cfg.staging_pipeline && !cfg.image_paths.empty()) {
+    auto load_prepared_image = [&](size_t i) -> PreparedStagingFrame {
+      PreparedStagingFrame frame;
+      frame.frame_start_s = steady_seconds();
+      double t0 = steady_seconds();
+      double t1 = t0;
+      if (image_prefetcher) {
+        t0 = steady_seconds();
+        DecodedFrame decoded = image_prefetcher->pop();
+        t1 = steady_seconds();
+        frame.decode_wait_ms = (t1 - t0) * 1000.0;
+        frame.image_path = decoded.image_path;
+        frame.image = std::move(decoded.image);
+        frame.file_read_ms = decoded.file_read_ms;
+        frame.jpeg_decode_ms = decoded.jpeg_decode_ms;
+        frame.frame_index = static_cast<int>(i);
+      } else {
+        frame.image_path = cfg.image_paths[i];
+        frame.frame_index = static_cast<int>(i);
+        t0 = steady_seconds();
+        const std::vector<uint8_t> jpeg = read_bytes(frame.image_path);
+        t1 = steady_seconds();
+        frame.file_read_ms = (t1 - t0) * 1000.0;
+        t0 = steady_seconds();
+        frame.image = jpeg_decoder.decode_buffer(jpeg.data(), jpeg.size());
+        t1 = steady_seconds();
+        frame.jpeg_decode_ms = (t1 - t0) * 1000.0;
+      }
+      return runtime.prepare_staging_frame(std::move(frame));
+    };
+
+    PreparedStagingFrame pending = load_prepared_image(0);
+    for (size_t i = 1; i < cfg.image_paths.size(); ++i) {
+      std::future<PreparedStagingFrame> current_future =
+          runtime.start_staging_inference(std::move(pending));
+      PreparedStagingFrame next = load_prepared_image(i);
+      PreparedStagingFrame done = current_future.get();
+      finish_and_write_frame(
+          cfg,
+          runtime,
+          angle_runtime,
+          tracker.get(),
+          jsonl,
+          debug_jsonl,
+          ws_server.get(),
+          webui_server.get(),
+          webui_frame_publisher.get(),
+          system_sampler.get(),
+          done,
+          frame_id,
+          run_start_s,
+          profile_summary,
+          first_stdout);
+      pending = std::move(next);
+    }
+    std::future<PreparedStagingFrame> current_future =
+        runtime.start_staging_inference(std::move(pending));
+    PreparedStagingFrame done = current_future.get();
+    finish_and_write_frame(
+        cfg,
+        runtime,
+        angle_runtime,
+        tracker.get(),
+        jsonl,
+        debug_jsonl,
+        ws_server.get(),
+        webui_server.get(),
+        webui_frame_publisher.get(),
+        system_sampler.get(),
+        done,
+        frame_id,
+        run_start_s,
+        profile_summary,
+        first_stdout);
+  } else {
   for (size_t i = 0; i < cfg.image_paths.size(); ++i) {
     const double frame_start_s = steady_seconds();
     std::string image_path;
@@ -4092,17 +6487,84 @@ static int run(Config cfg) {
         jsonl,
         debug_jsonl,
         ws_server.get(),
+        webui_server.get(),
+          webui_frame_publisher.get(),
+        system_sampler.get(),
+        &image,
         result,
         fps,
         frame_id,
         first_stdout);
     first_stdout = false;
   }
+  }
 
   if (!cfg.camera_device.empty()) {
     if (cfg.camera_prefetch) {
       CameraDecodePrefetcher camera_prefetcher(cfg);
-      for (int i = 0; i < cfg.max_frames; ++i) {
+      if (cfg.staging_pipeline) {
+        auto load_prepared_camera = [&]() -> PreparedStagingFrame {
+          PreparedStagingFrame frame;
+          frame.frame_start_s = steady_seconds();
+          const double t0 = steady_seconds();
+          DecodedFrame decoded = camera_prefetcher.pop();
+          const double t1 = steady_seconds();
+          frame.decode_wait_ms = (t1 - t0) * 1000.0;
+          frame.image_path = decoded.image_path;
+          frame.image = std::move(decoded.image);
+          frame.frame_index = static_cast<int>(decoded.index);
+          frame.camera_read_ms = decoded.camera_read_ms;
+          frame.jpeg_decode_ms = decoded.jpeg_decode_ms;
+          return runtime.prepare_staging_frame(std::move(frame));
+        };
+
+        PreparedStagingFrame pending = load_prepared_camera();
+        for (int i = 1; cfg.max_frames == 0 || i < cfg.max_frames; ++i) {
+          std::future<PreparedStagingFrame> current_future =
+              runtime.start_staging_inference(std::move(pending));
+          PreparedStagingFrame next = load_prepared_camera();
+          PreparedStagingFrame done = current_future.get();
+          finish_and_write_frame(
+              cfg,
+              runtime,
+              angle_runtime,
+              tracker.get(),
+              jsonl,
+              debug_jsonl,
+              ws_server.get(),
+              webui_server.get(),
+              webui_frame_publisher.get(),
+              system_sampler.get(),
+              done,
+              frame_id,
+              run_start_s,
+              profile_summary,
+              first_stdout);
+          pending = std::move(next);
+        }
+        if (cfg.max_frames > 0) {
+          std::future<PreparedStagingFrame> current_future =
+              runtime.start_staging_inference(std::move(pending));
+          PreparedStagingFrame done = current_future.get();
+          finish_and_write_frame(
+              cfg,
+              runtime,
+              angle_runtime,
+              tracker.get(),
+              jsonl,
+              debug_jsonl,
+              ws_server.get(),
+              webui_server.get(),
+              webui_frame_publisher.get(),
+              system_sampler.get(),
+              done,
+              frame_id,
+              run_start_s,
+              profile_summary,
+              first_stdout);
+        }
+      } else {
+      for (int i = 0; cfg.max_frames == 0 || i < cfg.max_frames; ++i) {
         const double frame_start_s = steady_seconds();
         double t0 = steady_seconds();
         DecodedFrame decoded = camera_prefetcher.pop();
@@ -4148,11 +6610,16 @@ static int run(Config cfg) {
             jsonl,
             debug_jsonl,
             ws_server.get(),
+            webui_server.get(),
+            webui_frame_publisher.get(),
+            system_sampler.get(),
+            &decoded.image,
             result,
             fps,
             frame_id,
             first_stdout);
         first_stdout = false;
+      }
       }
     } else {
       V4L2MjpegCamera camera(
@@ -4164,7 +6631,7 @@ static int run(Config cfg) {
           cfg.camera_timeout_ms);
       camera.open();
 
-      for (int i = 0; i < cfg.max_frames; ++i) {
+      for (int i = 0; cfg.max_frames == 0 || i < cfg.max_frames; ++i) {
         const double frame_start_s = steady_seconds();
         double t0 = steady_seconds();
         V4L2MjpegCamera::Frame frame = camera.read_frame();
@@ -4222,6 +6689,10 @@ static int run(Config cfg) {
             jsonl,
             debug_jsonl,
             ws_server.get(),
+            webui_server.get(),
+            webui_frame_publisher.get(),
+            system_sampler.get(),
+            &image,
             result,
             fps,
             frame_id,
@@ -4233,6 +6704,15 @@ static int run(Config cfg) {
 
   if (cfg.print_profile_summary) {
     profile_summary.print(std::cerr, "final");
+  }
+  if (system_sampler) {
+    system_sampler->stop();
+    const double elapsed_s = std::max(0.0, steady_seconds() - run_start_s);
+    write_system_load_summary(
+        system_profile_path,
+        !cfg.debug_jsonl_path.empty() ? cfg.debug_jsonl_path : cfg.output_jsonl_path,
+        elapsed_s,
+        frame_id);
   }
 
   return 0;
