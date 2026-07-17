@@ -613,6 +613,7 @@ struct Track {
 
   void update(const std::array<double, 5>& bbox) {
     bool kf_damp = false;
+    const bool low_score_update = bbox[4] < p.det_thresh;
     if (box_sum(last_observation) >= 0.0) {
       std::array<double, 5> previous_box{};
       bool previous_found = false;
@@ -657,7 +658,7 @@ struct Track {
         store_normalized_pair(&velocity_lb, speeds_sum[4], speeds_sum[5]);
         store_normalized_pair(&velocity_rb, speeds_sum[6], speeds_sum[7]);
         has_velocity = true;
-      } else if (has_velocity) {
+      } else if (has_velocity && !low_score_update) {
         for (int i = 0; i < 2; ++i) {
           velocity_lt[i] *= 0.3;
           velocity_rt[i] *= 0.3;

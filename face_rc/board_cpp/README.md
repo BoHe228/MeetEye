@@ -187,7 +187,7 @@ bash run_smoke.sh --image frame.jpg
 ```bash
 bash run_smoke.sh \
   --image-list test_frames/frames.txt \
-  --track-buffer 120 \
+  --track-buffer 1000 \
   --output-jsonl board_cpp_results.jsonl \
   --no-stdout-json
 ```
@@ -197,7 +197,7 @@ bash run_smoke.sh \
 ```bash
 bash run_smoke.sh \
   --image-list test_frames/frames.txt \
-  --track-buffer 120 \
+  --track-buffer 1000 \
   --decode-prefetch \
   --output-jsonl board_cpp_targets.jsonl \
   --debug-jsonl board_cpp_debug.jsonl \
@@ -208,6 +208,17 @@ bash run_smoke.sh \
 debug JSONL 会在 `fps` 和 `timings_ms` 里写入运行帧率信息：
 `fps.instant`、`fps.average`、`fps.frame_ms`。
 
+跟踪排查时，debug JSONL 还会写入 `tracker_debug`：
+
+- `tracker_debug.snapshots`：底层 native tracker 当前保留的 raw track，包括
+  `raw_id`、`public_id`、`time_since_update`、`last_observation`、Kalman `state`，
+  以及是否还能作为 `lost_confirmed` 继承候选。
+- `tracker_debug.short_inherit`：旧 raw track 仍在有效候选时的短暂遮挡继承判断，
+  记录每个候选 old raw 的中心距离、尺寸分数和过滤原因。
+- `tracker_debug.public_recover`：旧 raw track 已不在有效候选时，使用 public 历史
+  位置兜底恢复的判断，记录 local single target、missing frames、strict/relaxed
+  gate 是否通过和最终结果。
+
 参数说明：
 
 - `--print-profile-summary`：在终端 stderr 打印各阶段平均耗时和最大耗时。
@@ -216,15 +227,42 @@ debug JSONL 会在 `fps` 和 `timings_ms` 里写入运行帧率信息：
 - `--system-load-interval-ms N`：硬件采样间隔，默认 200 ms，最小 50 ms。
 - `--decode-prefetch`：图片列表模式下用 worker 线程提前读取和解码下一帧，
   让 JPEG 解码与 RKNN/OpenCL 推理重叠。
-- `--track-buffer N`：跟踪器内部保留丢失 track 的最大帧数。
+- `--track-buffer N`：跟踪器内部保留丢失 track 的最大帧数，默认 `1000`。
 - `--lost-velocity-decay VALUE`：目标丢失后，每帧将 Kalman 预测速度和方向速度
   乘以该系数，默认 `0.85`；设为 `1.0` 等于保持原常速度预测。
 - `--inherit-center-dist-thresh VALUE`：短暂遮挡 ID 继承的中心距离阈值，单位是
   平均框高，默认 `1.0`；设为 `0` 基本关闭短暂遮挡继承。
+- `--inherit-multi-target-center-dist-thresh VALUE`：当新框附近还有其他当前目标时，
+  短暂遮挡继承会自动使用这个更严格的中心距离阈值，默认 `1.2`，用于降低多人靠近
+  时的冒领 ID 风险。
 - `--inherit-size-ratio-thresh VALUE`：短暂遮挡 ID 继承的尺寸比例阈值，默认
   `0.5`；新框和旧观测框/Kalman 框大小差太多时不继承。
 - `--inherit-ambiguity-margin VALUE`：短暂遮挡 ID 继承的唯一最佳候选阈值，默认
   `0.25`；最近候选和第二近候选距离差太小时不继承。
+- `--public-recover-center-dist-thresh VALUE`：旧 raw track 已不在有效候选时，
+  使用最近 public ID 记录做低歧义恢复的中心距离阈值，默认 `2.0`。只有当前新框
+  附近没有第二个当前目标时才会使用这个放宽阈值。
+- `--public-recover-max-frames N`：低歧义 public ID 恢复的最大丢失帧数，默认
+  `1000`；超过该窗口后不再用旧 public ID 兜底恢复。
+- `--display-id-reuse`：开启输出层 display ID 复用池。内部仍使用 public ID 做
+  跟踪、遮挡继承和边界恢复；最终输出会把 `id`/WebUI 标签显示为可复用的
+  `display_id`，并同时保留原始 `public_id`。目标消失并不再输出后，其
+  `display_id` 会进入空闲池。后续新 public ID 会先尝试复用最近消失、空间位置
+  也接近、bbox 尺寸相近且无歧义的 `display_id`；如果找不到合适候选，再复用
+  最小空闲编号。默认关闭，关闭时输出逻辑与原 public ID 行为一致。该模式不会
+  为了强行连续而重编号仍在输出中的目标；如果需要每帧严格压缩成 `1..N`，应单独
+  实现 compact display 模式。
+- `--no-display-id-reuse-spatial`：关闭 display ID 的空间优先复用，退回到直接复用
+  最小空闲编号。
+- `--display-id-reuse-max-frames N`：display ID 空间复用的最大回看帧数，默认
+  `1000`。
+- `--display-id-reuse-center-thresh VALUE`：display ID 空间复用的中心距离阈值，
+  单位为平均框高，默认 `2.0`。
+- `--display-id-reuse-size-ratio VALUE`：display ID 空间复用的尺寸比例阈值，默认
+  `0.4`。
+- `--display-id-reuse-ambiguity-margin VALUE`：display ID 空间复用的唯一最佳候选
+  阈值，默认 `0.25`；最近候选和第二近候选差距太小时不按空间复用，改走最小空闲
+  编号兜底。
 - `--smooth-bbox-alpha VALUE`：跟踪框 EMA 防抖系数，默认 `0.5`；检测框抖动明显
   时可先试 `0.7`，数值越大越稳但跟随移动越慢。
 - `--no-smooth-bbox`：关闭跟踪框 EMA 平滑。
@@ -268,11 +306,14 @@ bash run_smoke.sh \
   --camera-width 1920 \
   --camera-height 1080 \
   --camera-fps 30 \
-  --track-buffer 120 \
+  --track-buffer 1000 \
   --lost-velocity-decay 0.85 \
   --inherit-center-dist-thresh 1.0 \
+  --inherit-multi-target-center-dist-thresh 1.2 \
   --inherit-size-ratio-thresh 0.5 \
   --inherit-ambiguity-margin 0.25 \
+  --public-recover-center-dist-thresh 2.0 \
+  --public-recover-max-frames 1000 \
   --smooth-bbox-alpha 0.7 \
   --output-jsonl camera_results.jsonl \
   --no-stdout-json
@@ -320,9 +361,10 @@ bash run_smoke.sh \
   --camera-width 1920 \
   --camera-height 1080 \
   --camera-fps 30 \
-  --track-buffer 120 \
+  --track-buffer 1000 \
   --lost-velocity-decay 0.85 \
   --inherit-center-dist-thresh 1.0 \
+  --inherit-multi-target-center-dist-thresh 1.2 \
   --inherit-size-ratio-thresh 0.5 \
   --inherit-ambiguity-margin 0.25 \
   --smooth-bbox-alpha 0.7 \
@@ -399,7 +441,7 @@ JSONL 和 WebSocket payload 会从 `targets` 切换为 Python 板端使用的扇
 ```bash
 bash run_smoke.sh \
   --image-list test_frames/frames_3s.txt \
-  --track-buffer 120 \
+  --track-buffer 1000 \
   --sector-output \
   --num-sectors 8 \
   --ws-host 0.0.0.0 \
@@ -428,10 +470,30 @@ C++ 跟踪输出默认还会执行一层保守的最终空间/边界去重。它
 --final-boundary-dedup-iou 0.70
 --final-boundary-dedup-center 0.80
 --final-boundary-dedup-size 0.25
+--min-box-width 12
+--min-box-height 12
+--min-box-aspect-ratio 0.35
+--no-close-small-dedup
+--close-small-dedup-center 0.70
+--close-small-dedup-max-area 1800
+--close-small-dedup-max-side 55
+--close-small-dedup-iou 0.10
+--no-normal-duplicate-dedup
+--normal-duplicate-center 0.25
+--normal-duplicate-abs-center-px 22
+--normal-duplicate-size-ratio 0.70
+--normal-duplicate-iou 0.25
+--normal-duplicate-cover 0.60
 ```
 
 不要为了强行匹配目标总数而过度降低这些阈值。当前 3 秒对比里，很多 C++ 多出的
 行是低分短 track，不一定是重叠重复框；过松的边界邻居规则可能误删真实相邻的人。
+`--min-box-width`、`--min-box-height` 和 `--min-box-aspect-ratio` 用于在进入 tracker
+前过滤全景边界裁剪产生的极窄残框，避免这类非真实目标占用 public ID。
+`--close-small-dedup-*` 用于处理两个很小、中心很近、但几乎不重叠的小残框；
+`--normal-duplicate-*` 用于处理大小相近、中心非常近、且 IoU 或 x/y 覆盖明显的
+正常框重复输出。两类去重默认开启；如果怀疑误删真实相邻目标，可分别用
+`--no-close-small-dedup` 或 `--no-normal-duplicate-dedup` 关闭。
 
 ## Python 命令兼容性
 
@@ -447,8 +509,33 @@ C++ runtime 接受当前 Python 板端无头命令里常用的参数，包括：
 --track-buffer
 --lost-velocity-decay
 --inherit-center-dist-thresh
+--inherit-multi-target-center-dist-thresh
 --inherit-size-ratio-thresh
 --inherit-ambiguity-margin
+--public-recover-center-dist-thresh
+--public-recover-max-frames
+--display-id-reuse
+--no-display-id-reuse
+--display-id-reuse-spatial
+--no-display-id-reuse-spatial
+--display-id-reuse-max-frames
+--display-id-reuse-center-thresh
+--display-id-reuse-size-ratio
+--display-id-reuse-ambiguity-margin
+--min-box-width
+--min-box-height
+--min-box-aspect-ratio
+--no-close-small-dedup
+--close-small-dedup-center
+--close-small-dedup-max-area
+--close-small-dedup-max-side
+--close-small-dedup-iou
+--no-normal-duplicate-dedup
+--normal-duplicate-center
+--normal-duplicate-abs-center-px
+--normal-duplicate-size-ratio
+--normal-duplicate-iou
+--normal-duplicate-cover
 ```
 
 其中 `--force-build` 在 C++ 版本里是 no-op，因为部署到 Buildroot 前所有 native
@@ -516,11 +603,14 @@ taskset -c 0-6 bash run_smoke.sh \
   --camera-width 1920 \
   --camera-height 1080 \
   --camera-fps 30 \
-  --track-buffer 120 \
+  --track-buffer 1000 \
   --lost-velocity-decay 0.85 \
   --inherit-center-dist-thresh 1.0 \
+  --inherit-multi-target-center-dist-thresh 1.2 \
   --inherit-size-ratio-thresh 0.5 \
   --inherit-ambiguity-margin 0.25 \
+  --public-recover-center-dist-thresh 2.0 \
+  --public-recover-max-frames 1000 \
   --smooth-bbox-alpha 0.7 \
   --sector-output \
   --num-sectors 8 \
@@ -541,15 +631,21 @@ taskset -c 0-6 bash run_smoke.sh \
   当前 USB 摄像头的 `/dev/video1` 是 metadata 节点，不是图像节点。
 - `--camera-width 1920 --camera-height 1080 --camera-fps 30`：请求 1920x1080、
   30 FPS 的 MJPEG 采集。
-- `--track-buffer 120`：跟踪器内部将丢失 track 保留最多 120 帧。
+- `--track-buffer 1000`：跟踪器内部将丢失 track 保留最多 1000 帧。
 - `--lost-velocity-decay 0.85`：目标丢失后逐帧削弱预测速度，降低遮挡后轨迹继续
   漂移的幅度。
 - `--inherit-center-dist-thresh 1.0`：短暂遮挡继承旧 ID 的中心距离门限，`1.0`
   表示新框与旧轨迹最后观测框或 Kalman 预测框的中心距离小于约 1 个平均框高。
+- `--inherit-multi-target-center-dist-thresh 1.2`：如果新框附近还有其他当前目标，
+  短暂遮挡继承会把中心距离门限收紧到该值，避免多人靠近时把旁边的人接成旧 ID。
 - `--inherit-size-ratio-thresh 0.5`：短暂遮挡继承旧 ID 的尺寸门限，新框和旧框
   的宽高比例乘积低于 0.5 时不继承。
 - `--inherit-ambiguity-margin 0.25`：短暂遮挡继承旧 ID 的唯一候选门限，最近旧轨迹
   需要比第二近旧轨迹至少近 0.25 个平均框高，否则不继承。
+- `--public-recover-center-dist-thresh 2.0`：旧 raw track 已不在有效 lost 候选时，
+  允许在局部只有一个当前目标的情况下，把新 raw track 接回最近 public ID。
+- `--public-recover-max-frames 1000`：public ID 兜底恢复最多回看 1000 帧，避免很久以前
+  的旧 ID 被重新接上。
 - `--smooth-bbox-alpha 0.7`：增强 bbox 防抖；默认是 0.5，调到 0.7 会更稳但有轻微
   跟随延迟。
 - `--sector-output --num-sectors 8`：输出 Python 兼容的 8 扇区 JSON。

@@ -27,6 +27,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <ostream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -321,6 +322,8 @@ struct Config {
   bool webui = false;
   bool json_debug_keypoints = false;
   bool sector_output = false;
+  bool display_id_reuse = false;
+  bool display_id_reuse_spatial = true;
   bool print_profile_summary = false;
   bool profile_system_load = false;
   bool decode_prefetch = false;
@@ -340,6 +343,7 @@ struct Config {
   int webui_port = 8080;
   int webui_jpeg_quality = 80;
   int num_sectors = 8;
+  int display_id_reuse_max_frames = 1000;
   int profile_interval = 30;
   int system_load_interval_ms = 200;
   int fit_degree = 4;
@@ -358,7 +362,7 @@ struct Config {
   bool coast_hold = false;
   bool boundary_recover = true;
   bool filter_invalid_boxes = true;
-  int track_buffer = 500;
+  int track_buffer = 1000;
   int coast_frames = 0;
   int tracker_frame_rate = 30;
   int tracker_delta_t = 3;
@@ -372,9 +376,29 @@ struct Config {
   float lost_velocity_decay = 0.85f;
   float smooth_bbox_alpha = 0.6f;
   float max_width_ratio = 0.6f;
+  float min_box_width = 12.0f;
+  float min_box_height = 12.0f;
+  float min_box_aspect_ratio = 0.35f;
+  bool close_small_dedup = true;
+  float close_small_dedup_center_thresh = 0.70f;
+  float close_small_dedup_max_area = 1800.0f;
+  float close_small_dedup_max_side = 55.0f;
+  float close_small_dedup_iou_thresh = 0.10f;
+  bool normal_duplicate_dedup = true;
+  float normal_duplicate_center_thresh = 0.25f;
+  float normal_duplicate_abs_center_px = 22.0f;
+  float normal_duplicate_size_ratio_thresh = 0.70f;
+  float normal_duplicate_iou_thresh = 0.25f;
+  float normal_duplicate_cover_thresh = 0.60f;
+  float display_id_reuse_center_thresh = 2.0f;
+  float display_id_reuse_size_ratio_thresh = 0.4f;
+  float display_id_reuse_ambiguity_margin = 0.25f;
   float inherit_center_dist_thresh = 1.0f;
+  float inherit_multi_target_center_dist_thresh = 1.2f;
   float inherit_size_ratio_thresh = 0.5f;
   float inherit_ambiguity_margin = 0.25f;
+  float public_recover_center_dist_thresh = 2.0f;
+  int public_recover_max_frames = 1000;
   float boundary_margin = 0.04f;
   float boundary_size_ratio_thresh = 0.45f;
   float boundary_center_dist_thresh = 1.8f;
@@ -422,6 +446,63 @@ struct Image {
   std::vector<uint8_t> bgr;
 };
 
+struct TrackerSnapshotDebug {
+  int raw_id = -1;
+  int public_id = 0;
+  int time_since_update = 0;
+  std::array<float, 5> last_observation{{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f}};
+  std::array<float, 4> state{{0.0f, 0.0f, 0.0f, 0.0f}};
+  bool finite_last_observation = false;
+  bool lost_confirmed = false;
+  std::string reject_reason;
+};
+
+struct ShortInheritCandidateDebug {
+  int old_raw_id = -1;
+  int old_public_id = 0;
+  std::array<float, 4> bbox{{0.0f, 0.0f, 0.0f, 0.0f}};
+  float dist = 0.0f;
+  float size_score = 0.0f;
+  bool used_state = false;
+  std::string reject_reason;
+};
+
+struct ShortInheritDebug {
+  int raw_id = -1;
+  std::array<float, 4> bbox{{0.0f, 0.0f, 0.0f, 0.0f}};
+  int local_target_count = 0;
+  bool local_multi_target = false;
+  float effective_center_dist_thresh = 0.0f;
+  int chosen_old_raw_id = -1;
+  int chosen_public_id = 0;
+  std::string result;
+  std::vector<ShortInheritCandidateDebug> candidates;
+};
+
+struct PublicRecoverCandidateDebug {
+  int public_id = 0;
+  int missing_frames = 0;
+  std::array<float, 4> last_bbox{{0.0f, 0.0f, 0.0f, 0.0f}};
+  float dist = 0.0f;
+  float size_score = 0.0f;
+  bool strict_duplicate = false;
+  bool strict_ok = false;
+  bool relaxed_ok = false;
+  std::string reject_reason;
+};
+
+struct PublicRecoverDebug {
+  int raw_id = -1;
+  std::array<float, 4> bbox{{0.0f, 0.0f, 0.0f, 0.0f}};
+  int local_target_count = 0;
+  bool local_single_target = false;
+  int recovery_window = 0;
+  int chosen_public_id = 0;
+  std::string mode;
+  std::string result;
+  std::vector<PublicRecoverCandidateDebug> candidates;
+};
+
 struct FrameResult {
   int frame_index = 0;
   std::string image_path;
@@ -435,6 +516,7 @@ struct FrameResult {
   int tracker_stats[16] = {0};
   std::vector<float> detections;
   std::vector<int> track_ids;
+  std::vector<int> display_ids;
   int raw_detection_count = 0;
   int detection_count = 0;
   int filtered_invalid = 0;
@@ -442,7 +524,12 @@ struct FrameResult {
   int boundary_recovered = 0;
   int coasting_added = 0;
   int final_dedup_removed = 0;
+  int close_small_dedup_removed = 0;
+  int normal_duplicate_dedup_removed = 0;
   bool tracker_enabled = false;
+  std::vector<TrackerSnapshotDebug> tracker_snapshots_debug;
+  std::vector<ShortInheritDebug> short_inherit_debug;
+  std::vector<PublicRecoverDebug> public_recover_debug;
 };
 
 struct PreparedStagingFrame {
@@ -1810,6 +1897,14 @@ static void print_usage(const char* argv0) {
       << "  --webui-jpeg-quality N  annotated JPEG quality, default: 80\n"
       << "  --sector-output       emit Python-compatible sector aggregate JSON\n"
       << "  --num-sectors N       sector count for --sector-output, default: 8\n"
+      << "  --display-id-reuse    emit compact reusable display_id while preserving public track_id\n"
+      << "  --no-display-id-reuse disable reusable display_id output, default\n"
+      << "  --display-id-reuse-spatial     prefer recently lost nearby display_id, default\n"
+      << "  --no-display-id-reuse-spatial  reuse the smallest free display_id directly\n"
+      << "  --display-id-reuse-max-frames N  spatial display_id reuse window, default: 1000\n"
+      << "  --display-id-reuse-center-thresh VALUE  spatial display_id center gate, default: 2.0\n"
+      << "  --display-id-reuse-size-ratio VALUE  spatial display_id size gate, default: 0.4\n"
+      << "  --display-id-reuse-ambiguity-margin VALUE  spatial display_id unique-best gate, default: 0.25\n"
       << "  --print-profile-summary  print average per-stage timings to stderr\n"
       << "  --profile-system-load write background CPU/GPU/NPU/memory load JSONL\n"
       << "  --system-load-interval-ms N  hardware load sample interval, default: 200\n"
@@ -1833,14 +1928,17 @@ static void print_usage(const char* argv0) {
       << "  --overlap VALUE        slice overlap ratio, default: 0.1\n"
       << "  --max-det N            per-slice max detections, default: 100\n"
       << "  --no-tracker           disable native HybridSORT tracking\n"
-      << "  --track-buffer N       tracker lost buffer frames, default: 500\n"
+      << "  --track-buffer N       tracker lost buffer frames, default: 1000\n"
       << "  --tracker-match-thresh VALUE  tracker association IoU threshold, default: 0.15\n"
       << "  --tracker-new-thresh VALUE    new track confidence threshold, default: 0.5\n"
       << "  --new-track-overlap-thresh VALUE  avoid duplicate new tracks, default: 0.4\n"
       << "  --lost-velocity-decay VALUE   multiply unmatched track velocity each frame, default: 0.85\n"
       << "  --inherit-center-dist-thresh VALUE  short occlusion ID inheritance gate, default: 1.0\n"
+      << "  --inherit-multi-target-center-dist-thresh VALUE  stricter short inheritance gate near multiple targets, default: 1.2\n"
       << "  --inherit-size-ratio-thresh VALUE   short occlusion size gate, default: 0.5\n"
       << "  --inherit-ambiguity-margin VALUE    short occlusion unique-best gate, default: 0.25\n"
+      << "  --public-recover-center-dist-thresh VALUE  low-ambiguity public ID recovery gate, default: 2.0\n"
+      << "  --public-recover-max-frames N       low-ambiguity public ID recovery window, default: 1000\n"
       << "  --no-smooth-bbox       disable tracker bbox EMA smoothing\n"
       << "  --smooth-bbox-alpha VALUE  tracker bbox EMA alpha, default: 0.5\n"
       << "  --coast-frames N       output lost tracks for N frames, default: 0\n"
@@ -1852,6 +1950,21 @@ static void print_usage(const char* argv0) {
       << "  --final-boundary-dedup-center VALUE  final spatial duplicate center gate, default: 0.80\n"
       << "  --final-boundary-dedup-size VALUE    final spatial duplicate area-ratio gate, default: 0.25\n"
       << "  --no-filter-invalid-boxes  disable Python-compatible invalid bbox filtering\n"
+      << "  --min-box-width VALUE   drop boxes narrower than this before tracker, default: 12\n"
+      << "  --min-box-height VALUE  drop boxes shorter than this before tracker, default: 12\n"
+      << "  --min-box-aspect-ratio VALUE  drop very thin boxes before tracker, default: 0.35\n"
+      << "  --max-width-ratio VALUE  drop invalid huge boxes wider than process_width*ratio, default: 0.6\n"
+      << "  --no-close-small-dedup  disable close-center tiny box duplicate suppression\n"
+      << "  --close-small-dedup-center VALUE  tiny duplicate center gate, default: 0.70\n"
+      << "  --close-small-dedup-max-area VALUE  tiny duplicate max area, default: 1800\n"
+      << "  --close-small-dedup-max-side VALUE  tiny duplicate max side length, default: 55\n"
+      << "  --close-small-dedup-iou VALUE  max IoU for adjacent tiny duplicates, default: 0.10\n"
+      << "  --no-normal-duplicate-dedup  disable close-center normal box duplicate suppression\n"
+      << "  --normal-duplicate-center VALUE  normal duplicate center gate, default: 0.25\n"
+      << "  --normal-duplicate-abs-center-px VALUE  normal duplicate absolute center gate, default: 22\n"
+      << "  --normal-duplicate-size-ratio VALUE  normal duplicate size gate, default: 0.70\n"
+      << "  --normal-duplicate-iou VALUE  normal duplicate IoU gate, default: 0.25\n"
+      << "  --normal-duplicate-cover VALUE  normal duplicate x/y cover gate, default: 0.60\n"
       << "  --angle-vectorized     accepted; C++ angle path is already vector-style\n"
       << "  --force-build          accepted as no-op; board_cpp is prebuilt\n";
 }
@@ -1909,6 +2022,22 @@ static Config parse_args(int argc, char** argv) {
       cfg.sector_output = true;
     } else if (arg == "--num-sectors") {
       cfg.num_sectors = std::stoi(need_value(arg));
+    } else if (arg == "--display-id-reuse") {
+      cfg.display_id_reuse = true;
+    } else if (arg == "--no-display-id-reuse") {
+      cfg.display_id_reuse = false;
+    } else if (arg == "--display-id-reuse-spatial") {
+      cfg.display_id_reuse_spatial = true;
+    } else if (arg == "--no-display-id-reuse-spatial") {
+      cfg.display_id_reuse_spatial = false;
+    } else if (arg == "--display-id-reuse-max-frames") {
+      cfg.display_id_reuse_max_frames = std::stoi(need_value(arg));
+    } else if (arg == "--display-id-reuse-center-thresh") {
+      cfg.display_id_reuse_center_thresh = std::stof(need_value(arg));
+    } else if (arg == "--display-id-reuse-size-ratio") {
+      cfg.display_id_reuse_size_ratio_thresh = std::stof(need_value(arg));
+    } else if (arg == "--display-id-reuse-ambiguity-margin") {
+      cfg.display_id_reuse_ambiguity_margin = std::stof(need_value(arg));
     } else if (arg == "--print-profile-summary") {
       cfg.print_profile_summary = true;
     } else if (arg == "--decode-prefetch") {
@@ -1971,10 +2100,16 @@ static Config parse_args(int argc, char** argv) {
       cfg.lost_velocity_decay = std::stof(need_value(arg));
     } else if (arg == "--inherit-center-dist-thresh") {
       cfg.inherit_center_dist_thresh = std::stof(need_value(arg));
+    } else if (arg == "--inherit-multi-target-center-dist-thresh") {
+      cfg.inherit_multi_target_center_dist_thresh = std::stof(need_value(arg));
     } else if (arg == "--inherit-size-ratio-thresh") {
       cfg.inherit_size_ratio_thresh = std::stof(need_value(arg));
     } else if (arg == "--inherit-ambiguity-margin") {
       cfg.inherit_ambiguity_margin = std::stof(need_value(arg));
+    } else if (arg == "--public-recover-center-dist-thresh") {
+      cfg.public_recover_center_dist_thresh = std::stof(need_value(arg));
+    } else if (arg == "--public-recover-max-frames") {
+      cfg.public_recover_max_frames = std::stoi(need_value(arg));
     } else if (arg == "--tracker-high-thresh") {
       cfg.tracker_high_thresh = std::stof(need_value(arg));
     } else if (arg == "--tracker-low-thresh") {
@@ -2015,8 +2150,40 @@ static Config parse_args(int argc, char** argv) {
       cfg.final_boundary_dedup_size_ratio_thresh = std::stof(need_value(arg));
     } else if (arg == "--no-filter-invalid-boxes") {
       cfg.filter_invalid_boxes = false;
+    } else if (arg == "--min-box-width") {
+      cfg.min_box_width = std::stof(need_value(arg));
+    } else if (arg == "--min-box-height") {
+      cfg.min_box_height = std::stof(need_value(arg));
+    } else if (arg == "--min-box-aspect-ratio") {
+      cfg.min_box_aspect_ratio = std::stof(need_value(arg));
     } else if (arg == "--max-width-ratio") {
       cfg.max_width_ratio = std::stof(need_value(arg));
+    } else if (arg == "--close-small-dedup") {
+      cfg.close_small_dedup = true;
+    } else if (arg == "--no-close-small-dedup") {
+      cfg.close_small_dedup = false;
+    } else if (arg == "--close-small-dedup-center") {
+      cfg.close_small_dedup_center_thresh = std::stof(need_value(arg));
+    } else if (arg == "--close-small-dedup-max-area") {
+      cfg.close_small_dedup_max_area = std::stof(need_value(arg));
+    } else if (arg == "--close-small-dedup-max-side") {
+      cfg.close_small_dedup_max_side = std::stof(need_value(arg));
+    } else if (arg == "--close-small-dedup-iou") {
+      cfg.close_small_dedup_iou_thresh = std::stof(need_value(arg));
+    } else if (arg == "--normal-duplicate-dedup") {
+      cfg.normal_duplicate_dedup = true;
+    } else if (arg == "--no-normal-duplicate-dedup") {
+      cfg.normal_duplicate_dedup = false;
+    } else if (arg == "--normal-duplicate-center") {
+      cfg.normal_duplicate_center_thresh = std::stof(need_value(arg));
+    } else if (arg == "--normal-duplicate-abs-center-px") {
+      cfg.normal_duplicate_abs_center_px = std::stof(need_value(arg));
+    } else if (arg == "--normal-duplicate-size-ratio") {
+      cfg.normal_duplicate_size_ratio_thresh = std::stof(need_value(arg));
+    } else if (arg == "--normal-duplicate-iou") {
+      cfg.normal_duplicate_iou_thresh = std::stof(need_value(arg));
+    } else if (arg == "--normal-duplicate-cover") {
+      cfg.normal_duplicate_cover_thresh = std::stof(need_value(arg));
     } else if (arg == "--profile-interval") {
       cfg.profile_interval = std::stoi(need_value(arg));
     } else if (arg == "--profile-system-load" || arg == "--json-system-load") {
@@ -2097,6 +2264,9 @@ static Config parse_args(int argc, char** argv) {
   if (cfg.coast_frames < 0) {
     throw std::runtime_error("--coast-frames must be non-negative");
   }
+  if (cfg.display_id_reuse_max_frames < 0) {
+    throw std::runtime_error("--display-id-reuse-max-frames must be non-negative");
+  }
   cfg.system_load_interval_ms = std::max(50, cfg.system_load_interval_ms);
   if (cfg.fit_degree != 4 && cfg.fit_degree != 5) {
     throw std::runtime_error("--fit-degree must be 4 or 5");
@@ -2105,12 +2275,46 @@ static Config parse_args(int argc, char** argv) {
   cfg.lost_velocity_decay = std::max(0.0f, std::min(cfg.lost_velocity_decay, 1.0f));
   cfg.inherit_center_dist_thresh =
       std::max(0.0f, std::min(cfg.inherit_center_dist_thresh, 5.0f));
+  cfg.inherit_multi_target_center_dist_thresh =
+      std::max(0.0f, std::min(cfg.inherit_multi_target_center_dist_thresh, 5.0f));
   cfg.inherit_size_ratio_thresh =
       std::max(0.0f, std::min(cfg.inherit_size_ratio_thresh, 1.0f));
   cfg.inherit_ambiguity_margin =
       std::max(0.0f, std::min(cfg.inherit_ambiguity_margin, 5.0f));
+  cfg.public_recover_center_dist_thresh =
+      std::max(0.0f, std::min(cfg.public_recover_center_dist_thresh, 5.0f));
+  cfg.public_recover_max_frames = std::max(0, std::min(cfg.public_recover_max_frames, 1000));
   cfg.boundary_margin = std::max(0.01f, std::min(cfg.boundary_margin, 0.4f));
   cfg.max_width_ratio = std::max(0.05f, std::min(cfg.max_width_ratio, 1.0f));
+  cfg.min_box_width = std::max(0.0f, std::min(cfg.min_box_width, 200.0f));
+  cfg.min_box_height = std::max(0.0f, std::min(cfg.min_box_height, 200.0f));
+  cfg.min_box_aspect_ratio = std::max(0.0f, std::min(cfg.min_box_aspect_ratio, 1.0f));
+  cfg.close_small_dedup_center_thresh =
+      std::max(0.0f, std::min(cfg.close_small_dedup_center_thresh, 5.0f));
+  cfg.close_small_dedup_max_area =
+      std::max(0.0f, std::min(cfg.close_small_dedup_max_area, 10000.0f));
+  cfg.close_small_dedup_max_side =
+      std::max(0.0f, std::min(cfg.close_small_dedup_max_side, 300.0f));
+  cfg.close_small_dedup_iou_thresh =
+      std::max(0.0f, std::min(cfg.close_small_dedup_iou_thresh, 1.0f));
+  cfg.normal_duplicate_center_thresh =
+      std::max(0.0f, std::min(cfg.normal_duplicate_center_thresh, 5.0f));
+  cfg.normal_duplicate_abs_center_px =
+      std::max(0.0f, std::min(cfg.normal_duplicate_abs_center_px, 300.0f));
+  cfg.normal_duplicate_size_ratio_thresh =
+      std::max(0.0f, std::min(cfg.normal_duplicate_size_ratio_thresh, 1.0f));
+  cfg.normal_duplicate_iou_thresh =
+      std::max(0.0f, std::min(cfg.normal_duplicate_iou_thresh, 1.0f));
+  cfg.normal_duplicate_cover_thresh =
+      std::max(0.0f, std::min(cfg.normal_duplicate_cover_thresh, 1.0f));
+  cfg.display_id_reuse_max_frames =
+      std::max(0, std::min(cfg.display_id_reuse_max_frames, 1000));
+  cfg.display_id_reuse_center_thresh =
+      std::max(0.0f, std::min(cfg.display_id_reuse_center_thresh, 10.0f));
+  cfg.display_id_reuse_size_ratio_thresh =
+      std::max(0.0f, std::min(cfg.display_id_reuse_size_ratio_thresh, 1.0f));
+  cfg.display_id_reuse_ambiguity_margin =
+      std::max(0.0f, std::min(cfg.display_id_reuse_ambiguity_margin, 5.0f));
   cfg.final_boundary_dedup_iou_thresh =
       std::max(0.0f, std::min(cfg.final_boundary_dedup_iou_thresh, 1.0f));
   cfg.final_boundary_dedup_center_thresh =
@@ -2143,6 +2347,100 @@ static void print_json_array(std::ostream& os, const float* values, int count) {
     os << std::fixed << std::setprecision(3) << values[i];
   }
   os << "]";
+}
+
+template <size_t N>
+static void print_json_array(std::ostream& os, const std::array<float, N>& values) {
+  print_json_array(os, values.data(), static_cast<int>(N));
+}
+
+static void print_tracker_debug_json(std::ostream& os, const FrameResult& result) {
+  os << "{\"snapshots\":[";
+  for (size_t i = 0; i < result.tracker_snapshots_debug.size(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    const TrackerSnapshotDebug& s = result.tracker_snapshots_debug[i];
+    os << "{\"raw_id\":" << s.raw_id
+       << ",\"public_id\":" << s.public_id
+       << ",\"time_since_update\":" << s.time_since_update
+       << ",\"last_observation\":";
+    print_json_array(os, s.last_observation);
+    os << ",\"state\":";
+    print_json_array(os, s.state);
+    os << ",\"finite_last_observation\":" << (s.finite_last_observation ? "true" : "false")
+       << ",\"lost_confirmed\":" << (s.lost_confirmed ? "true" : "false")
+       << ",\"reject_reason\":\"" << json_escape(s.reject_reason) << "\"}";
+  }
+
+  os << "],\"short_inherit\":[";
+  for (size_t i = 0; i < result.short_inherit_debug.size(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    const ShortInheritDebug& d = result.short_inherit_debug[i];
+    os << "{\"raw_id\":" << d.raw_id
+       << ",\"bbox\":";
+    print_json_array(os, d.bbox);
+    os << ",\"local_target_count\":" << d.local_target_count
+       << ",\"local_multi_target\":" << (d.local_multi_target ? "true" : "false")
+       << ",\"effective_center_dist_thresh\":" << d.effective_center_dist_thresh
+       << ",\"chosen_old_raw_id\":" << d.chosen_old_raw_id
+       << ",\"chosen_public_id\":" << d.chosen_public_id
+       << ",\"result\":\"" << json_escape(d.result) << "\""
+       << ",\"candidates\":[";
+    for (size_t j = 0; j < d.candidates.size(); ++j) {
+      if (j > 0) {
+        os << ",";
+      }
+      const ShortInheritCandidateDebug& c = d.candidates[j];
+      os << "{\"old_raw_id\":" << c.old_raw_id
+         << ",\"old_public_id\":" << c.old_public_id
+         << ",\"bbox\":";
+      print_json_array(os, c.bbox);
+      os << ",\"dist\":" << c.dist
+         << ",\"size_score\":" << c.size_score
+         << ",\"used_state\":" << (c.used_state ? "true" : "false")
+         << ",\"reject_reason\":\"" << json_escape(c.reject_reason) << "\"}";
+    }
+    os << "]}";
+  }
+
+  os << "],\"public_recover\":[";
+  for (size_t i = 0; i < result.public_recover_debug.size(); ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    const PublicRecoverDebug& d = result.public_recover_debug[i];
+    os << "{\"raw_id\":" << d.raw_id
+       << ",\"bbox\":";
+    print_json_array(os, d.bbox);
+    os << ",\"local_target_count\":" << d.local_target_count
+       << ",\"local_single_target\":" << (d.local_single_target ? "true" : "false")
+       << ",\"recovery_window\":" << d.recovery_window
+       << ",\"chosen_public_id\":" << d.chosen_public_id
+       << ",\"mode\":\"" << json_escape(d.mode) << "\""
+       << ",\"result\":\"" << json_escape(d.result) << "\""
+       << ",\"candidates\":[";
+    for (size_t j = 0; j < d.candidates.size(); ++j) {
+      if (j > 0) {
+        os << ",";
+      }
+      const PublicRecoverCandidateDebug& c = d.candidates[j];
+      os << "{\"public_id\":" << c.public_id
+         << ",\"missing_frames\":" << c.missing_frames
+         << ",\"last_bbox\":";
+      print_json_array(os, c.last_bbox);
+      os << ",\"dist\":" << c.dist
+         << ",\"size_score\":" << c.size_score
+         << ",\"strict_duplicate\":" << (c.strict_duplicate ? "true" : "false")
+         << ",\"strict_ok\":" << (c.strict_ok ? "true" : "false")
+         << ",\"relaxed_ok\":" << (c.relaxed_ok ? "true" : "false")
+         << ",\"reject_reason\":\"" << json_escape(c.reject_reason) << "\"}";
+    }
+    os << "]}";
+  }
+  os << "]}";
 }
 
 static double wall_time_seconds() {
@@ -2614,6 +2912,9 @@ struct AngleDistanceState {
 
 struct TargetInfo {
   int id = -1;
+  int public_id = -1;
+  int display_id = -1;
+  bool has_display_id = false;
   bool has_azimuth = false;
   bool has_elevation = false;
   bool has_eye_pixel_dist = false;
@@ -2674,10 +2975,16 @@ static void draw_annotation(Image& image,
   draw_sector_overlay(image, cfg, targets);
   for (int i = 0; i < result.detection_count; ++i) {
     const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
-    const int track_id =
+    const int public_id =
         (i < static_cast<int>(result.track_ids.size()) && result.track_ids[static_cast<size_t>(i)] > 0)
             ? result.track_ids[static_cast<size_t>(i)]
             : i + 1;
+    const int display_id =
+        (cfg.display_id_reuse &&
+         i < static_cast<int>(result.display_ids.size()) &&
+         result.display_ids[static_cast<size_t>(i)] > 0)
+            ? result.display_ids[static_cast<size_t>(i)]
+            : public_id;
     const int x1 = static_cast<int>(std::lround(det[0]));
     const int y1 = static_cast<int>(std::lround(det[1]));
     const int x2 = static_cast<int>(std::lround(det[2]));
@@ -2688,9 +2995,9 @@ static void draw_annotation(Image& image,
       sector_target = target.has_azimuth && target.has_elevation &&
                       std::isfinite(target.azimuth) && std::isfinite(target.elevation);
     }
-    const uint8_t b = sector_target ? 0 : static_cast<uint8_t>((track_id * 53) % 180 + 60);
-    const uint8_t g = sector_target ? 0 : static_cast<uint8_t>((track_id * 97) % 180 + 60);
-    const uint8_t r = sector_target ? 255 : static_cast<uint8_t>((track_id * 131) % 180 + 60);
+    const uint8_t b = sector_target ? 0 : static_cast<uint8_t>((display_id * 53) % 180 + 60);
+    const uint8_t g = sector_target ? 0 : static_cast<uint8_t>((display_id * 97) % 180 + 60);
+    const uint8_t r = sector_target ? 255 : static_cast<uint8_t>((display_id * 131) % 180 + 60);
     draw_rect(image, x1, y1, x2, y2, b, g, r, 3);
     const float* left_mouth = det + 5 + 3 * 3;
     const float* right_mouth = det + 5 + 4 * 3;
@@ -2710,7 +3017,7 @@ static void draw_annotation(Image& image,
       fill_rect(image, cx - 4, cy - 4, cx + 4, cy + 4, 0, 255, 0);
     }
     std::ostringstream label;
-    label << "ID:" << track_id;
+    label << "ID:" << display_id;
     const TargetInfo* target =
         i < static_cast<int>(targets.size()) ? &targets[static_cast<size_t>(i)] : nullptr;
     if (target != nullptr && target->has_azimuth && std::isfinite(target->azimuth)) {
@@ -2777,8 +3084,17 @@ class AngleAndDistanceRuntime {
           (i < static_cast<int>(result.track_ids.size()) && result.track_ids[static_cast<size_t>(i)] > 0)
               ? result.track_ids[static_cast<size_t>(i)]
               : i + 1;
+      const int display_id =
+          (cfg_.display_id_reuse &&
+           i < static_cast<int>(result.display_ids.size()) &&
+           result.display_ids[static_cast<size_t>(i)] > 0)
+              ? result.display_ids[static_cast<size_t>(i)]
+              : -1;
       TargetInfo info;
-      info.id = track_id;
+      info.public_id = track_id;
+      info.display_id = display_id;
+      info.has_display_id = cfg_.display_id_reuse && display_id > 0;
+      info.id = info.has_display_id ? display_id : track_id;
       fill_angle(det, info);
       fill_distance(track_id, det, info);
       targets.push_back(info);
@@ -2940,7 +3256,7 @@ class AngleAndDistanceRuntime {
     std::vector<int> active_ids;
     active_ids.reserve(targets.size());
     for (const TargetInfo& target : targets) {
-      active_ids.push_back(target.id);
+      active_ids.push_back(target.public_id > 0 ? target.public_id : target.id);
     }
     std::map<int, AngleDistanceState> kept;
     for (const auto& item : distance_states_) {
@@ -2989,7 +3305,12 @@ static std::string build_inference_json(const std::vector<TargetInfo>& targets,
       os << ",";
     }
     const TargetInfo& target = targets[i];
-    os << "\"" << target.id << "\":{\"id\":" << target.id << ",\"azimuth\":";
+    os << "\"" << target.id << "\":{\"id\":" << target.id;
+    if (target.has_display_id) {
+      os << ",\"display_id\":" << target.display_id
+         << ",\"public_id\":" << target.public_id;
+    }
+    os << ",\"azimuth\":";
     print_json_nullable(os, target.has_azimuth, target.azimuth, 3);
     os << ",\"elevation\":";
     print_json_nullable(os, target.has_elevation, target.elevation, 3);
@@ -3175,7 +3496,13 @@ static void print_result_json(std::ostream& os,
             << ", \"inherited\": " << result.inherited_ids
             << ", \"boundary_recovered\": " << result.boundary_recovered
             << ", \"coasting_added\": " << result.coasting_added
-            << ", \"final_dedup_removed\": " << result.final_dedup_removed << "},\n";
+            << ", \"final_dedup_removed\": " << result.final_dedup_removed
+            << ", \"close_small_dedup_removed\": " << result.close_small_dedup_removed
+            << ", \"normal_duplicate_dedup_removed\": "
+            << result.normal_duplicate_dedup_removed << "},\n";
+  os << "  \"tracker_debug\": ";
+  print_tracker_debug_json(os, result);
+  os << ",\n";
   os << "  \"detection_count\": " << result.detection_count << ",\n";
   os << "  \"detections\": [\n";
   for (int i = 0; i < result.detection_count; ++i) {
@@ -3184,6 +3511,10 @@ static void print_result_json(std::ostream& os,
     print_json_array(os, det, 4);
     if (i < static_cast<int>(result.track_ids.size()) && result.track_ids[static_cast<size_t>(i)] > 0) {
       os << ", \"track_id\": " << result.track_ids[static_cast<size_t>(i)];
+    }
+    if (i < static_cast<int>(result.display_ids.size()) &&
+        result.display_ids[static_cast<size_t>(i)] > 0) {
+      os << ", \"display_id\": " << result.display_ids[static_cast<size_t>(i)];
     }
     os << ", \"score\": " << std::fixed << std::setprecision(6) << det[4]
               << ", \"keypoints\": [";
@@ -3278,7 +3609,12 @@ static void print_result_jsonl(std::ostream& os,
      << ",\"inherited\":" << result.inherited_ids
      << ",\"boundary_recovered\":" << result.boundary_recovered
      << ",\"coasting_added\":" << result.coasting_added
-     << ",\"final_dedup_removed\":" << result.final_dedup_removed << "}"
+     << ",\"final_dedup_removed\":" << result.final_dedup_removed
+     << ",\"close_small_dedup_removed\":" << result.close_small_dedup_removed
+     << ",\"normal_duplicate_dedup_removed\":" << result.normal_duplicate_dedup_removed << "}"
+     << ",\"tracker_debug\":";
+  print_tracker_debug_json(os, result);
+  os
      << ",\"detection_count\":" << result.detection_count
      << ",\"detections\":[";
   for (int i = 0; i < result.detection_count; ++i) {
@@ -3290,6 +3626,10 @@ static void print_result_jsonl(std::ostream& os,
     print_json_array(os, det, 4);
     if (i < static_cast<int>(result.track_ids.size()) && result.track_ids[static_cast<size_t>(i)] > 0) {
       os << ",\"track_id\":" << result.track_ids[static_cast<size_t>(i)];
+    }
+    if (i < static_cast<int>(result.display_ids.size()) &&
+        result.display_ids[static_cast<size_t>(i)] > 0) {
+      os << ",\"display_id\":" << result.display_ids[static_cast<size_t>(i)];
     }
     os << ",\"score\":" << std::fixed << std::setprecision(6) << det[4] << ",\"keypoints\":[";
     for (int k = 0; k < 5; ++k) {
@@ -3521,6 +3861,7 @@ class NativeHybridSortTracker {
         snapshot_by_raw[snapshot.raw_id] = snapshot;
       }
     }
+    record_tracker_snapshot_debug(result, snapshots);
 
     const std::vector<int> track_to_det = match_tracks_to_detections(tracker_rows, tracker_count, raw);
     std::vector<float> tracked(static_cast<size_t>(tracker_count) * kDetectionFields, 0.0f);
@@ -3571,13 +3912,24 @@ class NativeHybridSortTracker {
     result.detections.swap(tracked);
     result.detection_count = tracker_count;
 
+    register_lost_targets(current_active_raw_ids);
     apply_short_occlusion_inheritance(result, raw_ids, snapshot_by_raw);
     apply_boundary_recovery(result, raw_ids);
+    if (!cfg_.coast_hold) {
+      add_coasting_tracks(result, raw_ids, snapshot_by_raw);
+    }
+    apply_final_boundary_dedup(result, raw_ids);
+    apply_close_small_dedup(result, raw_ids);
+    apply_recent_public_occlusion_recovery(result, raw_ids);
+    resolve_public_id_conflicts(result, raw_ids);
     apply_public_ids(result, raw_ids);
-    add_coasting_tracks(result, raw_ids, snapshot_by_raw);
-    apply_final_boundary_dedup(result);
     update_public_seen_counts(result);
-    update_lost_state(current_active_raw_ids, snapshot_by_raw);
+    update_public_last_bboxes(result);
+    const int count_before_public_coast = result.detection_count;
+    add_public_coasting_tracks(result);
+    apply_close_small_output_dedup(result, count_before_public_coast);
+    apply_display_ids(result);
+    update_active_track_state(current_active_raw_ids, snapshot_by_raw);
   }
 
  private:
@@ -3606,6 +3958,13 @@ class NativeHybridSortTracker {
       const float box_w = x2 - x1;
       const float box_h = y2 - y1;
       if (box_w <= 0.0f || box_h <= 0.0f) {
+        continue;
+      }
+      if (box_w < cfg_.min_box_width || box_h < cfg_.min_box_height) {
+        continue;
+      }
+      const float aspect_ratio = std::min(box_w, box_h) / (std::max(box_w, box_h) + 1.0e-6f);
+      if (aspect_ratio < cfg_.min_box_aspect_ratio) {
         continue;
       }
       if (box_w > max_allowed_width || (x1 < boundary_threshold && x2 > process_w - boundary_threshold)) {
@@ -3701,6 +4060,35 @@ class NativeHybridSortTracker {
     return snapshots;
   }
 
+  void record_tracker_snapshot_debug(FrameResult& result,
+                                     const std::vector<NativeTrackSnapshot>& snapshots) const {
+    result.tracker_snapshots_debug.clear();
+    result.tracker_snapshots_debug.reserve(snapshots.size());
+    for (const NativeTrackSnapshot& snapshot : snapshots) {
+      TrackerSnapshotDebug debug;
+      debug.raw_id = snapshot.raw_id;
+      debug.time_since_update = snapshot.time_since_update;
+      debug.last_observation = snapshot.last_observation;
+      debug.state = snapshot.state;
+      debug.finite_last_observation = finite_bbox(bbox_from_last_observation(snapshot));
+      const auto public_it = public_id_map_.find(snapshot.raw_id);
+      debug.public_id = public_it == public_id_map_.end() ? 0 : public_it->second;
+      if (snapshot.time_since_update <= 0) {
+        debug.reject_reason = "active";
+      } else if (snapshot.time_since_update > max_age_) {
+        debug.reject_reason = "too_old";
+      } else if (!debug.finite_last_observation) {
+        debug.reject_reason = "invalid_last_observation";
+      } else if (debug.public_id <= 0) {
+        debug.reject_reason = "no_public_id";
+      } else {
+        debug.lost_confirmed = true;
+        debug.reject_reason = "candidate";
+      }
+      result.tracker_snapshots_debug.push_back(debug);
+    }
+  }
+
   void apply_short_occlusion_inheritance(FrameResult& result,
                                          const std::vector<int>& raw_ids,
                                          const std::map<int, NativeTrackSnapshot>& snapshot_by_raw) {
@@ -3733,16 +4121,42 @@ class NativeHybridSortTracker {
       }
       const float* det = result.detections.data() + i * kDetectionFields;
       const std::array<float, 4> new_bbox = bbox4_from_ptr(det);
+      ShortInheritDebug debug;
+      debug.raw_id = raw_id;
+      debug.bbox = new_bbox;
+      debug.result = "no_candidate";
       int best_old_raw = -1;
-      float best_dist = cfg_.inherit_center_dist_thresh;
+      const int local_target_count =
+          count_local_current_targets(result, new_bbox, i, cfg_.inherit_center_dist_thresh);
+      debug.local_target_count = local_target_count;
+      debug.local_multi_target = local_target_count > 1;
+      const float inherit_dist_thresh =
+          debug.local_multi_target
+              ? std::min(cfg_.inherit_center_dist_thresh,
+                         cfg_.inherit_multi_target_center_dist_thresh)
+              : cfg_.inherit_center_dist_thresh;
+      debug.effective_center_dist_thresh = inherit_dist_thresh;
+      float best_dist = std::numeric_limits<float>::infinity();
       float second_best_dist = std::numeric_limits<float>::infinity();
       for (const auto& item : lost_confirmed) {
         const int old_raw = item.first;
-        if (old_raw == raw_id || public_id_map_.find(old_raw) == public_id_map_.end()) {
+        ShortInheritCandidateDebug cand;
+        cand.old_raw_id = old_raw;
+        const auto public_it = public_id_map_.find(old_raw);
+        cand.old_public_id = public_it == public_id_map_.end() ? 0 : public_it->second;
+        if (old_raw == raw_id) {
+          cand.reject_reason = "same_raw";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        if (public_it == public_id_map_.end()) {
+          cand.reject_reason = "no_public_id";
+          debug.candidates.push_back(cand);
           continue;
         }
         const NativeTrackSnapshot& old_track = item.second;
         const std::array<float, 4> obs_bbox = bbox_from_last_observation(old_track);
+        cand.bbox = obs_bbox;
         float d = center_distance_norm(new_bbox, obs_bbox);
         float size_score = size_ratio_score(new_bbox, obs_bbox);
         if (finite_bbox(old_track.state)) {
@@ -3750,38 +4164,75 @@ class NativeHybridSortTracker {
           if (state_dist < d) {
             d = state_dist;
             size_score = size_ratio_score(new_bbox, old_track.state);
+            cand.bbox = old_track.state;
+            cand.used_state = true;
           }
         }
+        cand.dist = d;
+        cand.size_score = size_score;
         if (size_score < cfg_.inherit_size_ratio_thresh) {
+          cand.reject_reason = "size_gate";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        if (d >= inherit_dist_thresh) {
+          cand.reject_reason =
+              debug.local_multi_target && d < cfg_.inherit_center_dist_thresh
+                  ? "multi_target_distance_gate"
+                  : "distance_gate";
+          debug.candidates.push_back(cand);
           continue;
         }
         if (d < best_dist) {
-          second_best_dist = best_dist;
+          if (std::isfinite(best_dist)) {
+            second_best_dist = best_dist;
+          }
           best_dist = d;
           best_old_raw = old_raw;
+          cand.reject_reason = "best";
         } else if (d < second_best_dist) {
           second_best_dist = d;
+          cand.reject_reason = "second_best";
+        } else {
+          cand.reject_reason = "distance_gate";
         }
+        debug.candidates.push_back(cand);
       }
       if (best_old_raw > 0) {
         if (std::isfinite(second_best_dist) &&
             (second_best_dist - best_dist) < cfg_.inherit_ambiguity_margin) {
+          debug.chosen_old_raw_id = best_old_raw;
+          debug.chosen_public_id = public_id_map_[best_old_raw];
+          debug.result = "ambiguity";
+          result.short_inherit_debug.push_back(debug);
           continue;
         }
         const int old_public = public_id_map_[best_old_raw];
-        public_id_map_.erase(best_old_raw);
         public_id_map_[raw_id] = old_public;
+        remove_boundary_lost(best_old_raw);
         result.inherited_ids += 1;
+        debug.chosen_old_raw_id = best_old_raw;
+        debug.chosen_public_id = old_public;
+        debug.result = "assigned";
       }
+      result.short_inherit_debug.push_back(debug);
     }
   }
 
   void apply_boundary_recovery(FrameResult& result, const std::vector<int>& raw_ids) {
-    if (!cfg_.boundary_recover || boundary_lost_.empty()) {
+    if (!cfg_.boundary_recover) {
       return;
     }
     cleanup_boundary_lost();
     std::vector<int> claimed_old;
+    std::set<int> claimed_public;
+    std::set<int> active_public;
+    for (int raw_id : raw_ids) {
+      const auto map_it = public_id_map_.find(raw_id);
+      if (map_it != public_id_map_.end() && map_it->second > 0) {
+        active_public.insert(map_it->second);
+      }
+    }
     for (size_t i = 0; i < raw_ids.size(); ++i) {
       const int raw_id = raw_ids[i];
       if (raw_id <= 0 || public_id_map_.find(raw_id) != public_id_map_.end()) {
@@ -3837,12 +4288,16 @@ class NativeHybridSortTracker {
         }
       }
       if (best_old_raw > 0) {
-        public_id_map_[raw_id] = public_id_map_[best_old_raw];
+        const int public_id = public_id_map_[best_old_raw];
+        public_id_map_[raw_id] = public_id;
+        claimed_public.insert(public_id);
+        active_public.insert(public_id);
         claimed_old.push_back(best_old_raw);
         remove_boundary_lost(best_old_raw);
         result.boundary_recovered += 1;
       }
     }
+    apply_recent_public_boundary_recovery(result, raw_ids, active_public, claimed_public);
   }
 
   void apply_public_ids(FrameResult& result, const std::vector<int>& raw_ids) {
@@ -3853,8 +4308,63 @@ class NativeHybridSortTracker {
     }
   }
 
+  void resolve_public_id_conflicts(FrameResult& result, std::vector<int>& raw_ids) {
+    if (result.detection_count <= 1) {
+      return;
+    }
+
+    const int n = result.detection_count;
+    std::map<int, std::vector<int>> indices_by_public;
+    for (int i = 0; i < n; ++i) {
+      const int raw_id = i < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(i)] : -1;
+      const auto map_it = public_id_map_.find(raw_id);
+      if (map_it == public_id_map_.end() || map_it->second <= 0) {
+        continue;
+      }
+      indices_by_public[map_it->second].push_back(i);
+    }
+
+    std::vector<uint8_t> keep(static_cast<size_t>(n), 1);
+    bool changed = false;
+    for (const auto& item : indices_by_public) {
+      const int public_id = item.first;
+      const std::vector<int>& indices = item.second;
+      if (indices.size() <= 1) {
+        continue;
+      }
+
+      const int owner = choose_public_conflict_owner(result, public_id, indices);
+      const std::array<float, 4> owner_bbox =
+          bbox4_from_ptr(result.detections.data() + static_cast<size_t>(owner) * kDetectionFields);
+      for (int idx : indices) {
+        if (idx == owner) {
+          continue;
+        }
+        const std::array<float, 4> bbox =
+            bbox4_from_ptr(result.detections.data() + static_cast<size_t>(idx) * kDetectionFields);
+        if (same_public_duplicate(owner_bbox, bbox) ||
+            !should_split_public_conflict(owner_bbox, bbox)) {
+          keep[static_cast<size_t>(idx)] = 0;
+          result.final_dedup_removed += 1;
+          changed = true;
+          continue;
+        }
+        const int raw_id = idx < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(idx)] : -1;
+        if (raw_id > 0) {
+          assign_new_public_id(raw_id);
+          changed = true;
+        }
+      }
+    }
+
+    if (!changed) {
+      return;
+    }
+    compact_result_with_raw_ids(result, raw_ids, keep);
+  }
+
   void add_coasting_tracks(FrameResult& result,
-                           const std::vector<int>& active_raw_ids,
+                           std::vector<int>& active_raw_ids,
                            const std::map<int, NativeTrackSnapshot>& snapshot_by_raw) {
     if (!cfg_.kalman_bbox && cfg_.coast_frames <= 0) {
       return;
@@ -3897,13 +4407,13 @@ class NativeHybridSortTracker {
       out[1] = bbox[1];
       out[2] = bbox[2];
       out[3] = bbox[3];
-      result.track_ids.push_back(public_id_for(raw_id));
+      active_raw_ids.push_back(raw_id);
       result.detection_count += 1;
       result.coasting_added += 1;
     }
   }
 
-  void apply_final_boundary_dedup(FrameResult& result) {
+  void apply_final_boundary_dedup(FrameResult& result, std::vector<int>& raw_ids) {
     if (!cfg_.final_boundary_dedup || result.detection_count <= 1) {
       return;
     }
@@ -3929,7 +4439,9 @@ class NativeHybridSortTracker {
         if (!is_final_boundary_duplicate(a, side_a, b, side_b)) {
           continue;
         }
-        const int drop = choose_final_boundary_duplicate_drop(result, i, j);
+        const int drop = choose_final_boundary_duplicate_drop(result, raw_ids, i, j);
+        const int keep_idx = drop == i ? j : i;
+        alias_final_boundary_duplicate_public_id(raw_ids, keep_idx, drop);
         keep[static_cast<size_t>(drop)] = 0;
         result.final_dedup_removed += 1;
         if (drop == i) {
@@ -3940,24 +4452,147 @@ class NativeHybridSortTracker {
     if (result.final_dedup_removed <= 0) {
       return;
     }
+    compact_result_with_raw_ids(result, raw_ids, keep);
+  }
 
+  void apply_close_small_dedup(FrameResult& result, std::vector<int>& raw_ids) {
+    if ((!cfg_.close_small_dedup && !cfg_.normal_duplicate_dedup) ||
+        result.detection_count <= 1) {
+      return;
+    }
+    const int n = result.detection_count;
+    std::vector<uint8_t> keep(static_cast<size_t>(n), 1);
+    int removed = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!keep[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const std::array<float, 4> a =
+          bbox4_from_ptr(result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
+      for (int j = i + 1; j < n; ++j) {
+        if (!keep[static_cast<size_t>(j)]) {
+          continue;
+        }
+        const std::array<float, 4> b =
+            bbox4_from_ptr(result.detections.data() + static_cast<size_t>(j) * kDetectionFields);
+        const bool close_small_duplicate = is_close_small_duplicate(a, b);
+        const bool normal_duplicate =
+            !close_small_duplicate && is_normal_close_duplicate(a, b);
+        if (!close_small_duplicate && !normal_duplicate) {
+          continue;
+        }
+        const int drop = choose_close_small_duplicate_drop(result, raw_ids, i, j);
+        keep[static_cast<size_t>(drop)] = 0;
+        if (close_small_duplicate) {
+          result.close_small_dedup_removed += 1;
+        } else {
+          result.normal_duplicate_dedup_removed += 1;
+        }
+        removed += 1;
+        if (drop == i) {
+          break;
+        }
+      }
+    }
+    if (removed <= 0) {
+      return;
+    }
+    compact_result_with_raw_ids(result, raw_ids, keep);
+  }
+
+  void apply_close_small_output_dedup(FrameResult& result, int active_count) {
+    if ((!cfg_.close_small_dedup && !cfg_.normal_duplicate_dedup) ||
+        result.detection_count <= 1 ||
+        result.track_ids.size() < static_cast<size_t>(result.detection_count)) {
+      return;
+    }
+    const int n = result.detection_count;
+    active_count = std::max(0, std::min(active_count, n));
+    std::vector<uint8_t> keep(static_cast<size_t>(n), 1);
+    int removed = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!keep[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const std::array<float, 4> a =
+          bbox4_from_ptr(result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
+      for (int j = i + 1; j < n; ++j) {
+        if (!keep[static_cast<size_t>(j)]) {
+          continue;
+        }
+        const std::array<float, 4> b =
+            bbox4_from_ptr(result.detections.data() + static_cast<size_t>(j) * kDetectionFields);
+        const bool close_small_duplicate = is_close_small_duplicate(a, b);
+        const bool normal_duplicate =
+            !close_small_duplicate && is_normal_close_duplicate(a, b);
+        if (!close_small_duplicate && !normal_duplicate) {
+          continue;
+        }
+        const int drop = choose_close_small_output_duplicate_drop(result, i, j, active_count);
+        keep[static_cast<size_t>(drop)] = 0;
+        if (close_small_duplicate) {
+          result.close_small_dedup_removed += 1;
+        } else {
+          result.normal_duplicate_dedup_removed += 1;
+        }
+        removed += 1;
+        if (drop == i) {
+          break;
+        }
+      }
+    }
+    if (removed <= 0) {
+      return;
+    }
+    compact_result_with_track_ids(result, keep);
+  }
+
+  void compact_result_with_raw_ids(FrameResult& result,
+                                   std::vector<int>& raw_ids,
+                                   const std::vector<uint8_t>& keep) {
+    const int n = result.detection_count;
     std::vector<float> compact;
-    std::vector<int> compact_ids;
+    std::vector<int> compact_raw_ids;
     compact.reserve(static_cast<size_t>(n) * kDetectionFields);
-    compact_ids.reserve(static_cast<size_t>(n));
+    compact_raw_ids.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       if (!keep[static_cast<size_t>(i)]) {
         continue;
       }
       const float* src = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
       compact.insert(compact.end(), src, src + kDetectionFields);
-      compact_ids.push_back(i < static_cast<int>(result.track_ids.size())
-                                ? result.track_ids[static_cast<size_t>(i)]
-                                : -1);
+      compact_raw_ids.push_back(i < static_cast<int>(raw_ids.size())
+                                    ? raw_ids[static_cast<size_t>(i)]
+                                    : -1);
     }
     result.detections.swap(compact);
-    result.track_ids.swap(compact_ids);
+    raw_ids.swap(compact_raw_ids);
+    result.detection_count = static_cast<int>(raw_ids.size());
+    result.track_ids.clear();
+    result.display_ids.clear();
+  }
+
+  void compact_result_with_track_ids(FrameResult& result,
+                                     const std::vector<uint8_t>& keep) {
+    const int n = result.detection_count;
+    std::vector<float> compact;
+    std::vector<int> compact_track_ids;
+    compact.reserve(static_cast<size_t>(n) * kDetectionFields);
+    compact_track_ids.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      if (!keep[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const float* src = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+      compact.insert(compact.end(), src, src + kDetectionFields);
+      compact_track_ids.push_back(i < static_cast<int>(result.track_ids.size())
+                                      ? result.track_ids[static_cast<size_t>(i)]
+                                      : -1);
+    }
+    result.detections.swap(compact);
+    result.track_ids.swap(compact_track_ids);
     result.detection_count = static_cast<int>(result.track_ids.size());
+    result.display_ids.clear();
   }
 
   bool is_final_boundary_duplicate(const std::array<float, 4>& a,
@@ -3977,15 +4612,31 @@ class NativeHybridSortTracker {
     float y_cover = 0.0f;
     float min_iou = 0.0f;
     const float inter = boundary_intersection_stats(a, side_a, b, side_b, &x_cover, &y_cover, &min_iou);
+    const float dist = boundary_center_distance_norm(a, side_a, b, side_b);
+    const float area_ratio =
+        std::min(bbox_area4(a), bbox_area4(b)) / (std::max(bbox_area4(a), bbox_area4(b)) + 1.0e-6f);
+    if (wrap_side &&
+        dist < cfg_.final_boundary_dedup_center_thresh &&
+        y_cover > 0.45f &&
+        area_ratio > cfg_.final_boundary_dedup_size_ratio_thresh) {
+      return true;
+    }
+    if (same_side) {
+      const float x_gap = std::max(0.0f, std::max(a[0], b[0]) - std::min(a[2], b[2]));
+      const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
+      if (dist < 1.25f &&
+          x_gap / avg_h < 0.35f &&
+          y_cover > 0.55f &&
+          area_ratio > cfg_.final_boundary_dedup_size_ratio_thresh) {
+        return true;
+      }
+    }
     if (inter <= 0.0f) {
       return false;
     }
     if (min_iou > cfg_.final_boundary_dedup_iou_thresh) {
       return true;
     }
-    const float dist = boundary_center_distance_norm(a, side_a, b, side_b);
-    const float area_ratio =
-        std::min(bbox_area4(a), bbox_area4(b)) / (std::max(bbox_area4(a), bbox_area4(b)) + 1.0e-6f);
     return dist < cfg_.final_boundary_dedup_center_thresh &&
            x_cover > 0.35f &&
            y_cover > 0.35f &&
@@ -4056,13 +4707,14 @@ class NativeHybridSortTracker {
     return std::sqrt(dx * dx + dy * dy) / avg_h;
   }
 
-  int choose_final_boundary_duplicate_drop(const FrameResult& result, int i, int j) const {
-    const int id_i =
-        i < static_cast<int>(result.track_ids.size()) ? result.track_ids[static_cast<size_t>(i)] : -1;
-    const int id_j =
-        j < static_cast<int>(result.track_ids.size()) ? result.track_ids[static_cast<size_t>(j)] : -1;
-    const int seen_i = public_seen_count(id_i);
-    const int seen_j = public_seen_count(id_j);
+  int choose_final_boundary_duplicate_drop(const FrameResult& result,
+                                           const std::vector<int>& raw_ids,
+                                           int i,
+                                           int j) const {
+    const int raw_i = i < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(i)] : -1;
+    const int raw_j = j < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(j)] : -1;
+    const int seen_i = public_seen_count_for_raw(raw_i);
+    const int seen_j = public_seen_count_for_raw(raw_j);
     if (seen_i != seen_j) {
       return seen_i > seen_j ? j : i;
     }
@@ -4078,25 +4730,777 @@ class NativeHybridSortTracker {
     return bbox_area4(box_i) >= bbox_area4(box_j) ? j : i;
   }
 
+  bool is_close_small_duplicate(const std::array<float, 4>& a,
+                                const std::array<float, 4>& b) const {
+    if (!cfg_.close_small_dedup || !finite_bbox(a) || !finite_bbox(b)) {
+      return false;
+    }
+    const float area_a = bbox_area4(a);
+    const float area_b = bbox_area4(b);
+    const float max_side_a = std::max(bbox_width(a), bbox_height(a));
+    const float max_side_b = std::max(bbox_width(b), bbox_height(b));
+    if (area_a <= 0.0f || area_b <= 0.0f ||
+        area_a > cfg_.close_small_dedup_max_area ||
+        area_b > cfg_.close_small_dedup_max_area ||
+        max_side_a > cfg_.close_small_dedup_max_side ||
+        max_side_b > cfg_.close_small_dedup_max_side) {
+      return false;
+    }
+
+    const float dist = center_distance_norm(a, b);
+    if (dist >= cfg_.close_small_dedup_center_thresh) {
+      return false;
+    }
+    const float iou = box_iou(a.data(), b.data());
+    if (iou > cfg_.close_small_dedup_iou_thresh) {
+      return false;
+    }
+    const float y_cover = bbox_y_cover(a, b);
+    const float x_gap = std::max(0.0f, std::max(a[0], b[0]) - std::min(a[2], b[2]));
+    const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
+    return y_cover > 0.25f && x_gap / avg_h < 0.55f;
+  }
+
+  bool is_normal_close_duplicate(const std::array<float, 4>& a,
+                                 const std::array<float, 4>& b) const {
+    if (!cfg_.normal_duplicate_dedup || !finite_bbox(a) || !finite_bbox(b)) {
+      return false;
+    }
+    const float size_score = size_ratio_score(a, b);
+    if (size_score < cfg_.normal_duplicate_size_ratio_thresh) {
+      return false;
+    }
+    const float dist_norm = center_distance_norm(a, b);
+    const float dist_px = center_distance_px(a, b);
+    const bool center_ok =
+        dist_px <= cfg_.normal_duplicate_abs_center_px ||
+        (dist_norm <= cfg_.normal_duplicate_center_thresh &&
+         dist_px <= cfg_.normal_duplicate_abs_center_px * 1.5f);
+    if (!center_ok) {
+      return false;
+    }
+    const float iou = box_iou(a.data(), b.data());
+    const float x_cover = bbox_x_cover(a, b);
+    const float y_cover = bbox_y_cover(a, b);
+    return iou >= cfg_.normal_duplicate_iou_thresh ||
+           (x_cover >= cfg_.normal_duplicate_cover_thresh &&
+            y_cover >= cfg_.normal_duplicate_cover_thresh);
+  }
+
+  float center_distance_px(const std::array<float, 4>& a,
+                           const std::array<float, 4>& b) const {
+    const auto ca = bbox_center(a);
+    const auto cb = bbox_center(b);
+    const float dx = ca[0] - cb[0];
+    const float dy = ca[1] - cb[1];
+    return std::sqrt(dx * dx + dy * dy);
+  }
+
+  int choose_close_small_duplicate_drop(const FrameResult& result,
+                                        const std::vector<int>& raw_ids,
+                                        int i,
+                                        int j) const {
+    const int raw_i = i < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(i)] : -1;
+    const int raw_j = j < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(j)] : -1;
+    const int seen_i = public_seen_count_for_raw(raw_i);
+    const int seen_j = public_seen_count_for_raw(raw_j);
+    if (seen_i != seen_j) {
+      return seen_i > seen_j ? j : i;
+    }
+
+    const float* det_i = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+    const float* det_j = result.detections.data() + static_cast<size_t>(j) * kDetectionFields;
+    if (std::fabs(det_i[4] - det_j[4]) > 1.0e-6f) {
+      return det_i[4] >= det_j[4] ? j : i;
+    }
+
+    const std::array<float, 4> box_i = bbox4_from_ptr(det_i);
+    const std::array<float, 4> box_j = bbox4_from_ptr(det_j);
+    return bbox_area4(box_i) >= bbox_area4(box_j) ? j : i;
+  }
+
+  int choose_close_small_output_duplicate_drop(const FrameResult& result,
+                                               int i,
+                                               int j,
+                                               int active_count) const {
+    const bool active_i = i < active_count;
+    const bool active_j = j < active_count;
+    if (active_i != active_j) {
+      return active_i ? j : i;
+    }
+
+    const int public_i =
+        i < static_cast<int>(result.track_ids.size()) ? result.track_ids[static_cast<size_t>(i)] : -1;
+    const int public_j =
+        j < static_cast<int>(result.track_ids.size()) ? result.track_ids[static_cast<size_t>(j)] : -1;
+    const int seen_i = public_i > 0 ? public_seen_count(public_i) : 0;
+    const int seen_j = public_j > 0 ? public_seen_count(public_j) : 0;
+    if (seen_i != seen_j) {
+      return seen_i > seen_j ? j : i;
+    }
+
+    const float* det_i = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+    const float* det_j = result.detections.data() + static_cast<size_t>(j) * kDetectionFields;
+    if (std::fabs(det_i[4] - det_j[4]) > 1.0e-6f) {
+      return det_i[4] >= det_j[4] ? j : i;
+    }
+
+    const std::array<float, 4> box_i = bbox4_from_ptr(det_i);
+    const std::array<float, 4> box_j = bbox4_from_ptr(det_j);
+    return bbox_area4(box_i) >= bbox_area4(box_j) ? j : i;
+  }
+
+  void alias_final_boundary_duplicate_public_id(const std::vector<int>& raw_ids,
+                                                int keep_idx,
+                                                int drop_idx) {
+    if (keep_idx < 0 || drop_idx < 0 ||
+        keep_idx >= static_cast<int>(raw_ids.size()) ||
+        drop_idx >= static_cast<int>(raw_ids.size())) {
+      return;
+    }
+    const int keep_raw = raw_ids[static_cast<size_t>(keep_idx)];
+    const int drop_raw = raw_ids[static_cast<size_t>(drop_idx)];
+    if (keep_raw <= 0 || drop_raw <= 0 || keep_raw == drop_raw) {
+      return;
+    }
+    const auto drop_it = public_id_map_.find(drop_raw);
+    if (drop_it != public_id_map_.end() && drop_it->second > 0) {
+      return;
+    }
+    const auto keep_it = public_id_map_.find(keep_raw);
+    if (keep_it != public_id_map_.end() && keep_it->second > 0) {
+      public_id_map_[drop_raw] = keep_it->second;
+    }
+  }
+
+  int choose_public_conflict_owner(const FrameResult& result,
+                                   int public_id,
+                                   const std::vector<int>& indices) const {
+    const auto last_it = public_last_bbox_.find(public_id);
+    if (last_it != public_last_bbox_.end() && finite_bbox(last_it->second)) {
+      int best = indices.empty() ? -1 : indices[0];
+      float best_dist = std::numeric_limits<float>::infinity();
+      for (int idx : indices) {
+        if (idx < 0 || idx >= result.detection_count) {
+          continue;
+        }
+        const std::array<float, 4> bbox =
+            bbox4_from_ptr(result.detections.data() + static_cast<size_t>(idx) * kDetectionFields);
+        if (!finite_bbox(bbox)) {
+          continue;
+        }
+        const float dist = center_distance_norm(bbox, last_it->second);
+        if (dist < best_dist) {
+          best_dist = dist;
+          best = idx;
+        }
+      }
+      if (best >= 0) {
+        return best;
+      }
+    }
+
+    int best = indices.empty() ? -1 : indices[0];
+    float best_score = -1.0f;
+    for (int idx : indices) {
+      if (idx < 0 || idx >= result.detection_count) {
+        continue;
+      }
+      const float* det = result.detections.data() + static_cast<size_t>(idx) * kDetectionFields;
+      if (det[4] > best_score) {
+        best_score = det[4];
+        best = idx;
+      }
+    }
+    return best;
+  }
+
+  bool same_public_duplicate(const std::array<float, 4>& a,
+                             const std::array<float, 4>& b) const {
+    if (!finite_bbox(a) || !finite_bbox(b)) {
+      return false;
+    }
+    const float iou = box_iou(a.data(), b.data());
+    const float dist = center_distance_norm(a, b);
+    const float size_score = size_ratio_score(a, b);
+    const float x_cover = bbox_x_cover(a, b);
+    const float y_cover = bbox_y_cover(a, b);
+    const BoundarySide side_a = boundary_side_for_bbox(a);
+    const BoundarySide side_b = boundary_side_for_bbox(b);
+    const bool same_boundary_side = side_a != BoundarySide::None && side_a == side_b;
+    const float x_gap = std::max(0.0f, std::max(a[0], b[0]) - std::min(a[2], b[2]));
+    const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
+    if (same_boundary_side &&
+        dist < 1.0f &&
+        size_score > 0.45f &&
+        y_cover > 0.55f &&
+        (x_cover > 0.25f || x_gap / avg_h < 0.15f)) {
+      return true;
+    }
+    return iou > 0.35f ||
+           (dist < 0.65f &&
+            size_score > 0.35f &&
+            x_cover > 0.30f &&
+            y_cover > 0.35f);
+  }
+
+  int count_local_current_targets(const FrameResult& result,
+                                  const std::array<float, 4>& bbox,
+                                  size_t self_index,
+                                  float dist_thresh) const {
+    if (!finite_bbox(bbox) || dist_thresh <= 0.0f) {
+      return 0;
+    }
+    int count = 0;
+    for (int i = 0; i < result.detection_count; ++i) {
+      const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+      const std::array<float, 4> other = bbox4_from_ptr(det);
+      if (!finite_bbox(other)) {
+        continue;
+      }
+      if (static_cast<size_t>(i) == self_index || center_distance_norm(bbox, other) <= dist_thresh) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  bool should_split_public_conflict(const std::array<float, 4>& a,
+                                    const std::array<float, 4>& b) const {
+    if (!finite_bbox(a) || !finite_bbox(b)) {
+      return false;
+    }
+    if (same_public_duplicate(a, b)) {
+      return false;
+    }
+    const float iou = box_iou(a.data(), b.data());
+    const float dist = center_distance_norm(a, b);
+    const float x_cover = bbox_x_cover(a, b);
+    const float y_cover = bbox_y_cover(a, b);
+    const float size_score = size_ratio_score(a, b);
+    if (iou > 0.20f && x_cover > 0.35f && y_cover > 0.55f && size_score > 0.35f) {
+      return false;
+    }
+    if (dist < 0.45f && x_cover > 0.20f && y_cover > 0.35f && size_score > 0.35f) {
+      return false;
+    }
+    if (dist < 0.80f && x_cover > 0.75f && y_cover > 0.30f && size_score > 0.60f) {
+      return false;
+    }
+    const BoundarySide side_a = boundary_side_for_bbox(a);
+    const BoundarySide side_b = boundary_side_for_bbox(b);
+    const bool same_boundary_side = side_a != BoundarySide::None && side_a == side_b;
+    if (same_boundary_side && y_cover > 0.55f) {
+      const float x_gap = std::max(0.0f, std::max(a[0], b[0]) - std::min(a[2], b[2]));
+      const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
+      if (dist < 1.25f &&
+          x_gap / avg_h < 0.15f &&
+          x_cover > 0.20f &&
+          size_score > 0.45f) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  float bbox_x_cover(const std::array<float, 4>& a,
+                     const std::array<float, 4>& b) const {
+    const float iw = std::max(0.0f, std::min(a[2], b[2]) - std::max(a[0], b[0]));
+    const float min_w = std::min(bbox_width(a), bbox_width(b));
+    return min_w > 0.0f ? iw / (min_w + 1.0e-6f) : 0.0f;
+  }
+
+  float bbox_y_cover(const std::array<float, 4>& a,
+                     const std::array<float, 4>& b) const {
+    const float ih = std::max(0.0f, std::min(a[3], b[3]) - std::max(a[1], b[1]));
+    const float min_h = std::min(bbox_height(a), bbox_height(b));
+    return min_h > 0.0f ? ih / (min_h + 1.0e-6f) : 0.0f;
+  }
+
   int public_seen_count(int public_id) const {
     const auto it = public_seen_count_.find(public_id);
     return it == public_seen_count_.end() ? 0 : it->second;
   }
 
+  int public_seen_count_for_raw(int raw_id) const {
+    const auto it = public_id_map_.find(raw_id);
+    return it == public_id_map_.end() ? 0 : public_seen_count(it->second);
+  }
+
+  int assign_new_public_id(int raw_id) {
+    public_id_counter_ += 1;
+    public_id_map_[raw_id] = public_id_counter_;
+    return public_id_counter_;
+  }
+
+  void apply_display_ids(FrameResult& result) {
+    result.display_ids.clear();
+    if (!cfg_.display_id_reuse ||
+        result.track_ids.size() < static_cast<size_t>(result.detection_count)) {
+      return;
+    }
+
+    std::set<int> active_public_ids;
+    for (int i = 0; i < result.detection_count; ++i) {
+      const int public_id = result.track_ids[static_cast<size_t>(i)];
+      if (public_id > 0) {
+        active_public_ids.insert(public_id);
+      }
+    }
+
+    for (auto it = display_id_by_public_.begin(); it != display_id_by_public_.end();) {
+      if (active_public_ids.find(it->first) != active_public_ids.end()) {
+        ++it;
+        continue;
+      }
+      const int display_id = it->second;
+      if (display_id > 0) {
+        free_display_ids_.insert(display_id);
+      }
+      it = display_id_by_public_.erase(it);
+    }
+
+    result.display_ids.reserve(static_cast<size_t>(result.detection_count));
+    for (int i = 0; i < result.detection_count; ++i) {
+      const int public_id = result.track_ids[static_cast<size_t>(i)];
+      if (public_id <= 0) {
+        result.display_ids.push_back(-1);
+        continue;
+      }
+      auto display_it = display_id_by_public_.find(public_id);
+      if (display_it == display_id_by_public_.end()) {
+        const float* det =
+            result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+        const std::array<float, 4> bbox = bbox4_from_ptr(det);
+        int display_id = choose_reusable_display_id(bbox);
+        if (display_id > 0) {
+          free_display_ids_.erase(display_id);
+        } else {
+          display_id = ++display_id_counter_;
+        }
+        display_id_by_public_[public_id] = display_id;
+        display_it = display_id_by_public_.find(public_id);
+      }
+      const int display_id = display_it->second;
+      result.display_ids.push_back(display_id);
+      const float* det =
+          result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+      const std::array<float, 4> bbox = bbox4_from_ptr(det);
+      if (display_id > 0 && finite_bbox(bbox)) {
+        display_last_bbox_[display_id] = bbox;
+        display_last_frame_[display_id] = frame_id_;
+      }
+    }
+  }
+
+  int choose_reusable_display_id(const std::array<float, 4>& bbox) const {
+    if (free_display_ids_.empty()) {
+      return 0;
+    }
+    const int fallback_display_id = *free_display_ids_.begin();
+    if (!cfg_.display_id_reuse_spatial ||
+        cfg_.display_id_reuse_max_frames <= 0 ||
+        !finite_bbox(bbox)) {
+      return fallback_display_id;
+    }
+
+    int best_display_id = 0;
+    float best_score = std::numeric_limits<float>::infinity();
+    float second_best_score = std::numeric_limits<float>::infinity();
+    for (int display_id : free_display_ids_) {
+      const auto bbox_it = display_last_bbox_.find(display_id);
+      const auto frame_it = display_last_frame_.find(display_id);
+      if (bbox_it == display_last_bbox_.end() ||
+          frame_it == display_last_frame_.end() ||
+          !finite_bbox(bbox_it->second)) {
+        continue;
+      }
+      const int missing_frames = frame_id_ - frame_it->second;
+      if (missing_frames <= 0 || missing_frames > cfg_.display_id_reuse_max_frames) {
+        continue;
+      }
+      const float size_score = size_ratio_score(bbox, bbox_it->second);
+      if (size_score < cfg_.display_id_reuse_size_ratio_thresh) {
+        continue;
+      }
+      const float dist = center_distance_norm(bbox, bbox_it->second);
+      if (dist >= cfg_.display_id_reuse_center_thresh) {
+        continue;
+      }
+      const float time_score =
+          static_cast<float>(missing_frames) /
+          static_cast<float>(std::max(1, cfg_.display_id_reuse_max_frames));
+      const float score = dist + time_score * 0.10f;
+      if (score < best_score) {
+        second_best_score = best_score;
+        best_score = score;
+        best_display_id = display_id;
+      } else if (score < second_best_score) {
+        second_best_score = score;
+      }
+    }
+
+    if (best_display_id > 0) {
+      if (std::isfinite(second_best_score) &&
+          (second_best_score - best_score) < cfg_.display_id_reuse_ambiguity_margin) {
+        return fallback_display_id;
+      }
+      return best_display_id;
+    }
+    return fallback_display_id;
+  }
+
   void update_public_seen_counts(const FrameResult& result) {
+    std::set<int> seen_this_frame;
     for (int i = 0; i < result.detection_count; ++i) {
       if (i >= static_cast<int>(result.track_ids.size())) {
         continue;
       }
       const int public_id = result.track_ids[static_cast<size_t>(i)];
-      if (public_id > 0) {
+      if (public_id > 0 && seen_this_frame.insert(public_id).second) {
         public_seen_count_[public_id] += 1;
       }
     }
   }
 
-  void update_lost_state(const std::vector<int>& current_active_raw_ids,
-                         const std::map<int, NativeTrackSnapshot>& snapshot_by_raw) {
+  void update_public_last_bboxes(const FrameResult& result) {
+    for (int i = 0; i < result.detection_count; ++i) {
+      if (i >= static_cast<int>(result.track_ids.size())) {
+        continue;
+      }
+      const int public_id = result.track_ids[static_cast<size_t>(i)];
+      if (public_id <= 0) {
+        continue;
+      }
+      const std::array<float, 4> bbox =
+          bbox4_from_ptr(result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
+      if (finite_bbox(bbox)) {
+        public_last_bbox_[public_id] = bbox;
+        public_last_frame_[public_id] = frame_id_;
+        std::array<float, kDetectionFields> cached{};
+        const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+        std::copy(det, det + kDetectionFields, cached.begin());
+        public_last_detection_[public_id] = cached;
+      }
+    }
+  }
+
+  void add_public_coasting_tracks(FrameResult& result) {
+    if (!cfg_.coast_hold || cfg_.coast_frames <= 0 || public_last_detection_.empty()) {
+      return;
+    }
+
+    const int real_count = result.detection_count;
+    std::set<int> active_public;
+    std::vector<std::array<float, 4>> active_bboxes;
+    active_bboxes.reserve(static_cast<size_t>(real_count));
+    for (int i = 0; i < real_count; ++i) {
+      if (i >= static_cast<int>(result.track_ids.size())) {
+        continue;
+      }
+      const int public_id = result.track_ids[static_cast<size_t>(i)];
+      if (public_id > 0) {
+        active_public.insert(public_id);
+      }
+      const std::array<float, 4> bbox =
+          bbox4_from_ptr(result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
+      if (finite_bbox(bbox)) {
+        active_bboxes.push_back(bbox);
+      }
+    }
+
+    for (const auto& item : public_last_detection_) {
+      const int public_id = item.first;
+      if (active_public.find(public_id) != active_public.end()) {
+        continue;
+      }
+      const auto frame_it = public_last_frame_.find(public_id);
+      if (frame_it == public_last_frame_.end()) {
+        continue;
+      }
+      const int missing_frames = frame_id_ - frame_it->second;
+      if (missing_frames <= 0 || missing_frames > cfg_.coast_frames) {
+        continue;
+      }
+      const auto bbox_it = public_last_bbox_.find(public_id);
+      if (bbox_it == public_last_bbox_.end() || !finite_bbox(bbox_it->second)) {
+        continue;
+      }
+      bool covered_by_current_output = false;
+      for (const std::array<float, 4>& active_bbox : active_bboxes) {
+        if (same_public_duplicate(bbox_it->second, active_bbox)) {
+          covered_by_current_output = true;
+          break;
+        }
+      }
+      if (covered_by_current_output) {
+        continue;
+      }
+      if (result.detection_count >= cfg_.max_output_dets) {
+        break;
+      }
+
+      const size_t required =
+          (static_cast<size_t>(result.detection_count) + 1) * kDetectionFields;
+      if (result.detections.size() < required) {
+        result.detections.resize(required, 0.0f);
+      }
+      float* out = result.detections.data() +
+                   static_cast<size_t>(result.detection_count) * kDetectionFields;
+      std::copy(item.second.begin(), item.second.end(), out);
+      result.track_ids.push_back(public_id);
+      active_public.insert(public_id);
+      active_bboxes.push_back(bbox_it->second);
+      result.detection_count += 1;
+      result.coasting_added += 1;
+    }
+  }
+
+  void apply_recent_public_occlusion_recovery(FrameResult& result,
+                                              const std::vector<int>& raw_ids) {
+    if (public_last_bbox_.empty() || result.detection_count <= 0) {
+      return;
+    }
+
+    std::set<int> active_public;
+    for (int raw_id : raw_ids) {
+      const auto map_it = public_id_map_.find(raw_id);
+      if (map_it != public_id_map_.end() && map_it->second > 0) {
+        active_public.insert(map_it->second);
+      }
+    }
+
+    std::set<int> claimed_public;
+    for (size_t i = 0; i < raw_ids.size(); ++i) {
+      const int raw_id = raw_ids[i];
+      if (raw_id <= 0 || public_id_map_.find(raw_id) != public_id_map_.end()) {
+        continue;
+      }
+      if (i >= static_cast<size_t>(result.detection_count)) {
+        continue;
+      }
+      const float* det = result.detections.data() + i * kDetectionFields;
+      const std::array<float, 4> bbox = bbox4_from_ptr(det);
+      if (!finite_bbox(bbox)) {
+        continue;
+      }
+
+      const int recovery_window = std::max(cfg_.coast_frames, max_age_);
+      if (recovery_window <= 0) {
+        return;
+      }
+
+      const float strict_dist_thresh = std::min(cfg_.inherit_center_dist_thresh, 0.75f);
+      const float relaxed_dist_thresh = cfg_.public_recover_center_dist_thresh;
+      const int local_target_count =
+          relaxed_dist_thresh > 0.0f
+              ? count_local_current_targets(result, bbox, i, relaxed_dist_thresh)
+              : 0;
+      const bool local_single_target =
+          relaxed_dist_thresh > 0.0f && local_target_count == 1;
+
+      PublicRecoverDebug debug;
+      debug.raw_id = raw_id;
+      debug.bbox = bbox;
+      debug.local_target_count = local_target_count;
+      debug.local_single_target = local_single_target;
+      debug.recovery_window = recovery_window;
+      debug.result = "no_candidate";
+
+      int strict_best_public = -1;
+      float strict_best_dist = strict_dist_thresh;
+      float strict_second_best_dist = std::numeric_limits<float>::infinity();
+      int relaxed_best_public = -1;
+      float relaxed_best_dist = std::numeric_limits<float>::infinity();
+      float relaxed_second_best_dist = std::numeric_limits<float>::infinity();
+      float second_best_dist = std::numeric_limits<float>::infinity();
+      for (const auto& item : public_last_bbox_) {
+        const int public_id = item.first;
+        PublicRecoverCandidateDebug cand;
+        cand.public_id = public_id;
+        if (active_public.find(public_id) != active_public.end() ||
+            claimed_public.find(public_id) != claimed_public.end()) {
+          cand.reject_reason = "active_or_claimed";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        const auto frame_it = public_last_frame_.find(public_id);
+        if (frame_it == public_last_frame_.end()) {
+          cand.reject_reason = "no_last_frame";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        const int missing_frames = frame_id_ - frame_it->second;
+        cand.missing_frames = missing_frames;
+        if (missing_frames <= 0 || missing_frames > recovery_window) {
+          cand.reject_reason = "outside_recovery_window";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        const std::array<float, 4>& last_bbox = item.second;
+        cand.last_bbox = last_bbox;
+        if (!finite_bbox(last_bbox)) {
+          cand.reject_reason = "invalid_last_bbox";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        const float size_score = size_ratio_score(last_bbox, bbox);
+        cand.size_score = size_score;
+        if (size_score < cfg_.inherit_size_ratio_thresh) {
+          cand.reject_reason = "size_gate";
+          debug.candidates.push_back(cand);
+          continue;
+        }
+        const float dist = center_distance_norm(last_bbox, bbox);
+        cand.dist = dist;
+        cand.strict_duplicate = same_public_duplicate(last_bbox, bbox);
+        const bool strict_ok = cand.strict_duplicate && dist < strict_dist_thresh;
+        cand.strict_ok = strict_ok;
+        if (strict_ok) {
+          if (dist < strict_best_dist) {
+            strict_second_best_dist = strict_best_dist;
+            strict_best_dist = dist;
+            strict_best_public = public_id;
+          } else if (dist < strict_second_best_dist) {
+            strict_second_best_dist = dist;
+          }
+        }
+
+        const bool relaxed_window_ok =
+            cfg_.public_recover_max_frames > 0 && missing_frames <= cfg_.public_recover_max_frames;
+        cand.relaxed_ok = local_single_target && relaxed_window_ok && dist < relaxed_dist_thresh;
+        if (cand.relaxed_ok) {
+          if (dist < relaxed_best_dist) {
+            relaxed_second_best_dist = relaxed_best_dist;
+            relaxed_best_dist = dist;
+            relaxed_best_public = public_id;
+          } else if (dist < relaxed_second_best_dist) {
+            relaxed_second_best_dist = dist;
+          }
+        }
+        if (cand.strict_ok || cand.relaxed_ok) {
+          cand.reject_reason = "candidate";
+        } else if (!local_single_target) {
+          cand.reject_reason = "not_local_single";
+        } else if (!relaxed_window_ok) {
+          cand.reject_reason = "outside_public_recover_window";
+        } else {
+          cand.reject_reason = "distance_or_duplicate_gate";
+        }
+        debug.candidates.push_back(cand);
+      }
+
+      int best_public = strict_best_public;
+      float best_dist = strict_best_dist;
+      second_best_dist = strict_second_best_dist;
+      debug.mode = "strict";
+      if (best_public <= 0 && local_single_target) {
+        best_public = relaxed_best_public;
+        best_dist = relaxed_best_dist;
+        second_best_dist = relaxed_second_best_dist;
+        debug.mode = "relaxed";
+      }
+
+      if (best_public <= 0) {
+        result.public_recover_debug.push_back(debug);
+        continue;
+      }
+      if (std::isfinite(second_best_dist) &&
+          (second_best_dist - best_dist) < cfg_.inherit_ambiguity_margin) {
+        debug.chosen_public_id = best_public;
+        debug.result = "ambiguity";
+        result.public_recover_debug.push_back(debug);
+        continue;
+      }
+      public_id_map_[raw_id] = best_public;
+      active_public.insert(best_public);
+      claimed_public.insert(best_public);
+      result.inherited_ids += 1;
+      debug.chosen_public_id = best_public;
+      debug.result = "assigned";
+      result.public_recover_debug.push_back(debug);
+    }
+  }
+
+  void apply_recent_public_boundary_recovery(FrameResult& result,
+                                             const std::vector<int>& raw_ids,
+                                             std::set<int>& active_public,
+                                             std::set<int>& claimed_public) {
+    if (public_last_bbox_.empty() || result.detection_count <= 0) {
+      return;
+    }
+    const int recent_window = std::max(1, std::min(cfg_.boundary_time_window, 3));
+    for (size_t i = 0; i < raw_ids.size(); ++i) {
+      const int raw_id = raw_ids[i];
+      if (raw_id <= 0 || public_id_map_.find(raw_id) != public_id_map_.end()) {
+        continue;
+      }
+      if (i >= static_cast<size_t>(result.detection_count)) {
+        continue;
+      }
+      const float* det = result.detections.data() + i * kDetectionFields;
+      const std::array<float, 4> bbox = bbox4_from_ptr(det);
+      const BoundarySide appear_side = boundary_side_for_bbox(bbox);
+      if (appear_side == BoundarySide::None) {
+        continue;
+      }
+
+      int best_public = -1;
+      float best_score = cfg_.boundary_center_dist_thresh;
+      float second_best_score = std::numeric_limits<float>::infinity();
+      for (const auto& item : public_last_bbox_) {
+        const int public_id = item.first;
+        if (active_public.find(public_id) != active_public.end() ||
+            claimed_public.find(public_id) != claimed_public.end()) {
+          continue;
+        }
+        const auto frame_it = public_last_frame_.find(public_id);
+        if (frame_it == public_last_frame_.end() ||
+            frame_id_ - frame_it->second > recent_window) {
+          continue;
+        }
+        const std::array<float, 4>& last_bbox = item.second;
+        const BoundarySide lost_side = boundary_side_for_bbox(last_bbox);
+        if (lost_side == BoundarySide::None ||
+            opposite_boundary(lost_side) != appear_side) {
+          continue;
+        }
+        const float size_score = size_ratio_score(last_bbox, bbox);
+        if (size_score < cfg_.boundary_size_ratio_thresh) {
+          continue;
+        }
+        BoundaryLostTarget pseudo_lost;
+        pseudo_lost.raw_id = -1;
+        pseudo_lost.frame_index = frame_it->second;
+        pseudo_lost.side = lost_side;
+        pseudo_lost.bbox = last_bbox;
+        const float dist = boundary_distance_score(pseudo_lost, bbox, appear_side, true);
+        if (dist > cfg_.boundary_center_dist_thresh) {
+          continue;
+        }
+        if (dist < best_score) {
+          second_best_score = best_score;
+          best_score = dist;
+          best_public = public_id;
+        } else if (dist < second_best_score) {
+          second_best_score = dist;
+        }
+      }
+      if (best_public <= 0) {
+        continue;
+      }
+      if (std::isfinite(second_best_score) &&
+          (second_best_score - best_score) < cfg_.inherit_ambiguity_margin) {
+        continue;
+      }
+      public_id_map_[raw_id] = best_public;
+      active_public.insert(best_public);
+      claimed_public.insert(best_public);
+      result.boundary_recovered += 1;
+    }
+  }
+
+  void register_lost_targets(const std::vector<int>& current_active_raw_ids) {
     std::vector<int> lost_ids;
     for (int prev_raw : prev_active_raw_ids_) {
       if (std::find(current_active_raw_ids.begin(), current_active_raw_ids.end(), prev_raw) ==
@@ -4106,6 +5510,9 @@ class NativeHybridSortTracker {
     }
     for (int lost_raw : lost_ids) {
       bbox_cache_.erase(lost_raw);
+      if (public_id_map_.find(lost_raw) == public_id_map_.end()) {
+        continue;
+      }
       const auto prev_it = prev_bbox_.find(lost_raw);
       if (prev_it == prev_bbox_.end()) {
         continue;
@@ -4129,7 +5536,10 @@ class NativeHybridSortTracker {
       boundary_lost_.push_back(lost);
     }
     cleanup_boundary_lost();
+  }
 
+  void update_active_track_state(const std::vector<int>& current_active_raw_ids,
+                                 const std::map<int, NativeTrackSnapshot>& snapshot_by_raw) {
     prev_prev_bbox_ = prev_bbox_;
     prev_bbox_.clear();
     for (int raw_id : current_active_raw_ids) {
@@ -4270,7 +5680,15 @@ class NativeHybridSortTracker {
   HybridSortHandle handle_;
   std::map<int, int> public_id_map_;
   std::map<int, int> public_seen_count_;
+  std::map<int, std::array<float, 4>> public_last_bbox_;
+  std::map<int, int> public_last_frame_;
+  std::map<int, std::array<float, kDetectionFields>> public_last_detection_;
+  std::map<int, int> display_id_by_public_;
+  std::set<int> free_display_ids_;
+  std::map<int, std::array<float, 4>> display_last_bbox_;
+  std::map<int, int> display_last_frame_;
   int public_id_counter_ = 0;
+  int display_id_counter_ = 0;
   int frame_id_ = 0;
   int max_age_ = 0;
   std::map<int, std::array<float, kDetectionFields>> meta_cache_;
