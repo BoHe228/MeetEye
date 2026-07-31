@@ -1,7 +1,7 @@
 # MeetEye
 
-**Real-time multi-person localization for fisheye panoramic cameras.**  
-Detects, tracks, and estimates the azimuth, elevation, and distance of every person in a 360° scene — at interactive frame rates on a single GPU.
+**Real-time multi-person localization for fisheye panoramic and wide-angle cameras.**
+MeetEye detects faces/persons, keeps stable IDs, estimates azimuth/elevation/distance, and streams annotated video plus JSON from either a GPU workstation or an RK3588 edge board.
 
 [中文文档 →](README_zh.md)
 
@@ -31,9 +31,9 @@ https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b
 
 https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181
 
-*To compress your own result video for GitHub, run:*
+*To compress your own result video for GitHub, run ffmpeg directly:*
 ```bash
-python compress_demo.py -i your_result.mp4 -o demo.mp4 --duration 180 --scale 1280:-2 --crf 18
+ffmpeg -y -i your_result.mp4 -t 180 -vf scale=1280:-2 -c:v libx264 -crf 18 -preset medium -movflags +faststart demo.mp4
 ```
 
 ---
@@ -41,33 +41,23 @@ python compress_demo.py -i your_result.mp4 -o demo.mp4 --duration 180 --scale 12
 ## What It Does
 
 ```
-Fisheye Camera (360°)
-      │
-      ▼
- GPU Fisheye Unwarping  ──────────────────────────────────────────┐
-      │                                                           │
-      ▼                                                   Panorama (3840 × 1080)
- Panoramic Slicing  ──  3 overlapping sub-images                 │
-      │                                                           │
-      ▼                                                           │
- YOLOv8 / YOLO26 Pose Detection  (batch GPU inference)           │
-      │                                                           │
-      ▼                                                           │
- Cross-Slice Deduplication  (NMS + ReID similarity)              │
-      │                                                           │
-      ▼                                                           │
- OSNet ReID Feature Extraction  (GPU crop → feature)             │
-      │                                                           │
-      ▼                                                           │
- Multi-Target Tracking                                            │
-  ├── HybridSORT  (IoU + VDC + TCM, default)                     │
-  └── BoT-SORT    (IoU + ReID EMA)                               │
-      │                                                           │
-      ▼                                                           │
- Azimuth / Elevation / Distance per Person                       │
-      │                                                           │
-      ▼                                                           │
- Output: annotated video  │  JSON WebSocket stream  │  WebUI     │
+Fisheye camera                    Wide-angle camera
+      │                                  │
+      ▼                                  ▼
+Panorama unwrap + 3 slices        Undistort / full-frame letterbox
+      │                                  │
+      └─────────────── YOLO face/person detection ───────────────┐
+                                                                 │
+       Cross-slice / same-frame / boundary deduplication          │
+                                                                 │
+       Native HybridSORT tracking + raw/public/display IDs        │
+                                                                 │
+       Optional AdaFace RKNN face recognition                     │
+       IR18 / IR50 · five-point alignment · dynamic FaceID library│
+                                                                 │
+       Angle / distance calculation                               │
+                                                                 │
+       Output: annotated WebUI │ JSON/WebSocket │ JSONL/profile   │
 ```
 
 ---
@@ -76,19 +66,17 @@ Fisheye Camera (360°)
 
 | Feature | Detail |
 |---------|--------|
-| **Full 360° coverage** | Single fisheye lens → GPU-unwarped panorama; persons near the left/right wrap edge are matched across the seam |
-| **Two trackers** | **HybridSORT** (default): IoU + 4-corner VDC + TCM; handles crossing, dense crowds. **BoT-SORT**: IoU + ReID EMA; reliable in sparse scenes |
-| **Tracking stability fixes** | VDC velocity-magnitude gate (oscillatory motion → decay instead of wrong direction); BoT-SORT pre-assignment overlap detection eliminates `fuse_score` confidence bias |
-| **GPU pipeline** | Fisheye unwarping, YOLO batch inference, and OSNet ReID all run on GPU; typical end-to-end latency ≈ 30–50 ms/frame on RTX 3080 |
-| **3D angular output** | Per-target azimuth (°) and elevation (°) from a calibrated polynomial fit; distance (m) estimated from inter-eye keypoint span |
-| **Recall boost** | Optional second detector (`--recall-boost`, e.g. `yolo26n`) recovers occluded / back-facing persons missed by the pose model and fuses them in; keypoint-less targets get an angle from a synthesized top-center reference point |
-| **Sector aggregation** | `--sector-output` splits the 360° horizon into N sectors (ID-agnostic), emits azimuth/elevation of the largest target per sector, and highlights it with a red box (WebUI mode) |
-| **Track coasting** | `--coast-frames N` keeps a momentarily-missed track alive with its Kalman-predicted box for up to N frames — resumes if it returns, drops otherwise (independent switch, does not alter normal boxes) |
-| **Face ID / speaking detection** | Optional AdaFace face recognition (`--use-face-rec`) labels names per track_id; MediaPipe mouth-aspect-ratio speaking detection (`--talking-detection`) |
-| **Two run modes** | **Local** (`main.py`): camera/video/folder + OpenCV display. **WebUI** (`webui/`): FastAPI server + browser dashboard + JSON WebSocket |
-| **TensorRT support** | Export YOLO `.pt` → `.engine` with `export_trt.py`; ~3× speedup over PyTorch on Jetson / desktop GPU |
-| **RK3588 edge deployment** | Board-side RKNN INT8 runtime, headless video/camera JSONL, WebUI, sector output, OpenCL direct-slice remap, NPU slice parallelism, and a Buildroot-oriented pure C++ runtime live in [`face_rc/`](face_rc/). See [`face_rc/README.md`](face_rc/README.md) |
-| **YOLO fine-tuning workspace** | Dataset conversion, pose fine-tuning, meeting-video auto-label review, INT8 calibration slice export, and server-side TensorRT INT8 checks live in [`fine-tune/`](fine-tune/). See [`fine-tune/README.md`](fine-tune/README.md) |
+| **Fisheye and wide-angle input** | Fisheye mode unwraps to a 2560/3840 panorama and uses overlapping slices. Wide-angle mode uses a calibrated full-frame path and disables fisheye-only wrap recovery. |
+| **RK3588 C++ edge runtime** | `face_rc/board_cpp` is the current board path: libjpeg-turbo decode, OpenCL remap/letterbox, RKNN inference, native HybridSORT, WebUI, JSONL, profiling, and camera/image-list input. |
+| **Tracking stability** | Native tracker includes small residual-box protection, tracker-input deduplication, lost-track reconnect, wrap-aware distance checks, raw duplicate retirement, and output-level coasting. |
+| **Display ID slots** | `--display-id-max-count` limits the public-facing IDs. Existing track/display bindings are kept first; new targets replace old slots only after confirmation, primarily by track hit age and bbox area. |
+| **Face recognition** | Optional AdaFace IR18/IR50 RKNN recognition with five-point 112x112 alignment, dynamic FaceID library, raw-track binding, tentative carry, relink, and async inference. |
+| **WebUI** | Browser dashboard shows annotated video, hardware load, JSON, display slots, FaceID thumbnails, and supports downscaled WebUI JPEG output via `--webui-frame-scale`. |
+| **Pipeline execution** | Image/camera decode prefetch queue, fisheye staging pipeline, wide-angle dual YOLO worker mode, async AdaFace worker, and async WebUI JPEG publishing reduce blocking in the main loop. |
+| **Angle and distance output** | Per-target azimuth, elevation, distance, eye distance, FaceID, public ID, raw track ID, and display ID are emitted in JSON. |
+| **Sector aggregation** | `--sector-output` switches output to sector-level largest-target reporting for downstream control systems that do not need identity continuity. |
+| **GPU prototype and tools** | `mytest/` keeps the GPU/WebUI prototype, face-recognition observer, wide-angle testing path, and visualization tools. |
+| **YOLO fine-tuning workspace** | Dataset conversion, pose/face fine-tuning, CVAT review, calibration slice export, and TensorRT/RKNN checks live in [`fine-tune/`](fine-tune/). |
 
 ---
 
@@ -170,11 +158,51 @@ python angle_visualizer.py --test
 
 ### 4 · RK3588 edge deployment
 
-The RK3588 deployment path is maintained separately under [`face_rc/`](face_rc/). It includes the Python board runtime, RKNN INT8 model loading, three-core slice parallel inference, direct-slice fisheye remap, C++ merge/NMS acceleration, headless JSONL output, camera input, WebUI preview, video recording, and sector-format output.
+The RK3588 deployment path is maintained under [`face_rc/`](face_rc/). The recommended board runtime is the C++ path in [`face_rc/board_cpp`](face_rc/board_cpp/). It supports fisheye panorama mode and calibrated wide-angle full-frame mode.
 
-For very small Buildroot systems, [`face_rc/board_cpp`](face_rc/board_cpp/) contains the pure C++ board path: libjpeg-turbo MJPEG/JPEG decode, OpenCL slice remap, RKNN inference, native HybridSORT tracking, sector JSON, WebSocket push, profiling, camera decode prefetch, and RKNN bound-input fallback handling.
+Fisheye image-list example:
 
-For board setup, runtime commands, lock-frequency checks, and troubleshooting, see [`face_rc/README.md`](face_rc/README.md).
+```bash
+cd face_rc/board_cpp
+
+sudo taskset -c 0-6 bash run_smoke.sh \
+  --image-list test_frames/meeting_6_4_multi_10min_all_frames.txt \
+  --map-dir "maps/meeting_6_4_multi_10min_cpp" \
+  --webui \
+  --face-rec \
+  --face-rec-dynamic-library \
+  --face-rec-model-preset ir50_webface4m \
+  --face-rec-align-mode five-point \
+  --face-rec-async \
+  --display-id-max-count 8 \
+  --webui-frame-scale 0.5 \
+  --no-output-jsonl \
+  --no-stdout-json
+```
+
+Wide-angle camera example:
+
+```bash
+cd face_rc/board_cpp
+
+sudo taskset -c 0-6 bash run_smoke.sh \
+  --camera-device /dev/video0 \
+  --camera-width 2560 \
+  --camera-height 1440 \
+  --camera-fps 30 \
+  --map-dir maps/wide_angle_2k_full_cpp \
+  --projection-mode wide-angle \
+  --webui \
+  --face-rec \
+  --face-rec-dynamic-library \
+  --face-rec-model-preset ir50_webface4m \
+  --face-rec-align-mode five-point \
+  --dynamic-face-library-dir face_library_dynamic_wide \
+  --no-output-jsonl \
+  --no-stdout-json
+```
+
+For board setup, map generation, model conversion, lock-frequency checks, profiling reports, and troubleshooting, see [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md).
 
 ---
 
@@ -246,10 +274,22 @@ Run a second detection-only model to recover occluded / back-facing persons the 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--use-face-rec` / `--no-use-face-rec` | `False` | Enable AdaFace IR-18 face recognition; labels names per track_id |
+| `--use-face-rec` / `--no-use-face-rec` | `False` | Enable AdaFace face recognition in the Python/GPU path; labels identities separately from track IDs |
 | `--face-library-dir` | `face_library` | Face gallery dir (one `.npy` per person, filename = name) |
 | `--talking-detection` / `--no-talking-detection` | `False` | Enable MediaPipe FaceLandmarker mouth-aspect-ratio (MAR) speaking detection |
 | `--talking-mar-threshold` | `0.06` | MAR threshold above which a target is marked speaking |
+
+In `face_rc/board_cpp`, use `--face-rec` instead. The board runtime supports `--face-rec-model-preset ir18_webface4m` and `--face-rec-model-preset ir50_webface4m`; IR18 is the fallback path, while IR50 WebFace4M is the current preferred model for better low-pixel discrimination. Face recognition can be run asynchronously with `--face-rec-async`.
+
+### Board C++ ID/output controls
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--display-id-max-count` | `8` | Maximum public-facing display slots; `0` means unlimited |
+| `--display-id-replace-confirm-frames` | `3` | Consecutive frames required before a new target can replace an occupied display slot |
+| `--target-output-limit` | `8` | Maximum non-sector JSON targets; `0` means unlimited |
+| `--target-output-compact-ids` / `--no-target-output-compact-ids` | compact on | Controls whether JSON target keys are `1..N` or actual display/public IDs |
+| `--webui-frame-scale` | `1.0` | Downscale only the WebUI JPEG stream before sending; does not change inference coordinates |
 
 ### Output
 
@@ -275,12 +315,21 @@ Every frame result is broadcast on `/ws/inference` (WebUI mode) and optionally w
   "frame_id": 42,
   "targets": {
     "1": {
-      "id":             1,
-      "azimuth":        12.5,
-      "elevation":       3.1,
+      "id": 1,
+      "display_id": 1,
+      "public_id": 5,
+      "raw_track_id": 7,
+      "azimuth": 12.5,
+      "elevation": 3.1,
       "eye_pixel_dist": 18.4,
-      "distance":        2.1,
-      "features":       [0.012, -0.034, ...]
+      "distance": 2.1,
+      "face_id": "face1",
+      "face_recognition": {
+        "matched": true,
+        "face_id": "face1",
+        "score": 0.713,
+        "dynamic": true
+      }
     }
   }
 }
@@ -292,7 +341,11 @@ Every frame result is broadcast on `/ws/inference` (WebUI mode) and optionally w
 | `elevation` | ° | Vertical angle; 0° = horizontal plane, positive upward |
 | `eye_pixel_dist` | px | Left–right eye keypoint distance in panorama pixels |
 | `distance` | m | Estimated range (calibrated polynomial, 0–5 m typical) |
-| `features` | — | 512-dim L2-normalised OSNet ReID feature vector |
+| `id` / `display_id` | — | Public-facing reusable display slot; bounded by `--display-id-max-count` when enabled |
+| `public_id` | — | Long-running output track ID maintained above the native raw tracker |
+| `raw_track_id` | — | Native HybridSORT raw track ID; FaceID is primarily bound to this value in `board_cpp` |
+| `face_id` | — | AdaFace dynamic/static identity label, or `null` when not available |
+| `features` | — | 512-dim L2-normalised OSNet ReID feature vector in the Python/GPU path |
 
 ### Sector-aggregated format (`--sector-output`)
 
@@ -334,11 +387,17 @@ MeetEye/
 │   │   ├── distance_estimator.py# Head-pose-corrected distance estimation
 │   │   ├── talking_detector.py  # MediaPipe mouth-aspect-ratio speaking detection
 │   │   └── display.py           # OpenCV display / layout helpers
-│   ├── face_rec/                # AdaFace face recognition (optional, names per track_id)
+│   ├── face_rec/                # AdaFace recognition, clustering/debug tools, observer support
 │   ├── models/                  # MediaPipe model weights (face_landmarker.task)
 │   ├── main_GPU_webui.py        # ② WebUI mode entry point (FastAPI)
+│   ├── main_GPU_face_rc_webui.py# GPU WebUI path aligned with board_cpp output logic
+│   ├── local_window/            # Camera client and local JSON visualizer
 │   └── webui/                   # Inference processor, FastAPI routes, WebSocket, GPU monitor
-├── face_rc/                     # RK3588 edge deployment runtime and board-side docs
+├── face_rc/
+│   ├── board_cpp/               # RK3588 C++ runtime, WebUI, native tracker, RKNN/AdaFace tools
+│   │   ├── src/                 # Split C++ modules included by meeteye_cpp_smoke.cpp
+│   │   └── tools/               # OpenCL/RKNN/native tracker/AdaFace build and conversion tools
+│   └── board/                   # Python board runtime and legacy board-side experiments
 ├── fine-tune/                   # YOLO fine-tuning, dataset conversion, and calibration utilities
 ├── HybridSORT/                  # Hybrid-SORT tracker source
 │   └── trackers/hybrid_sort_tracker/
@@ -346,7 +405,6 @@ MeetEye/
 │       ├── hybrid_sort_reid.py  # ReID variant (same patch)
 │       └── association.py       # IoU / VDC / TCM association functions
 ├── maps/                        # Pre-computed fisheye unwarp maps (.npz)
-├── compress_demo.py             # Demo video compressor (ffmpeg wrapper)
 ├── export_trt.py                # YOLO ONNX → TensorRT engine export
 └── requirements.txt
 ```
@@ -384,7 +442,8 @@ The original BoT-SORT runs its overlap check on *matched* detection pairs **afte
 |-------|-----------------|-----|
 | RTX 3080 · YOLO `.engine` · 3 slices · HybridSORT | 30–45 ms | 22–30 |
 | RTX 3080 · YOLO `.pt` · 3 slices · HybridSORT | 55–80 ms | 12–18 |
-| RK3588 · RKNN INT8 · direct-slice headless runtime | See [`face_rc/README.md`](face_rc/README.md) | Board-dependent |
+| RK3588 · C++ fisheye · RKNN INT8 · OpenCL direct-slice | See [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md) | Board-dependent |
+| RK3588 · C++ wide-angle · dual YOLO workers | See [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md) | Board-dependent |
 | CPU only (no GPU) | 300–600 ms | 1–3 |
 
 > Latency breakdown (30-frame average): ①CPU→GPU 2 ms  ②Fisheye unwarping 3 ms  ③GPU→CPU 1 ms  ④Slicing 2 ms  ⑤YOLO 18 ms  ⑥Merge+ReID 8 ms  ⑦Tracking 2 ms  ⑧Angle calc 1 ms
