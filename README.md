@@ -16,20 +16,26 @@ MeetEye detects faces/persons, keeps stable IDs, estimates azimuth/elevation/dis
      docs/demo_coast.mp4 into the edit box → GitHub generates a
      https://github.com/user-attachments/assets/xxxx URL → replace the placeholder
      line below with that URL → save to show the inline player -->
-https://github.com/user-attachments/assets/141b880a-fcd8-4ae8-ba29-a69648f7ba5c
+<video src="https://github.com/user-attachments/assets/141b880a-fcd8-4ae8-ba29-a69648f7ba5c" controls playsinline width="100%"></video>
+
+[Open demo video](https://github.com/user-attachments/assets/141b880a-fcd8-4ae8-ba29-a69648f7ba5c)
 
 <br>
 
 > **↳ Same scene · sector angle visualizer window** — live radar + hemisphere view, each sector's azimuth/elevation rendered in real time (the local `angle_visualizer.py` window paired with the result video above)
 
 <!-- To embed: open this README in the GitHub web editor → drag your local docs/demo_coast_angle.mp4 into the edit box → replace the placeholder line below with the generated user-attachments URL -->
-https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b
+<video src="https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b" controls playsinline width="100%"></video>
+
+[Open angle visualizer video](https://github.com/user-attachments/assets/d406b9bf-8586-4573-85f3-2c9957d9e83b)
 
 <br>
 
 > **Small conference room · 4 persons · blackboard discussion** — HybridSORT tracking · OSNet ReID · 3-slice panorama · 960 × 630
 
-https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181
+<video src="https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181" controls playsinline width="100%"></video>
+
+[Open small-room demo video](https://github.com/user-attachments/assets/10e2b8d3-aa76-4ed0-9236-3f568cd06181)
 
 *To compress your own result video for GitHub, run ffmpeg directly:*
 ```bash
