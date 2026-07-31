@@ -22,7 +22,7 @@ def parse_args():
     """
     解析命令行参数
     """
-    parser = argparse.ArgumentParser(description='鱼眼展开与YOLO姿态检测系统')
+    parser = argparse.ArgumentParser(description='鱼眼/广角相机 YOLO 姿态检测系统')
 
     # 输入源参数
     parser.add_argument('--cam-index', type=int, default=1, help='摄像头索引')
@@ -33,11 +33,24 @@ def parse_args():
     parser.add_argument('--cam-width', type=int, default=1920, help='摄像头宽度')
     parser.add_argument('--cam-height', type=int, default=1080, help='摄像头高度')
 
-    # 鱼眼展开参数
+    # 投影/展开参数
+    parser.add_argument('--projection-mode', type=str, default='fisheye-panorama',
+                        choices=['fisheye-panorama', 'wide-angle'],
+                        help='输入投影模式：fisheye-panorama=鱼眼展开后检测；wide-angle=广角整图检测 (默认: fisheye-panorama)')
     parser.add_argument('--output-width', type=int, default=3840, help='输出宽度')
     parser.add_argument('--output-height', type=int, default=1080, help='输出高度')
     parser.add_argument('--vertical-fov', type=float, default=100.0, help='垂直视场角')
     parser.add_argument('--map-file', type=str, default=r'maps/3840_fisheye_maps_2026.5.18.npz', help='映射文件路径')
+    parser.add_argument('--wide-horizontal-fov', type=float, default=90.0,
+                        help='广角模式下用于推导 fx 的水平视场角；显式传 --wide-fx 时该值仅作记录 (默认: 90)')
+    parser.add_argument('--wide-fx', type=float, default=0.0,
+                        help='广角模式 pinhole 近似 fx；<=0 时由 --wide-horizontal-fov 和画面宽度推导')
+    parser.add_argument('--wide-fy', type=float, default=0.0,
+                        help='广角模式 pinhole 近似 fy；<=0 时由 --vertical-fov 和画面高度推导')
+    parser.add_argument('--wide-cx', type=float, default=-1.0,
+                        help='广角模式 pinhole 近似 cx；<0 时使用画面中心')
+    parser.add_argument('--wide-cy', type=float, default=-1.0,
+                        help='广角模式 pinhole 近似 cy；<0 时使用画面中心')
 
     # 全景切片参数
     parser.add_argument('--num-slices', type=int, default=3, choices=[2, 3, 4, 5, 6, 7],
@@ -56,6 +69,21 @@ def parse_args():
 
     # YOLO参数
     parser.add_argument('--model-path', type=str, default='./yolo_model/yolo26n-pose.engine', help='YOLO模型路径（.pt 或 .engine）')
+    parser.add_argument('--wide-model-path', type=str, default='./yolo_model/yolov8n-face.engine',
+                        help='广角模式单独使用的 YOLO 模型路径；只在 --projection-mode wide-angle 时生效，'
+                             '需要使用 batch=1 的整图模型，不能复用鱼眼三切片 batch=3 engine')
+    parser.add_argument('--yolo-imgsz', type=int, default=864,
+                        help='鱼眼/默认 YOLO 推理输入尺寸 (默认: 864)')
+    parser.add_argument('--wide-yolo-imgsz', type=int, default=0,
+                        help='广角 YOLO 推理输入尺寸；0 表示沿用 --yolo-imgsz')
+    parser.add_argument('--wide-min-det-width', type=int, default=20,
+                        help='广角整图检测框最小宽度，小于该值直接过滤，避免低分小误检进入跟踪 (默认: 20)')
+    parser.add_argument('--wide-min-det-height', type=int, default=20,
+                        help='广角整图检测框最小高度，小于该值直接过滤，避免低分小误检进入跟踪 (默认: 20)')
+    parser.add_argument('--wide-dedup-min-iou', type=float, default=0.7,
+                        help='广角同帧重复框 min-IoU 去重阈值，用于压制小框落在大框内 (默认: 0.7)')
+    parser.add_argument('--wide-dedup-iou', type=float, default=0.95,
+                        help='广角同帧重复框标准 IoU 去重阈值，用于压制几乎重合的重复框 (默认: 0.95)')
     parser.add_argument('--conf-threshold', type=float, default=0.1, help='置信度阈值')
     parser.add_argument('--iou-threshold', type=float, default=0.99, help='IOU阈值')
 
@@ -126,11 +154,16 @@ def parse_args():
                         default='face_rec_model/adaface_ir18_vgg2.ckpt',
                         help='AdaFace IR-18 模型权重路径')
     parser.add_argument('--face-rec-threshold', type=float, default=0.55,
-                        help='人脸识别余弦相似度阈值，低于此值视为未知（默认: 0.35）')
+                        help='人脸识别余弦相似度阈值，低于此值视为未知（默认: 0.55）')
     parser.add_argument('--face-frontal-threshold', type=float, default=0.65,
-                        help='正面人脸判断阈值（鼻子水平偏移/眼距），越小越严格（默认: 0.35）')
+                        help='正面人脸判断阈值（鼻子水平偏移/眼距），越小越严格（默认: 0.65）')
     parser.add_argument('--face-rec-cooldown', type=int, default=30,
                         help='未识别目标重试间隔帧数，避免每帧触发推理（默认: 30）')
+    parser.add_argument('--face-rec-align-mode', type=str, default='eye',
+                        choices=['eye', 'five-point'],
+                        help='人脸识别裁剪对齐方式：eye=双眼裁剪，five-point=五点 ArcFace/AdaFace 对齐 (默认: eye)')
+    parser.add_argument('--face-rec-five-point-scale', type=float, default=1.20,
+                        help='five-point 对齐时的裁剪放大倍率，1.20 会比标准模板多取一些下巴/边缘信息 (默认: 1.20)')
 
     # 动态人脸库参数（主要供 main_GPU_face_rc_webui.py 使用）
     # 普通 main_GPU_webui.py 默认仍然不启用人脸识别，也不会自动启用动态库。
@@ -142,10 +175,44 @@ def parse_args():
                         help='每个动态人脸身份最多保留多少个特征样本 (默认: 5)')
     parser.add_argument('--dynamic-face-update-similarity', type=float, default=None,
                         help='匹配分数达到该值才追加为同一身份的新样本；默认 max(0.15, threshold-0.05)')
+    parser.add_argument('--dynamic-face-pose-sample-similarity', type=float, default=None,
+                        help='普通高质量姿态样本加入已有 FaceID 的最低相似度；默认等于 --face-rec-threshold')
+    parser.add_argument('--dynamic-face-pose-library-similarity', type=float, default=None,
+                        help='已有姿态库不为空时，新姿态样本与当前姿态库至少一个样本的最低相似度；'
+                             '用于防止短时间内把抖动/误裁切样本全部加入 (默认: 沿用 pose-sample 阈值)')
+    parser.add_argument('--dynamic-face-pose-library-max-similarity', type=float, default=0.90,
+                        help='新姿态样本与已有主特征/姿态样本的最高相似度；超过该值认为姿态重复，不再加入库 (默认: 0.90)')
+    parser.add_argument('--dynamic-face-pose-sample-interval', type=int, default=30,
+                        help='同一个 FaceID 两次追加多姿态样本之间至少间隔多少帧；0 表示不限制 (默认: 30)')
+    parser.add_argument('--dynamic-face-pending-seed-samples', type=int, default=2,
+                        help='新 FaceID 确认建库时，最多从 pending 队列带入多少个初始多姿态样本；'
+                             '避免长时间 pending 后一次性塞满姿态库 (默认: 2)')
+    parser.add_argument('--dynamic-face-locked-sample-similarity', type=float, default=0.35,
+                        help='已绑定 TrackID 的高质量姿态样本加入库的最低相似度 (默认: 0.35)')
     parser.add_argument('--dynamic-face-min-sample-diversity', type=float, default=0.015,
                         help='新样本与已有样本至少差异多少才保存，避免重复样本 (默认: 0.015)')
     parser.add_argument('--dynamic-face-primary-max-yaw', type=float, default=20.0,
                         help='动态库 primary 正脸样本最大 yaw 角；超过该角度进入 supplement (默认: 20)')
+    parser.add_argument('--dynamic-face-primary-ema-alpha', type=float, default=0.1,
+                        help='更新 primary 主特征时的 EMA 系数 (默认: 0.1)')
+    parser.add_argument('--dynamic-face-enroll-confirm-frames', type=int, default=3,
+                        help='新 FaceID 正式建库前需要连续确认的有效样本数 (默认: 3)')
+    parser.add_argument('--dynamic-face-binding-ttl', type=int, default=900,
+                        help='TrackID 暂时消失后保留 FaceID 绑定的帧数，30FPS 下 900 约为 30 秒 (默认: 900)')
+    parser.add_argument('--dynamic-face-min-keypoint-conf', type=float, default=0.6,
+                        help='触发 AdaFace 前，眼睛/鼻子关键点的最低置信度 (默认: 0.6)')
+    parser.add_argument('--dynamic-face-update-min-height', type=int, default=None,
+                        help='允许注册/补充 FaceID 样本的检测框最小短边；默认沿用 --dynamic-face-min-height')
+    parser.add_argument('--dynamic-face-update-min-keypoint-conf', type=float, default=0.7,
+                        help='允许注册/补充 FaceID 样本的眼睛/鼻子关键点最低置信度 (默认: 0.7)')
+    parser.add_argument('--dynamic-face-update-min-score', type=float, default=0.5,
+                        help='允许注册/补充 FaceID 样本的检测框最低置信度 (默认: 0.5)')
+    parser.add_argument('--dynamic-face-primary-min-height', type=int, default=None,
+                        help='允许更新 primary 主特征的检测框最小短边；默认沿用 update 最小短边')
+    parser.add_argument('--dynamic-face-primary-min-keypoint-conf', type=float, default=0.8,
+                        help='允许更新 primary 主特征的眼睛/鼻子关键点最低置信度 (默认: 0.8)')
+    parser.add_argument('--dynamic-face-primary-min-score', type=float, default=0.6,
+                        help='允许更新 primary 主特征的检测框最低置信度 (默认: 0.6)')
     parser.add_argument('--dynamic-face-supplement-fallback-threshold', type=float, default=None,
                         help='primary 最佳分数低于该值时才启用 supplement 兜底；默认 threshold+0.10')
     parser.add_argument('--dynamic-face-match-margin', type=float, default=0.08,
@@ -186,6 +253,15 @@ def parse_args():
                         help='临时调试：每 N 次有效人脸特征提取保存一次，配合 --face-debug-dump-dir 使用 (默认: 1)')
     parser.add_argument('--face-debug-dump-max', type=int, default=0,
                         help='临时调试：最多保存多少条样本；0 表示不限制，配合 --face-debug-dump-dir 使用')
+    parser.add_argument('--face-rec-observer', action=argparse.BooleanOptionalAction, default=False,
+                        help='WebUI 实时显示人脸识别特征相似度观察面板；会把 112x112 crop 以 base64 JSON 发送到浏览器，'
+                             '主要用于调试 (默认: False)')
+    parser.add_argument('--face-rec-observer-max-tracks', type=int, default=4,
+                        help='人脸识别观察面板最多显示最近多少个 FaceID / 待建库样本 (默认: 4)')
+    parser.add_argument('--face-rec-observer-jpeg-size', type=int, default=96,
+                        help='人脸识别观察面板中 crop 缩略图边长，越大 JSON 越重 (默认: 96)')
+    parser.add_argument('--face-rec-observer-pending-ttl', type=int, default=90,
+                        help='待建库观察项超过多少帧没有更新就从 WebUI 面板隐藏；只影响显示，不清理底层 pending (默认: 90，30FPS约3秒)')
 
     # 说话检测开关
     parser.add_argument('--talking-detection', action=argparse.BooleanOptionalAction, default=False,
@@ -270,12 +346,27 @@ def parse_args():
                         help='HybridSort ReID 第一轮关联外观代价权重（0=纯IoU+VDC，越大越依赖外观，默认: 0.3）')
     parser.add_argument('--reid-emb-weight-low', type=float, default=0.0,
                         help='HybridSort ReID BYTE第二轮关联外观代价权重（默认: 0.0）')
+    parser.add_argument('--new-track-overlap-thresh', type=float, default=0.4,
+                        help='HybridSort 新轨迹去重阈值：未匹配检测与已有轨迹 IoU 超过该值时不新建轨迹；'
+                             '调低可更强地压制同一目标双框，但相邻目标过近时更容易误合并 (默认: 0.4)')
 
     # JSON 结果保存参数（仅 WebUI 模式生效）
     parser.add_argument('--save-json', action='store_true', default=False,
                         help='将每帧推理结果追加保存为 JSONL 文件（每行一个 JSON，含角度/距离/特征）')
     parser.add_argument('--json-output', type=str, default=None,
                         help='JSONL 输出文件路径（默认：output_dir/视频名或camera_时间戳.jsonl）')
+    parser.add_argument('--display-id-max-count', type=int, default=8,
+                        help='对外显示 display_id 的最大数量；0 表示不限制 (默认: 8)')
+    parser.add_argument('--display-id-binding-ttl', type=int, default=60,
+                        help='track 短暂消失后 display_id 独占保留帧数 (默认: 60)')
+    parser.add_argument('--display-id-reuse-max-frames', type=int, default=900,
+                        help='空间复用 display_id 的最大消失帧数 (默认: 900)')
+    parser.add_argument('--display-id-reuse-fallback-min-frames', type=int, default=150,
+                        help='无空间匹配时允许无条件复用 display_id 的最小消失帧数 (默认: 150)')
+    parser.add_argument('--display-id-reuse-center-thresh', type=float, default=2.0,
+                        help='display_id 空间复用中心距离阈值，单位为平均框高倍数 (默认: 2.0)')
+    parser.add_argument('--display-id-reuse-size-ratio', type=float, default=0.4,
+                        help='display_id 空间复用尺寸相似度阈值 (默认: 0.4)')
 
     # 扇区聚合输出（仅 WebUI 模式生效）：水平 360° 等分为 N 个扇区，
     # 每帧每个扇区内取检测框最大的目标作为代表，输出扇区→（有无目标 + 水平角/俯仰角）。

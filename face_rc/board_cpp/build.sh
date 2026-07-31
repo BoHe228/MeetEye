@@ -36,6 +36,7 @@ fi
   -L"${ROOT_DIR}/lib" \
   -L"${ROOT_DIR}/lib/lib" \
   -lrknn_capi_parallel \
+  -ladaface_rknn \
   -ldirect_slice_opencl_fused \
   -lhybrid_sort_native \
   "${TURBOJPEG_LIB}" \

@@ -132,6 +132,34 @@ static bool old_spatial_duplicate(const Box& a, const Box& b)
   return cd_norm < 0.8f && x_cover > 0.35f && y_cover > 0.35f && area_ratio > 0.25f;
 }
 
+static bool wrap_spatial_duplicate(const Box& a,
+                                   const Box& b,
+                                   float min_iou_thresh)
+{
+  float inter = 0.0f;
+  float min_area = 0.0f;
+  float iw = 0.0f;
+  float ih = 0.0f;
+  float min_w = 0.0f;
+  float min_h = 0.0f;
+  float area_a = 0.0f;
+  float area_b = 0.0f;
+  intersection_stats(a, b, &inter, &min_area, &iw, &ih, &min_w, &min_h, &area_a, &area_b);
+  if (min_area <= 0.0f) {
+    return false;
+  }
+
+  const float min_iou = inter / (min_area + 1e-6f);
+  if (min_iou > min_iou_thresh) {
+    return true;
+  }
+
+  const float dist = center_distance_norm(a, b);
+  const float y_cover = min_h > 0.0f ? ih / (min_h + 1e-6f) : 0.0f;
+  const float area_ratio = std::min(area_a, area_b) / (std::max(area_a, area_b) + 1e-6f);
+  return dist < 0.80f && y_cover > 0.45f && area_ratio > 0.25f;
+}
+
 static Box convert_box_to_original(const Box& local,
                                    float start_x,
                                    int wrap_around,
@@ -432,17 +460,7 @@ int face_merge_fast(const float* boxes,
             bi.x2 -= panorama_width;
           }
 
-          float inter = 0.0f;
-          float min_area = 0.0f;
-          float iw = 0.0f;
-          float ih = 0.0f;
-          float min_w = 0.0f;
-          float min_h = 0.0f;
-          float area_i = 0.0f;
-          float area_j = 0.0f;
-          intersection_stats(bi, bj, &inter, &min_area, &iw, &ih, &min_w, &min_h, &area_i, &area_j);
-          const float wrap_min_iou = inter / (min_area + 1e-6f);
-          is_same_target = wrap_min_iou > iou_threshold;
+          is_same_target = wrap_spatial_duplicate(bi, bj, iou_threshold);
         } else if (is_adjacent_pair) {
           const float cxi = (di.box.x1 + di.box.x2) * 0.5f;
           const float cxj = (dj.box.x1 + dj.box.x2) * 0.5f;

@@ -112,6 +112,7 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
 
     for i, det in enumerate(tracked or []):
         tid = int(det.get('track_id', i + 1))
+        display_id = int(det.get('display_id') or tid)
         current_tids.add(tid)
         angle = persons[i] if i < len(persons) else None
 
@@ -134,8 +135,10 @@ def _build_inference_json(tracked: list, angle_info: dict) -> bytes:
         else:
             distance = estimator.last_valid_distance
 
-        targets[str(tid)] = {
-            'id':             tid,
+        targets[str(display_id)] = {
+            'id':             display_id,
+            'display_id':     display_id,
+            'track_id':       tid,
             'azimuth':        round(float(angle['azimuth_deg']),   3) if angle else None,
             'elevation':      round(float(angle['elevation_deg']), 3) if angle else None,
             'eye_pixel_dist': round(eye_d,    2) if eye_d    is not None else None,

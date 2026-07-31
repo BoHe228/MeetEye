@@ -54,6 +54,130 @@ static inline float box_iou_arr(const std::array<double, 5>& a,
   return box_iou(a.data(), b.data());
 }
 
+static inline double box_width_arr(const std::array<double, 5>& b) {
+  return std::max(0.0, b[2] - b[0]);
+}
+
+static inline double box_height_arr(const std::array<double, 5>& b) {
+  return std::max(0.0, b[3] - b[1]);
+}
+
+static inline double box_max_side_arr(const std::array<double, 5>& b) {
+  return std::max(box_width_arr(b), box_height_arr(b));
+}
+
+static inline double valid_wrap_width(double wrap_width) {
+  return std::isfinite(wrap_width) && wrap_width > 1.0 ? wrap_width : 0.0;
+}
+
+static inline double wrap_delta_x(double dx, double wrap_width) {
+  wrap_width = valid_wrap_width(wrap_width);
+  if (wrap_width <= 0.0) {
+    return dx;
+  }
+  dx = std::fmod(dx + wrap_width * 0.5, wrap_width);
+  if (dx < 0.0) {
+    dx += wrap_width;
+  }
+  return dx - wrap_width * 0.5;
+}
+
+static inline double box_center_dist_norm_arr(const std::array<double, 5>& a,
+                                              const std::array<double, 5>& b,
+                                              double wrap_width = 0.0) {
+  const double ax = (a[0] + a[2]) * 0.5;
+  const double ay = (a[1] + a[3]) * 0.5;
+  const double bx = (b[0] + b[2]) * 0.5;
+  const double by = (b[1] + b[3]) * 0.5;
+  const double avg_h = std::max((box_height_arr(a) + box_height_arr(b)) * 0.5, 1.0);
+  const double dx = wrap_delta_x(ax - bx, wrap_width);
+  const double dy = ay - by;
+  return std::sqrt(dx * dx + dy * dy) / avg_h;
+}
+
+static inline float box_iou_wrap_arr(const std::array<double, 5>& a,
+                                     const std::array<double, 5>& b,
+                                     double wrap_width) {
+  float best = box_iou_arr(a, b);
+  wrap_width = valid_wrap_width(wrap_width);
+  if (wrap_width <= 0.0) {
+    return best;
+  }
+
+  const double acx = (a[0] + a[2]) * 0.5;
+  const double bcx = (b[0] + b[2]) * 0.5;
+  const double raw_delta = acx - bcx;
+  const double nearest_shift = raw_delta - wrap_delta_x(raw_delta, wrap_width);
+  const double shifts[3] = {nearest_shift, nearest_shift + wrap_width,
+                            nearest_shift - wrap_width};
+  for (double shift : shifts) {
+    double shifted[5] = {b[0] + shift, b[1], b[2] + shift, b[3], b[4]};
+    best = std::max(best, box_iou(a.data(), shifted));
+  }
+  return best;
+}
+
+static inline double box_size_ratio_arr(const std::array<double, 5>& a,
+                                        const std::array<double, 5>& b) {
+  const double aw = std::max(box_width_arr(a), 1.0);
+  const double ah = std::max(box_height_arr(a), 1.0);
+  const double bw = std::max(box_width_arr(b), 1.0);
+  const double bh = std::max(box_height_arr(b), 1.0);
+  return std::min(aw, bw) / std::max(aw, bw) *
+         std::min(ah, bh) / std::max(ah, bh);
+}
+
+static inline double box_x_cover_arr(const std::array<double, 5>& a,
+                                     const std::array<double, 5>& b,
+                                     double wrap_width = 0.0) {
+  std::array<double, 5> shifted_b = b;
+  wrap_width = valid_wrap_width(wrap_width);
+  if (wrap_width > 0.0) {
+    const double acx = (a[0] + a[2]) * 0.5;
+    const double bcx = (b[0] + b[2]) * 0.5;
+    const double raw_delta = acx - bcx;
+    const double shift = raw_delta - wrap_delta_x(raw_delta, wrap_width);
+    shifted_b[0] += shift;
+    shifted_b[2] += shift;
+  }
+  const double iw =
+      std::max(0.0, std::min(a[2], shifted_b[2]) - std::max(a[0], shifted_b[0]));
+  const double min_w = std::min(box_width_arr(a), box_width_arr(b));
+  return min_w > 0.0 ? iw / (min_w + kEps) : 0.0;
+}
+
+static inline double box_y_cover_arr(const std::array<double, 5>& a,
+                                     const std::array<double, 5>& b) {
+  const double ih = std::max(0.0, std::min(a[3], b[3]) - std::max(a[1], b[1]));
+  const double min_h = std::min(box_height_arr(a), box_height_arr(b));
+  return min_h > 0.0 ? ih / (min_h + kEps) : 0.0;
+}
+
+static bool is_partial_duplicate_for_new_track(const std::array<double, 5>& det,
+                                               const std::array<double, 5>& ref,
+                                               double wrap_width) {
+  const double size_score = box_size_ratio_arr(det, ref);
+  if (size_score < 0.45) {
+    return false;
+  }
+  const double dist_norm = box_center_dist_norm_arr(det, ref, wrap_width);
+  if (dist_norm > 0.65) {
+    return false;
+  }
+  const double dcx = (det[0] + det[2]) * 0.5;
+  const double rcx = (ref[0] + ref[2]) * 0.5;
+  const double dcy = (det[1] + det[3]) * 0.5;
+  const double rcy = (ref[1] + ref[3]) * 0.5;
+  const double dist_px =
+      std::sqrt(std::pow(wrap_delta_x(dcx - rcx, wrap_width), 2.0) +
+                std::pow(dcy - rcy, 2.0));
+  if (dist_px > 48.0) {
+    return false;
+  }
+  return box_x_cover_arr(det, ref, wrap_width) >= 0.40 &&
+         box_y_cover_arr(det, ref) >= 0.65;
+}
+
 static std::vector<std::pair<int, int>> hungarian_maximize(const std::vector<float>& scores,
                                                            int n_dets,
                                                            int n_trks) {
@@ -178,9 +302,10 @@ static inline float corner_direction_cost(float det_y,
                                           float vel_x,
                                           float valid,
                                           float det_score,
-                                          float vdc_weight) {
+                                          float vdc_weight,
+                                          double wrap_width) {
   const float dy = det_y - obs_y;
-  const float dx = det_x - obs_x;
+  const float dx = static_cast<float>(wrap_delta_x(det_x - obs_x, wrap_width));
   const float norm = std::sqrt(dx * dx + dy * dy) + 1e-6f;
   const float dir_y = dy / norm;
   const float dir_x = dx / norm;
@@ -206,6 +331,15 @@ struct Params {
   double new_track_thresh = 0.5;
   double new_track_overlap_thresh = 0.6;
   double lost_velocity_decay = 0.85;
+  double new_track_center_suppress_thresh = 1.0;
+  double new_track_suppress_max_side = 80.0;
+  double byte_residual_size_ratio_thresh = 0.45;
+  double byte_residual_max_side = 40.0;
+  double lost_track_reconnect_center_thresh = 1.6;
+  double lost_track_reconnect_multi_target_center_thresh = 1.2;
+  double lost_track_reconnect_size_ratio_thresh = 0.5;
+  double lost_track_reconnect_ambiguity_margin = 0.35;
+  double wrap_width = 0.0;
 };
 
 struct Observation {
@@ -321,6 +455,7 @@ struct Track {
     confidence_pre_valid = false;
     last_observation.fill(-1.0);
     last_observation_save.fill(-1.0);
+    reliable_observation = bbox;
     velocity_lt.fill(0.0);
     velocity_rt.fill(0.0);
     velocity_lb.fill(0.0);
@@ -374,6 +509,7 @@ struct Track {
   double R[5][5]{};
   std::array<double, 5> last_observation{};
   std::array<double, 5> last_observation_save{};
+  std::array<double, 5> reliable_observation{};
   std::vector<Observation> observations;
   std::array<double, 2> velocity_lt{};
   std::array<double, 2> velocity_rt{};
@@ -408,29 +544,59 @@ struct Track {
     return observations.back().box;
   }
 
+  const std::array<double, 5>& residual_reference_observation() const {
+    if (box_sum(reliable_observation) >= 0.0) {
+      return reliable_observation;
+    }
+    return last_observation;
+  }
+
+  void maybe_update_reliable_observation(const std::array<double, 5>& bbox) {
+    if (p.byte_residual_size_ratio_thresh <= 0.0 ||
+        p.byte_residual_max_side <= 0.0 ||
+        box_sum(reliable_observation) < 0.0) {
+      reliable_observation = bbox;
+      return;
+    }
+
+    const double bbox_max_side = box_max_side_arr(bbox);
+    const double ref_max_side = box_max_side_arr(reliable_observation);
+    if (bbox_max_side > p.byte_residual_max_side) {
+      reliable_observation = bbox;
+      return;
+    }
+
+    if (ref_max_side <= p.byte_residual_max_side &&
+        box_size_ratio_arr(bbox, reliable_observation) >=
+            p.byte_residual_size_ratio_thresh) {
+      reliable_observation = bbox;
+    }
+  }
+
   static std::array<double, 8> corner_speed_scalars(const std::array<double, 5>& prev,
-                                                    const std::array<double, 5>& cur) {
+                                                    const std::array<double, 5>& cur,
+                                                    double wrap_width) {
     std::array<double, 8> out{};
     double dy = cur[1] - prev[1];
-    double dx = cur[0] - prev[0];
+    double dx = wrap_delta_x(cur[0] - prev[0], wrap_width);
     double norm = std::sqrt(dy * dy + dx * dx) + kEps;
     out[0] = dy / norm;
     out[1] = dx / norm;
 
     dy = cur[3] - prev[3];
-    dx = cur[0] - prev[0];
+    dx = wrap_delta_x(cur[0] - prev[0], wrap_width);
     norm = std::sqrt(dy * dy + dx * dx) + kEps;
     out[2] = dy / norm;
     out[3] = dx / norm;
 
     dy = cur[1] - prev[1];
-    dx = cur[2] - prev[2];
+    dx = wrap_delta_x(cur[2] - prev[2], wrap_width);
     norm = std::sqrt(dy * dy + dx * dx) + kEps;
     out[4] = dy / norm;
     out[5] = dx / norm;
 
     dy = cur[3] - prev[3];
-    dx = cur[2] - prev[2];
+    dx = wrap_delta_x(cur[2] - prev[2], wrap_width);
     norm = std::sqrt(dy * dy + dx * dx) + kEps;
     out[6] = dy / norm;
     out[7] = dx / norm;
@@ -626,7 +792,8 @@ struct Track {
         if (find_observation(age - i - 1, &obs)) {
           previous_box = obs;
           previous_found = true;
-          const std::array<double, 8> speeds = corner_speed_scalars(previous_box, bbox);
+          const std::array<double, 8> speeds =
+              corner_speed_scalars(previous_box, bbox, p.wrap_width);
           if (speeds_found) {
             for (int k = 0; k < 8; ++k) {
               speeds_sum[k] += speeds[k];
@@ -639,7 +806,7 @@ struct Track {
       }
       if (!previous_found) {
         previous_box = last_observation;
-        speeds_sum = corner_speed_scalars(previous_box, bbox);
+        speeds_sum = corner_speed_scalars(previous_box, bbox, p.wrap_width);
         speeds_found = true;
       }
 
@@ -647,7 +814,8 @@ struct Track {
       const double cy_ref = (previous_box[1] + previous_box[3]) * 0.5;
       const double cx_cur = (bbox[0] + bbox[2]) * 0.5;
       const double cy_cur = (bbox[1] + bbox[3]) * 0.5;
-      const double disp = std::sqrt((cx_cur - cx_ref) * (cx_cur - cx_ref) +
+      const double dx_cur = wrap_delta_x(cx_cur - cx_ref, p.wrap_width);
+      const double disp = std::sqrt(dx_cur * dx_cur +
                                     (cy_cur - cy_ref) * (cy_cur - cy_ref));
       const double avg_h = std::max((previous_box[3] - previous_box[1] +
                                      bbox[3] - bbox[1]) * 0.5,
@@ -671,6 +839,7 @@ struct Track {
 
     last_observation = bbox;
     last_observation_save = bbox;
+    maybe_update_reliable_observation(bbox);
     observations.push_back(Observation{age, bbox});
     if (observations.size() > 1024) {
       observations.erase(observations.begin(), observations.begin() + 256);
@@ -679,7 +848,17 @@ struct Track {
     time_since_update = 0;
     hits += 1;
     hit_streak += 1;
-    kf_update(bbox);
+    std::array<double, 5> kf_bbox = bbox;
+    const double wrap_width = valid_wrap_width(p.wrap_width);
+    if (wrap_width > 0.0) {
+      const double bbox_cx = (bbox[0] + bbox[2]) * 0.5;
+      const double dx = wrap_delta_x(bbox_cx - x[0], wrap_width);
+      const double adjusted_cx = x[0] + dx;
+      const double shift = adjusted_cx - bbox_cx;
+      kf_bbox[0] += shift;
+      kf_bbox[2] += shift;
+    }
+    kf_update(kf_bbox);
     if (kf_damp) {
       x[5] *= 0.3;
       x[6] *= 0.3;
@@ -700,6 +879,54 @@ struct Track {
     return out;
   }
 };
+
+static std::array<double, 5> track_reference_box(const Track& trk,
+                                                 double score) {
+  if (box_sum(trk.last_observation) >= 0.0) {
+    return trk.last_observation;
+  }
+  const std::array<double, 4> state = trk.get_state();
+  return std::array<double, 5>{{state[0], state[1], state[2], state[3], score}};
+}
+
+static bool should_suppress_new_track_near_existing(const std::array<double, 5>& det,
+                                                    const Track& tracker,
+                                                    const Params& p) {
+  if (p.new_track_center_suppress_thresh <= 0.0 ||
+      p.new_track_suppress_max_side <= 0.0) {
+    return false;
+  }
+  const std::array<double, 5> ref = track_reference_box(tracker, det[4]);
+  if (is_partial_duplicate_for_new_track(det, ref, p.wrap_width)) {
+    return true;
+  }
+  const bool small_case =
+      box_max_side_arr(det) <= p.new_track_suppress_max_side ||
+      box_max_side_arr(ref) <= p.new_track_suppress_max_side;
+  if (!small_case) {
+    return false;
+  }
+  return box_center_dist_norm_arr(det, ref, p.wrap_width) <=
+         p.new_track_center_suppress_thresh;
+}
+
+static bool should_protect_residual_observation_update(const std::array<double, 5>& det,
+                                                       const Track& tracker,
+                                                       const Params& p) {
+  if (p.byte_residual_size_ratio_thresh <= 0.0 ||
+      p.byte_residual_max_side <= 0.0) {
+    return false;
+  }
+  if (box_max_side_arr(det) > p.byte_residual_max_side) {
+    return false;
+  }
+  const std::array<double, 5>& ref = tracker.residual_reference_observation();
+  if (box_sum(ref) < 0.0) {
+    return false;
+  }
+  return box_size_ratio_arr(det, ref) <
+         p.byte_residual_size_ratio_thresh;
+}
 
 struct AssocResult {
   std::vector<std::pair<int, int>> matches;
@@ -733,8 +960,9 @@ static AssocResult associate_first(const std::vector<std::array<double, 5>>& det
     const float det_score = static_cast<float>(dets[static_cast<size_t>(i)][4]);
     for (int j = 0; j < n_trks; ++j) {
       const auto& trk_row = trks[static_cast<size_t>(j)];
-      const double trk_box[5] = {trk_row[0], trk_row[1], trk_row[2], trk_row[3], trk_row[4]};
-      const float iou = box_iou(dets[static_cast<size_t>(i)].data(), trk_box);
+      const std::array<double, 5> trk_box{{trk_row[0], trk_row[1], trk_row[2],
+                                           trk_row[3], trk_row[4]}};
+      const float iou = box_iou_wrap_arr(dets[static_cast<size_t>(i)], trk_box, p.wrap_width);
       iou_scores[static_cast<size_t>(i) * n_trks + j] = iou;
       iou_max = std::max(iou_max, iou);
       if (iou > p.iou_threshold) {
@@ -753,28 +981,32 @@ static AssocResult associate_first(const std::vector<std::array<double, 5>>& det
                                      static_cast<float>(obs[0]),
                                      static_cast<float>(trk.velocity_lt[0]),
                                      static_cast<float>(trk.velocity_lt[1]),
-                                     valid, det_score, static_cast<float>(p.inertia));
+                                     valid, det_score, static_cast<float>(p.inertia),
+                                     p.wrap_width);
       score += corner_direction_cost(static_cast<float>(dets[static_cast<size_t>(i)][3]),
                                      static_cast<float>(dets[static_cast<size_t>(i)][0]),
                                      static_cast<float>(obs[3]),
                                      static_cast<float>(obs[0]),
                                      static_cast<float>(trk.velocity_rt[0]),
                                      static_cast<float>(trk.velocity_rt[1]),
-                                     valid, det_score, static_cast<float>(p.inertia));
+                                     valid, det_score, static_cast<float>(p.inertia),
+                                     p.wrap_width);
       score += corner_direction_cost(static_cast<float>(dets[static_cast<size_t>(i)][1]),
                                      static_cast<float>(dets[static_cast<size_t>(i)][2]),
                                      static_cast<float>(obs[1]),
                                      static_cast<float>(obs[2]),
                                      static_cast<float>(trk.velocity_lb[0]),
                                      static_cast<float>(trk.velocity_lb[1]),
-                                     valid, det_score, static_cast<float>(p.inertia));
+                                     valid, det_score, static_cast<float>(p.inertia),
+                                     p.wrap_width);
       score += corner_direction_cost(static_cast<float>(dets[static_cast<size_t>(i)][3]),
                                      static_cast<float>(dets[static_cast<size_t>(i)][2]),
                                      static_cast<float>(obs[3]),
                                      static_cast<float>(obs[2]),
                                      static_cast<float>(trk.velocity_rb[0]),
                                      static_cast<float>(trk.velocity_rb[1]),
-                                     valid, det_score, static_cast<float>(p.inertia));
+                                     valid, det_score, static_cast<float>(p.inertia),
+                                     p.wrap_width);
       if (p.tcm_first_step) {
         score -= std::fabs(det_score - static_cast<float>(trk_row[4])) *
                  static_cast<float>(p.tcm_first_step_weight);
@@ -835,8 +1067,10 @@ static AssocResult associate_second(const std::vector<std::array<double, 5>>& de
   for (int i = 0; i < n_dets; ++i) {
     for (int j = 0; j < n_trks; ++j) {
       const auto& trk_row = trks[static_cast<size_t>(j)];
-      const double trk_box[5] = {trk_row[0], trk_row[1], trk_row[2], trk_row[3], trk_row[4]};
-      const float raw_iou = box_iou(dets[static_cast<size_t>(i)].data(), trk_box);
+      const std::array<double, 5> trk_box{{trk_row[0], trk_row[1], trk_row[2],
+                                           trk_row[3], trk_row[4]}};
+      const float raw_iou =
+          box_iou_wrap_arr(dets[static_cast<size_t>(i)], trk_box, p.wrap_width);
       raw_max = std::max(raw_max, raw_iou);
       float score = raw_iou;
       if (byte_mode && p.tcm_byte_step) {
@@ -894,6 +1128,212 @@ static std::vector<int> remap_subset_indices(const std::vector<int>& base,
   return out;
 }
 
+static std::array<double, 5> track_state_box(const Track& trk, double score) {
+  const std::array<double, 4> state = trk.get_state();
+  return std::array<double, 5>{{state[0], state[1], state[2], state[3], score}};
+}
+
+static bool lost_track_reconnect_metrics(const std::array<double, 5>& det,
+                                         const Track& tracker,
+                                         double* best_dist,
+                                         double* best_size_score) {
+  if (best_dist == nullptr || best_size_score == nullptr) {
+    return false;
+  }
+  *best_dist = std::numeric_limits<double>::infinity();
+  *best_size_score = 0.0;
+
+  auto consider_ref = [&](const std::array<double, 5>& ref) {
+    if (box_sum(ref) < 0.0) {
+      return;
+    }
+    const double dist = box_center_dist_norm_arr(det, ref, tracker.p.wrap_width);
+    if (dist < *best_dist) {
+      *best_dist = dist;
+      *best_size_score = box_size_ratio_arr(det, ref);
+    }
+  };
+
+  consider_ref(tracker.residual_reference_observation());
+  consider_ref(track_state_box(tracker, det[4]));
+  return std::isfinite(*best_dist);
+}
+
+static int count_local_detections(const std::vector<std::array<double, 5>>& dets,
+                                  int det_idx,
+                                  double center_thresh,
+                                  double wrap_width) {
+  if (det_idx < 0 || det_idx >= static_cast<int>(dets.size()) ||
+      center_thresh <= 0.0) {
+    return 1;
+  }
+  int count = 0;
+  const auto& det = dets[static_cast<size_t>(det_idx)];
+  for (int i = 0; i < static_cast<int>(dets.size()); ++i) {
+    if (i == det_idx) {
+      continue;
+    }
+    if (box_center_dist_norm_arr(det, dets[static_cast<size_t>(i)], wrap_width) <
+        center_thresh) {
+      count += 1;
+    }
+  }
+  return count + 1;
+}
+
+static int reconnect_lost_tracks_before_new(
+    const std::vector<std::array<double, 5>>& dets_high,
+    std::vector<int>* unmatched_dets,
+    std::vector<int>* unmatched_trks,
+    std::vector<std::unique_ptr<Track>>* trackers,
+    const Params& p) {
+  if (unmatched_dets == nullptr || unmatched_trks == nullptr ||
+      trackers == nullptr || unmatched_dets->empty() || unmatched_trks->empty() ||
+      p.lost_track_reconnect_center_thresh <= 0.0 ||
+      p.lost_track_reconnect_size_ratio_thresh <= 0.0) {
+    return 0;
+  }
+
+  struct Candidate {
+    int det_idx = -1;
+    int trk_idx = -1;
+    double dist = std::numeric_limits<double>::infinity();
+  };
+
+  std::vector<Candidate> candidates;
+  candidates.reserve(unmatched_dets->size());
+  for (int det_idx : *unmatched_dets) {
+    if (det_idx < 0 || det_idx >= static_cast<int>(dets_high.size())) {
+      continue;
+    }
+    const auto& det = dets_high[static_cast<size_t>(det_idx)];
+    if (det[4] < p.new_track_thresh) {
+      continue;
+    }
+
+    const int local_count =
+        count_local_detections(
+            dets_high, det_idx, p.lost_track_reconnect_center_thresh, p.wrap_width);
+    const double center_thresh =
+        local_count > 1
+            ? std::min(p.lost_track_reconnect_center_thresh,
+                       p.lost_track_reconnect_multi_target_center_thresh)
+            : p.lost_track_reconnect_center_thresh;
+    if (center_thresh <= 0.0) {
+      continue;
+    }
+
+    int best_trk = -1;
+    double best_dist = std::numeric_limits<double>::infinity();
+    double second_best_dist = std::numeric_limits<double>::infinity();
+    for (int trk_idx : *unmatched_trks) {
+      if (trk_idx < 0 || trk_idx >= static_cast<int>(trackers->size())) {
+        continue;
+      }
+      Track& tracker = *(*trackers)[static_cast<size_t>(trk_idx)];
+      if (tracker.id < 0 || tracker.time_since_update <= 0) {
+        continue;
+      }
+      if (should_protect_residual_observation_update(det, tracker, p)) {
+        continue;
+      }
+      double dist = 0.0;
+      double size_score = 0.0;
+      if (!lost_track_reconnect_metrics(det, tracker, &dist, &size_score)) {
+        continue;
+      }
+      if (size_score < p.lost_track_reconnect_size_ratio_thresh ||
+          dist >= center_thresh) {
+        continue;
+      }
+      if (dist < best_dist) {
+        if (std::isfinite(best_dist)) {
+          second_best_dist = best_dist;
+        }
+        best_dist = dist;
+        best_trk = trk_idx;
+      } else if (dist < second_best_dist) {
+        second_best_dist = dist;
+      }
+    }
+    if (best_trk < 0) {
+      continue;
+    }
+    if (std::isfinite(second_best_dist) &&
+        (second_best_dist - best_dist) < p.lost_track_reconnect_ambiguity_margin) {
+      continue;
+    }
+    candidates.push_back(Candidate{det_idx, best_trk, best_dist});
+  }
+
+  if (candidates.empty()) {
+    return 0;
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    return a.dist < b.dist;
+  });
+
+  std::vector<char> used_det(dets_high.size(), 0);
+  std::vector<char> used_trk(trackers->size(), 0);
+  int reconnected = 0;
+  for (const Candidate& candidate : candidates) {
+    if (candidate.det_idx < 0 ||
+        candidate.det_idx >= static_cast<int>(used_det.size()) ||
+        candidate.trk_idx < 0 ||
+        candidate.trk_idx >= static_cast<int>(used_trk.size()) ||
+        used_det[static_cast<size_t>(candidate.det_idx)] ||
+        used_trk[static_cast<size_t>(candidate.trk_idx)]) {
+      continue;
+    }
+    bool track_claim_ambiguous = false;
+    for (const Candidate& other : candidates) {
+      if (other.det_idx == candidate.det_idx ||
+          other.trk_idx != candidate.trk_idx) {
+        continue;
+      }
+      if ((other.dist - candidate.dist) < p.lost_track_reconnect_ambiguity_margin) {
+        track_claim_ambiguous = true;
+        break;
+      }
+    }
+    if (track_claim_ambiguous) {
+      continue;
+    }
+    (*trackers)[static_cast<size_t>(candidate.trk_idx)]->update(
+        dets_high[static_cast<size_t>(candidate.det_idx)]);
+    used_det[static_cast<size_t>(candidate.det_idx)] = 1;
+    used_trk[static_cast<size_t>(candidate.trk_idx)] = 1;
+    reconnected += 1;
+  }
+
+  if (reconnected <= 0) {
+    return 0;
+  }
+
+  std::vector<int> next_unmatched_dets;
+  next_unmatched_dets.reserve(unmatched_dets->size());
+  for (int det_idx : *unmatched_dets) {
+    if (det_idx < 0 ||
+        det_idx >= static_cast<int>(used_det.size()) ||
+        !used_det[static_cast<size_t>(det_idx)]) {
+      next_unmatched_dets.push_back(det_idx);
+    }
+  }
+  unmatched_dets->swap(next_unmatched_dets);
+
+  std::vector<int> next_unmatched_trks;
+  next_unmatched_trks.reserve(unmatched_trks->size());
+  for (int trk_idx : *unmatched_trks) {
+    if (trk_idx < 0 ||
+        trk_idx >= static_cast<int>(used_trk.size()) ||
+        !used_trk[static_cast<size_t>(trk_idx)]) {
+      next_unmatched_trks.push_back(trk_idx);
+    }
+  }
+  unmatched_trks->swap(next_unmatched_trks);
+  return reconnected;
+}
+
 struct HybridSortNative {
   explicit HybridSortNative(const Params& params) : p(params) {}
 
@@ -901,6 +1341,23 @@ struct HybridSortNative {
   int frame_count = 0;
   int next_id = 0;
   std::vector<std::unique_ptr<Track>> trackers;
+
+  int retire_track(int raw_id) {
+    if (raw_id <= 0) {
+      return 0;
+    }
+    const int internal_id = raw_id - 1;
+    int removed = 0;
+    for (auto it = trackers.begin(); it != trackers.end();) {
+      if ((*it)->id == internal_id) {
+        it = trackers.erase(it);
+        removed += 1;
+      } else {
+        ++it;
+      }
+    }
+    return removed;
+  }
 
   int update(const float* input,
              int n_input,
@@ -957,6 +1414,13 @@ struct HybridSortNative {
         scale = 1.0;
       }
     }
+    p.wrap_width = img_w > 1.0f
+                       ? static_cast<double>(img_w)
+                       : (size_w > 1.0f ? static_cast<double>(size_w) / scale : 0.0);
+    p.wrap_width = valid_wrap_width(p.wrap_width);
+    for (auto& tracker : trackers) {
+      tracker->p.wrap_width = p.wrap_width;
+    }
 
     std::vector<std::array<double, 5>> dets_high;
     std::vector<std::array<double, 5>> dets_second;
@@ -999,16 +1463,40 @@ struct HybridSortNative {
     mark(3);
 
     AssocResult first = associate_first(dets_high, trk_rows, trackers, p);
-    const int matches_first = static_cast<int>(first.matches.size());
+    int matches_first = 0;
+    int protected_observation_updates = 0;
+    std::vector<uint8_t> residual_protected_output(trackers.size(), 0);
+    auto mark_residual_protected = [&](int trk_idx) {
+      if (trk_idx >= 0 && trk_idx < static_cast<int>(residual_protected_output.size())) {
+        residual_protected_output[static_cast<size_t>(trk_idx)] = 1;
+      }
+    };
     mark(4);
 
+    std::vector<int> protected_first_trks;
     for (const auto& match : first.matches) {
-      trackers[static_cast<size_t>(match.second)]->update(dets_high[static_cast<size_t>(match.first)]);
+      const int trk_idx = match.second;
+      const auto& det = dets_high[static_cast<size_t>(match.first)];
+      if (should_protect_residual_observation_update(
+              det, *trackers[static_cast<size_t>(trk_idx)], p)) {
+        protected_first_trks.push_back(trk_idx);
+        mark_residual_protected(trk_idx);
+        protected_observation_updates += 1;
+        continue;
+      }
+      trackers[static_cast<size_t>(trk_idx)]->update(det);
+      matches_first += 1;
     }
     mark(5);
 
     int matches_byte = 0;
     std::vector<int> unmatched_trks = first.unmatched_trks;
+    for (int trk_idx : protected_first_trks) {
+      if (std::find(unmatched_trks.begin(), unmatched_trks.end(), trk_idx) ==
+          unmatched_trks.end()) {
+        unmatched_trks.push_back(trk_idx);
+      }
+    }
     if (p.use_byte && !dets_second.empty() && !unmatched_trks.empty()) {
       std::vector<std::array<double, 6>> u_trks;
       u_trks.reserve(unmatched_trks.size());
@@ -1018,12 +1506,28 @@ struct HybridSortNative {
         }
       }
       AssocResult byte = associate_second(dets_second, u_trks, p, true);
+      std::vector<int> protected_trks;
       for (const auto& match : byte.matches) {
         const int trk_idx = unmatched_trks[static_cast<size_t>(match.second)];
+        const auto& det = dets_second[static_cast<size_t>(match.first)];
+        if (should_protect_residual_observation_update(
+                det, *trackers[static_cast<size_t>(trk_idx)], p)) {
+          protected_trks.push_back(trk_idx);
+          mark_residual_protected(trk_idx);
+          protected_observation_updates += 1;
+          continue;
+        }
         trackers[static_cast<size_t>(trk_idx)]->update(dets_second[static_cast<size_t>(match.first)]);
+        matches_byte += 1;
       }
-      matches_byte = static_cast<int>(byte.matches.size());
-      unmatched_trks = remap_subset_indices(unmatched_trks, byte.unmatched_trks);
+      std::vector<int> next_unmatched_trks = remap_subset_indices(unmatched_trks, byte.unmatched_trks);
+      for (int trk_idx : protected_trks) {
+        if (std::find(next_unmatched_trks.begin(), next_unmatched_trks.end(), trk_idx) ==
+            next_unmatched_trks.end()) {
+          next_unmatched_trks.push_back(trk_idx);
+        }
+      }
+      unmatched_trks.swap(next_unmatched_trks);
     }
     mark(6);
 
@@ -1041,16 +1545,35 @@ struct HybridSortNative {
         left_trks.push_back(last_boxes[static_cast<size_t>(idx)]);
       }
       AssocResult ocr = associate_second(left_dets, left_trks, p, false);
+      std::vector<int> protected_ocr_trks;
       for (const auto& match : ocr.matches) {
         const int det_idx = unmatched_dets[static_cast<size_t>(match.first)];
         const int trk_idx = unmatched_trks[static_cast<size_t>(match.second)];
-        trackers[static_cast<size_t>(trk_idx)]->update(dets_high[static_cast<size_t>(det_idx)]);
+        const auto& det = dets_high[static_cast<size_t>(det_idx)];
+        if (should_protect_residual_observation_update(
+                det, *trackers[static_cast<size_t>(trk_idx)], p)) {
+          protected_ocr_trks.push_back(trk_idx);
+          mark_residual_protected(trk_idx);
+          protected_observation_updates += 1;
+          continue;
+        }
+        trackers[static_cast<size_t>(trk_idx)]->update(det);
       }
-      matches_ocr = static_cast<int>(ocr.matches.size());
+      matches_ocr = static_cast<int>(ocr.matches.size()) -
+                    static_cast<int>(protected_ocr_trks.size());
       unmatched_dets = remap_subset_indices(unmatched_dets, ocr.unmatched_dets);
       unmatched_trks = remap_subset_indices(unmatched_trks, ocr.unmatched_trks);
+      for (int trk_idx : protected_ocr_trks) {
+        if (std::find(unmatched_trks.begin(), unmatched_trks.end(), trk_idx) ==
+            unmatched_trks.end()) {
+          unmatched_trks.push_back(trk_idx);
+        }
+      }
     }
     mark(7);
+
+    const int lost_track_reconnects = reconnect_lost_tracks_before_new(
+        dets_high, &unmatched_dets, &unmatched_trks, &trackers, p);
 
     for (int idx : unmatched_trks) {
       if (idx >= 0 && idx < static_cast<int>(trackers.size())) {
@@ -1060,22 +1583,33 @@ struct HybridSortNative {
     mark(8);
 
     int created_tracks = 0;
+    int suppressed_new_tracks = 0;
     for (int idx : unmatched_dets) {
       const auto& det = dets_high[static_cast<size_t>(idx)];
       if (det[4] < p.new_track_thresh) {
         continue;
       }
-      if (p.new_track_overlap_thresh < 1.0 && !trackers.empty()) {
-        bool overlaps_existing = false;
+      if (!trackers.empty()) {
+        bool suppress_new = false;
+        bool suppress_by_center = false;
         for (const auto& tracker : trackers) {
           std::array<double, 4> state = tracker->get_state();
           const std::array<double, 5> state_box{{state[0], state[1], state[2], state[3], det[4]}};
-          if (box_iou_arr(det, state_box) > p.new_track_overlap_thresh) {
-            overlaps_existing = true;
+          if (p.new_track_overlap_thresh < 1.0 &&
+              box_iou_wrap_arr(det, state_box, p.wrap_width) > p.new_track_overlap_thresh) {
+            suppress_new = true;
+            break;
+          }
+          if (should_suppress_new_track_near_existing(det, *tracker, p)) {
+            suppress_new = true;
+            suppress_by_center = true;
             break;
           }
         }
-        if (overlaps_existing) {
+        if (suppress_new) {
+          if (suppress_by_center) {
+            suppressed_new_tracks += 1;
+          }
           continue;
         }
       }
@@ -1098,7 +1632,10 @@ struct HybridSortNative {
         d[3] = trk.last_observation[3];
       }
       const bool is_confirmed = (trk.id >= 0) || (trk.hit_streak >= p.min_hits);
-      if (trk.time_since_update < 1 && is_confirmed) {
+      const bool residual_protected_hold =
+          i >= 0 && i < static_cast<int>(residual_protected_output.size()) &&
+          residual_protected_output[static_cast<size_t>(i)] != 0;
+      if ((trk.time_since_update < 1 || residual_protected_hold) && is_confirmed) {
         if (trk.id < 0) {
           trk.id = next_id;
           next_id += 1;
@@ -1138,6 +1675,9 @@ struct HybridSortNative {
     if (stats_len > 10) stats[10] = static_cast<int>(unmatched_dets.size());
     if (stats_len > 11) stats[11] = static_cast<int>(unmatched_trks.size());
     if (stats_len > 12) stats[12] = 1;
+    if (stats_len > 13) stats[13] = suppressed_new_tracks;
+    if (stats_len > 14) stats[14] = protected_observation_updates;
+    if (stats_len > 15) stats[15] = lost_track_reconnects;
     if (timings_len > 0) {
       timings[0] = elapsed_ms(t0, Clock::now());
     }
@@ -1164,6 +1704,14 @@ int hybrid_sort_native_create(float det_thresh,
                               float new_track_thresh,
                               float new_track_overlap_thresh,
                               float lost_velocity_decay,
+                              float new_track_center_suppress_thresh,
+                              float new_track_suppress_max_side,
+                              float byte_residual_size_ratio_thresh,
+                              float byte_residual_max_side,
+                              float lost_track_reconnect_center_thresh,
+                              float lost_track_reconnect_multi_target_center_thresh,
+                              float lost_track_reconnect_size_ratio_thresh,
+                              float lost_track_reconnect_ambiguity_margin,
                               void** out_handle,
                               char* err,
                               int err_len) {
@@ -1187,6 +1735,22 @@ int hybrid_sort_native_create(float det_thresh,
   p.new_track_thresh = new_track_thresh;
   p.new_track_overlap_thresh = new_track_overlap_thresh;
   p.lost_velocity_decay = clamp_value(static_cast<double>(lost_velocity_decay), 0.0, 1.0);
+  p.new_track_center_suppress_thresh =
+      clamp_value(static_cast<double>(new_track_center_suppress_thresh), 0.0, 5.0);
+  p.new_track_suppress_max_side =
+      clamp_value(static_cast<double>(new_track_suppress_max_side), 0.0, 300.0);
+  p.byte_residual_size_ratio_thresh =
+      clamp_value(static_cast<double>(byte_residual_size_ratio_thresh), 0.0, 1.0);
+  p.byte_residual_max_side =
+      clamp_value(static_cast<double>(byte_residual_max_side), 0.0, 300.0);
+  p.lost_track_reconnect_center_thresh =
+      clamp_value(static_cast<double>(lost_track_reconnect_center_thresh), 0.0, 5.0);
+  p.lost_track_reconnect_multi_target_center_thresh =
+      clamp_value(static_cast<double>(lost_track_reconnect_multi_target_center_thresh), 0.0, 5.0);
+  p.lost_track_reconnect_size_ratio_thresh =
+      clamp_value(static_cast<double>(lost_track_reconnect_size_ratio_thresh), 0.0, 1.0);
+  p.lost_track_reconnect_ambiguity_margin =
+      clamp_value(static_cast<double>(lost_track_reconnect_ambiguity_margin), 0.0, 5.0);
   *out_handle = new HybridSortNative(p);
   return 0;
 }
@@ -1260,6 +1824,17 @@ int hybrid_sort_native_reset_ids(void* handle, char* err, int err_len) {
   }
   static_cast<HybridSortNative*>(handle)->next_id = 0;
   return 0;
+}
+
+int hybrid_sort_native_retire_track(void* handle, int raw_id, char* err, int err_len) {
+  if (handle == nullptr) {
+    set_error(err, err_len, "null handle");
+    return -1;
+  }
+  if (raw_id <= 0) {
+    return 0;
+  }
+  return static_cast<HybridSortNative*>(handle)->retire_track(raw_id);
 }
 
 void hybrid_sort_native_destroy(void* handle) {

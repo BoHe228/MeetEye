@@ -309,6 +309,34 @@ static bool merge_old_spatial_duplicate(const MergeBox& a, const MergeBox& b)
   return cd_norm < 0.8f && x_cover > 0.35f && y_cover > 0.35f && area_ratio > 0.25f;
 }
 
+static bool merge_wrap_spatial_duplicate(const MergeBox& a,
+                                         const MergeBox& b,
+                                         float min_iou_thresh)
+{
+  float inter = 0.0f;
+  float min_area = 0.0f;
+  float iw = 0.0f;
+  float ih = 0.0f;
+  float min_w = 0.0f;
+  float min_h = 0.0f;
+  float area_a = 0.0f;
+  float area_b = 0.0f;
+  merge_intersection_stats(a, b, &inter, &min_area, &iw, &ih, &min_w, &min_h, &area_a, &area_b);
+  if (min_area <= 0.0f) {
+    return false;
+  }
+
+  const float min_iou = inter / (min_area + 1e-6f);
+  if (min_iou > min_iou_thresh) {
+    return true;
+  }
+
+  const float dist = merge_center_distance_norm(a, b);
+  const float y_cover = min_h > 0.0f ? ih / (min_h + 1e-6f) : 0.0f;
+  const float area_ratio = std::min(area_a, area_b) / (std::max(area_a, area_b) + 1e-6f);
+  return dist < 0.80f && y_cover > 0.45f && area_ratio > 0.25f;
+}
+
 static MergeBox merge_convert_box_to_original(const MergeBox& local,
                                               float start_x,
                                               int wrap_around,
@@ -603,17 +631,7 @@ static int merge_decoded_slices(const float* decoded,
             bi.x2 -= panorama_width;
           }
 
-          float inter = 0.0f;
-          float min_area = 0.0f;
-          float iw = 0.0f;
-          float ih = 0.0f;
-          float min_w = 0.0f;
-          float min_h = 0.0f;
-          float area_i = 0.0f;
-          float area_j = 0.0f;
-          merge_intersection_stats(bi, bj, &inter, &min_area, &iw, &ih, &min_w, &min_h, &area_i, &area_j);
-          const float wrap_min_iou = inter / (min_area + 1e-6f);
-          is_same_target = wrap_min_iou > iou_threshold;
+          is_same_target = merge_wrap_spatial_duplicate(bi, bj, iou_threshold);
         } else if (is_adjacent_pair) {
           const float cxi = (di.box.x1 + di.box.x2) * 0.5f;
           const float cxj = (dj.box.x1 + dj.box.x2) * 0.5f;
@@ -1862,6 +1880,154 @@ int face_rknn_parallel_infer_merged(void* handle,
     timings[18] = decode_ms[2];
   }
   return 0;
+}
+
+int face_rknn_parallel_infer_merged_single_core(void* handle,
+                                                int core_index,
+                                                const uint8_t* input,
+                                                int input_h,
+                                                int input_w,
+                                                int input_c,
+                                                int image_h,
+                                                int image_w,
+                                                float gain,
+                                                int pad_left,
+                                                int pad_top,
+                                                float nms_iou_thresh,
+                                                float conf_threshold,
+                                                int max_det,
+                                                int max_nms,
+                                                float* detections,
+                                                int max_output_dets,
+                                                int* detection_count,
+                                                int* merge_stats,
+                                                double* timings,
+                                                char* err,
+                                                int err_len)
+{
+  auto* runner = static_cast<ParallelRunner*>(handle);
+  if (runner == nullptr || input == nullptr || detections == nullptr ||
+      detection_count == nullptr) {
+    set_error(err, err_len, "invalid null argument");
+    return -1;
+  }
+  if (image_h <= 0 || image_w <= 0 || gain <= 0.0f ||
+      max_det <= 0 || max_output_dets <= 0) {
+    set_error(err, err_len, "invalid single-image shape");
+    return -1;
+  }
+  if (max_nms <= 0) {
+    max_nms = 300;
+  }
+  if (core_index < 0 || core_index >= kNumContexts) {
+    set_error(err, err_len, "invalid single-image core index");
+    return -1;
+  }
+  ContextState& state = runner->states[core_index];
+  if (input_h != state.input_h || input_w != state.input_w || input_c != state.input_c) {
+    set_error(err, err_len, "input shape mismatch");
+    return -1;
+  }
+
+  DecodeMeta meta;
+  meta.slice_h = image_h;
+  meta.slice_w = image_w;
+  meta.gain = gain;
+  meta.pad_left = pad_left;
+  meta.pad_top = pad_top;
+
+  const int decode_max_det = std::min(max_det, max_output_dets);
+  int decoded_count = 0;
+  double run_ms = 0.0;
+  double outputs_ms = 0.0;
+  double decode_ms = 0.0;
+  std::string error;
+
+  const int64_t wall0 = now_us();
+  const int ret = run_one_decoded(
+      &state,
+      input,
+      meta,
+      conf_threshold,
+      nms_iou_thresh,
+      decode_max_det,
+      max_nms,
+      detections,
+      &decoded_count,
+      &run_ms,
+      &outputs_ms,
+      &decode_ms,
+      &error);
+  const int64_t wall1 = now_us();
+  if (ret != 0) {
+    set_error(err, err_len, error);
+    return ret;
+  }
+
+  *detection_count = std::max(0, std::min(decoded_count, max_output_dets));
+  if (merge_stats != nullptr) {
+    merge_stats[0] = *detection_count;
+    merge_stats[1] = *detection_count;
+    merge_stats[2] = *detection_count;
+  }
+  if (timings != nullptr) {
+    timings[0] = (wall1 - wall0) / 1000.0;
+    timings[1] = run_ms;
+    timings[2] = outputs_ms;
+    timings[3] = decode_ms;
+    timings[4] = 0.0;
+    timings[10] = run_ms;
+    timings[13] = outputs_ms;
+    timings[16] = decode_ms;
+  }
+  return 0;
+}
+
+int face_rknn_parallel_infer_merged_single(void* handle,
+                                           const uint8_t* input,
+                                           int input_h,
+                                           int input_w,
+                                           int input_c,
+                                           int image_h,
+                                           int image_w,
+                                           float gain,
+                                           int pad_left,
+                                           int pad_top,
+                                           float nms_iou_thresh,
+                                           float conf_threshold,
+                                           int max_det,
+                                           int max_nms,
+                                           float* detections,
+                                           int max_output_dets,
+                                           int* detection_count,
+                                           int* merge_stats,
+                                           double* timings,
+                                           char* err,
+                                           int err_len)
+{
+  return face_rknn_parallel_infer_merged_single_core(
+      handle,
+      0,
+      input,
+      input_h,
+      input_w,
+      input_c,
+      image_h,
+      image_w,
+      gain,
+      pad_left,
+      pad_top,
+      nms_iou_thresh,
+      conf_threshold,
+      max_det,
+      max_nms,
+      detections,
+      max_output_dets,
+      detection_count,
+      merge_stats,
+      timings,
+      err,
+      err_len);
 }
 
 int face_rknn_parallel_infer_merged_bound(void* handle,

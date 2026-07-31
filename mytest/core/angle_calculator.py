@@ -133,7 +133,11 @@ class AngleCalculator:
 
     def __init__(self, panorama_width: int, panorama_height: int, vertical_fov: float = 200.0,
                  fisheye_center: Optional[Tuple[float, float]] = None, fit_degree: int = 5,
-                 yaml_file: Optional[str] = None, feature_point_mode: str = 'nose'):
+                 yaml_file: Optional[str] = None, feature_point_mode: str = 'nose',
+                 projection_mode: str = 'fisheye-panorama',
+                 wide_fx: Optional[float] = None, wide_fy: Optional[float] = None,
+                 wide_cx: Optional[float] = None, wide_cy: Optional[float] = None,
+                 wide_horizontal_fov: float = 90.0):
         """
         初始化角度计算器
 
@@ -149,6 +153,14 @@ class AngleCalculator:
         self.panorama_height = panorama_height
         self.vertical_fov = vertical_fov
         self.crop_top_offset = 0  # 顶部裁剪偏移量（像素）
+        self.projection_mode = str(projection_mode or 'fisheye-panorama').replace('_', '-')
+        self.wide_horizontal_fov = float(wide_horizontal_fov)
+        self.wide_fx = None
+        self.wide_fy = None
+        self.wide_cx = None
+        self.wide_cy = None
+        self._wide_center_azimuth = 0.0
+        self._wide_center_elevation = 0.0
 
         # 鱼眼转换相关参数
         self.fisheye_center = fisheye_center or (922.0, 564.0)
@@ -159,10 +171,12 @@ class AngleCalculator:
         self.panorama_map_x: Optional[np.ndarray] = None
         self.panorama_map_y: Optional[np.ndarray] = None
 
-        # 初始化鱼眼角度转换器
-        self.fisheye_converter = FisheyeConverter(yaml_file=yaml_file, fit_degree=fit_degree)
-        if fisheye_center:
-            self.fisheye_converter.set_center(fisheye_center[0], fisheye_center[1])
+        # 广角模式使用 pinhole 近似角度，不加载鱼眼标定，避免误导日志。
+        self.fisheye_converter = None
+        if not self.is_wide_angle:
+            self.fisheye_converter = FisheyeConverter(yaml_file=yaml_file, fit_degree=fit_degree)
+            if fisheye_center:
+                self.fisheye_converter.set_center(fisheye_center[0], fisheye_center[1])
 
         # 关键点索引定义（与config.py保持一致）
         self.NOSE_INDEX = 0
@@ -180,6 +194,59 @@ class AngleCalculator:
         self.FACE_NOSE_INDEX = 2
         self.FACE_LEFT_MOUTH_INDEX = 3
         self.FACE_RIGHT_MOUTH_INDEX = 4
+
+        if self.is_wide_angle:
+            self.set_wide_angle_intrinsics(
+                fx=wide_fx, fy=wide_fy, cx=wide_cx, cy=wide_cy,
+                horizontal_fov=wide_horizontal_fov, vertical_fov=vertical_fov,
+            )
+
+    @property
+    def is_wide_angle(self) -> bool:
+        return self.projection_mode in {'wide-angle', 'wideangle', 'wide'}
+
+    def set_wide_angle_intrinsics(self, fx: Optional[float] = None,
+                                  fy: Optional[float] = None,
+                                  cx: Optional[float] = None,
+                                  cy: Optional[float] = None,
+                                  horizontal_fov: Optional[float] = None,
+                                  vertical_fov: Optional[float] = None) -> None:
+        """
+        设置广角相机 pinhole 近似内参。和 board_cpp 一致：
+        angle = atan2((pixel - center) / focal, 1)，再减去画面中心角。
+        """
+        w = max(1, int(self.panorama_width))
+        h = max(1, int(self.panorama_height))
+        hfov = float(horizontal_fov if horizontal_fov is not None else self.wide_horizontal_fov)
+        vfov = float(vertical_fov if vertical_fov is not None else self.vertical_fov)
+        if fx is None or float(fx) <= 0:
+            hfov_rad = np.deg2rad(max(1.0, min(179.0, hfov)))
+            fx = w / (2.0 * np.tan(hfov_rad * 0.5))
+        if fy is None or float(fy) <= 0:
+            vfov_rad = np.deg2rad(max(1.0, min(179.0, vfov)))
+            fy = h / (2.0 * np.tan(vfov_rad * 0.5))
+        if cx is None:
+            cx = (w - 1) * 0.5
+        if cy is None:
+            cy = (h - 1) * 0.5
+        self.wide_fx = float(fx)
+        self.wide_fy = float(fy)
+        self.wide_cx = float(cx)
+        self.wide_cy = float(cy)
+        center_x = (w - 1) * 0.5
+        center_y = (h - 1) * 0.5
+        self._wide_center_azimuth = self._wide_raw_azimuth(center_x)
+        self._wide_center_elevation = self._wide_raw_elevation(center_y)
+
+    def _wide_raw_azimuth(self, x: float) -> float:
+        if not self.wide_fx or self.wide_fx <= 0:
+            return 0.0
+        return float(np.degrees(np.arctan2((float(x) - self.wide_cx) / self.wide_fx, 1.0)))
+
+    def _wide_raw_elevation(self, y: float) -> float:
+        if not self.wide_fy or self.wide_fy <= 0:
+            return 0.0
+        return float(np.degrees(np.arctan2((float(y) - self.wide_cy) / self.wide_fy, 1.0)))
 
     def set_crop_offset(self, crop_top_offset: int):
         """
@@ -351,6 +418,11 @@ class AngleCalculator:
         返回:
             (azimuth_deg, elevation_deg) 水平角和俯仰角（度）
         """
+        if self.is_wide_angle:
+            azimuth_deg = self._wide_raw_azimuth(x) - self._wide_center_azimuth
+            elevation_deg = self._wide_raw_elevation(y) - self._wide_center_elevation
+            return azimuth_deg, elevation_deg
+
         # ========== 水平角：保持原有计算方法不变 ==========
         azimuth_deg = 360.0 * (x / self.panorama_width)
         azimuth_deg = azimuth_deg % 360.0

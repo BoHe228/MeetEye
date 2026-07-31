@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${ROOT_DIR}/bin/meeteye_cpp_smoke"
 MODEL="${ROOT_DIR}/models/yolov8n-face-640-b1-int8-hybrid-split-kptconf-rk3588.rknn"
-MAP_DIR="${ROOT_DIR}/maps/6.22_2560_yolo_slices_640_cpp"
+MAP_DIR="${ROOT_DIR}/maps/7.10_2560_yolo_slices_640_cpp"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "missing executable: ${BIN}" >&2

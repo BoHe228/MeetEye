@@ -218,7 +218,8 @@ def draw_bounding_boxes(image: np.ndarray, detections: List[Dict],
         if face_name:
             label_parts.append(face_name)
         elif show_id and track_id != -1:
-            label_parts.append(f"ID:{track_id}")
+            label_id = det.get('display_id') or track_id
+            label_parts.append(f"ID:{label_id}")
         if show_conf:
             label_parts.append(f"{confidence:.2f}")
         if det.get('talking'):

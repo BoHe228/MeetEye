@@ -44,6 +44,7 @@ from utils import (
 )
 
 from utils.sector import aggregate_sectors, draw_sector_grid
+from utils.display_id_manager import DisplayIdManager
 
 # 导入特征提取器
 from utils.feature_extractor import FeatureExtractor
@@ -126,6 +127,14 @@ class FisheyePanoramaYOLOPose:
         self.face_rec: Optional[FaceRecManager] = None
         self._face_name_map: Dict[int, str] = {}   # track_id → person_name
         self._prev_track_ids: set = set()
+        self.display_id_manager = DisplayIdManager(
+            max_count=getattr(args, 'display_id_max_count', 8),
+            binding_ttl_frames=getattr(args, 'display_id_binding_ttl', 60),
+            reuse_max_frames=getattr(args, 'display_id_reuse_max_frames', 900),
+            fallback_min_frames=getattr(args, 'display_id_reuse_fallback_min_frames', 150),
+            reuse_center_thresh=getattr(args, 'display_id_reuse_center_thresh', 2.0),
+            reuse_size_ratio=getattr(args, 'display_id_reuse_size_ratio', 0.4),
+        )
 
         # 说话检测
         self.talking_detector: Optional['TalkingDetector'] = None
@@ -222,6 +231,7 @@ class FisheyePanoramaYOLOPose:
                 with_reid=(args.use_reid and _reid_ok),
                 reid_emb_weight_high=args.reid_emb_weight_high,
                 reid_emb_weight_low=args.reid_emb_weight_low,
+                new_track_overlap_thresh=getattr(args, 'new_track_overlap_thresh', 0.6),
                 # ── 全景图尺寸 ───────────────────────────────────────────────
                 panorama_width=3840,
                 panorama_height=1080,
@@ -571,6 +581,8 @@ class FisheyePanoramaYOLOPose:
                 self._face_name_map.pop(gone, None)
                 self.face_rec.cleanup_track(gone)
         self._prev_track_ids = current_ids
+        tracked_detections = self.display_id_manager.apply(
+            tracked_detections, self._timing_counter)
 
         # ⑦-c 说话检测  [CPU, MediaPipe]
         if self.talking_detector is not None:

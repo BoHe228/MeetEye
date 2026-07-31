@@ -49,7 +49,7 @@ class Flatten(Module):
     """ Flat tensor
     """
     def forward(self, input):
-        return input.view(input.size(0), -1)
+        return input.reshape(input.size(0), -1)
 
 
 class LinearBlock(Module):

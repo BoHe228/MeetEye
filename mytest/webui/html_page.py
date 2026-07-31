@@ -80,6 +80,64 @@ button:hover{opacity:.85;transform:translateY(-1px);}
 .metric.net{border-left-color:#f59e0b;}
 .mlabel{font-size:11px;color:#94a3b8;margin-bottom:4px;}
 .mval{font-size:18px;font-weight:700;color:#e5e7eb;word-break:break-all;}
+.face-observer{
+    max-width:1280px;margin:0 auto 22px;
+    background:rgba(15,23,42,.72);border:1px solid #334155;
+    border-radius:10px;padding:14px;
+}
+.face-observer-title{
+    display:flex;justify-content:space-between;align-items:center;
+    gap:12px;margin-bottom:12px;
+}
+.face-observer-title h2{font-size:15px;font-weight:700;color:#e5e7eb;}
+.face-observer-title span{font-size:12px;color:#94a3b8;}
+.face-track-grid{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));
+    gap:12px;
+}
+.face-track-card{
+    background:rgba(30,41,59,.88);border:1px solid #334155;
+    border-radius:8px;padding:12px;min-width:0;
+}
+.face-track-head{
+    display:flex;justify-content:space-between;align-items:center;
+    gap:10px;margin-bottom:10px;font-size:12px;color:#94a3b8;
+}
+.face-track-head strong{font-size:14px;color:#e5e7eb;}
+.face-badge{
+    display:inline-flex;align-items:center;gap:6px;
+    border:1px solid #0ea5e9;background:rgba(14,165,233,.15);
+    color:#7dd3fc;border-radius:999px;padding:3px 8px;font-size:12px;
+}
+.face-system{
+    border-top:1px solid rgba(51,65,85,.8);
+    padding-top:10px;margin-top:10px;
+}
+.face-system-title{
+    display:flex;justify-content:space-between;gap:8px;
+    font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:8px;
+}
+.face-system-title span{font-weight:500;color:#94a3b8;}
+.face-row{display:flex;gap:8px;align-items:stretch;overflow-x:auto;padding-bottom:2px;}
+.face-crop{
+    flex:0 0 88px;min-height:116px;
+    background:rgba(2,6,23,.75);border:1px solid #334155;
+    border-radius:7px;padding:6px;text-align:center;
+}
+.face-crop img{
+    width:74px;height:74px;object-fit:cover;border-radius:5px;
+    background:#020617;border:1px solid rgba(148,163,184,.25);
+}
+.face-crop .cap{font-size:10px;color:#cbd5e1;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.face-crop .sim{font-size:11px;color:#fbbf24;margin-top:3px;}
+.face-quality{
+    font-size:11px;color:#94a3b8;line-height:1.6;margin-top:8px;
+    word-break:break-word;
+}
+.face-empty{
+    color:#94a3b8;font-size:13px;text-align:center;
+    padding:18px;border:1px dashed #334155;border-radius:8px;
+}
 .statusbar{
     position:fixed;bottom:0;left:0;right:0;
     background:rgba(15,23,42,.97);padding:9px 20px;
@@ -157,6 +215,16 @@ button:hover{opacity:.85;transform:translateY(-1px);}
     <div class="metric net"><div class="mlabel">推流客户端</div><div class="mval" id="m-clients">—</div></div>
     <div class="metric" style="border-left-color:#ec4899;"><div class="mlabel">WebRTC 状态</div><div class="mval" id="m-webrtc-state" style="font-size:13px;">连接中…</div></div>
     <div class="metric" style="border-left-color:#ec4899;"><div class="mlabel">浏览器帧率 (FPS)</div><div class="mval" id="m-display-fps">—</div></div>
+</div>
+
+<div class="face-observer">
+    <div class="face-observer-title">
+        <h2>人脸识别特征相似度观察</h2>
+        <span id="face-observer-status">等待 FaceRec 数据...</span>
+    </div>
+    <div id="face-observer-body" class="face-empty">
+        暂无人脸识别 crop。只有实际送入 AdaFace 的帧会更新这里。
+    </div>
 </div>
 
 <div class="statusbar">
@@ -494,6 +562,160 @@ async function toggleRecord() {
     }
 }
 
+function _escHtml(v) {
+    return String(v ?? '').replace(/[&<>"']/g, c => ({
+        '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    }[c]));
+}
+
+function _simText(v) {
+    return (typeof v === 'number' && Number.isFinite(v)) ? v.toFixed(3) : '—';
+}
+
+function _cropCard(title, image, similarity) {
+    const imgHtml = image
+        ? `<img src="${image}" alt="${_escHtml(title)}">`
+        : `<div style="width:74px;height:74px;border-radius:5px;background:#020617;border:1px dashed #334155;"></div>`;
+    return `
+        <div class="face-crop">
+            ${imgHtml}
+            <div class="cap">${_escHtml(title)}</div>
+            <div class="sim">sim ${_simText(similarity)}</div>
+        </div>`;
+}
+
+function _qualityLine(q, topScores) {
+    q = q || {};
+    const flags = [
+        q.trigger_ok ? 'trigger_ok' : 'trigger_no',
+        q.sample_ok ? 'sample_ok' : 'sample_no',
+        q.primary_ok ? 'primary_ok' : 'primary_no',
+        q.pose_sample_quality_ok ? 'pose_ok' : 'pose_no',
+        q.locked_pose_quality_ok ? 'locked_pose_ok' : ''
+    ].filter(Boolean).join(' / ');
+    const base = [
+        `质量: ${flags}`,
+        `reason=${_escHtml(q.reason || '—')}`,
+        `sample=${_escHtml(q.sample_reason || '—')}`,
+        `primary=${_escHtml(q.primary_reason || '—')}`,
+        `update=${_escHtml(q.update_reason || '—')}`,
+        `side=${_simText(q.min_side)}`,
+        `kp=${_simText(q.min_keypoint_conf)}`,
+        `yaw=${q.yaw_valid ? _simText(q.yaw_deg) + '°' : '—'}`,
+        `same=${_simText(q.best_existing)}`,
+        `other=${_simText(q.best_other)}`,
+        `need=${_simText(q.sample_similarity)}`,
+        `pose_same=${_simText(q.pose_library_similarity)}`,
+        `pose_need=${_simText(q.pose_library_threshold)}`,
+        `pose_max=${_simText(q.pose_library_max_similarity)}`,
+        `pose_gap=${q.pose_sample_missing_frames ?? '—'}/${q.pose_sample_interval ?? '—'}`
+    ].join(' ｜ ');
+    const tops = Array.isArray(topScores) && topScores.length
+        ? ' ｜ Top: ' + topScores.map(s => `${_escHtml(s.face_id)}=${_simText(s.score)}`).join(', ')
+        : '';
+    return base + tops;
+}
+
+function renderFaceObserver(observer) {
+    const status = document.getElementById('face-observer-status');
+    const body = document.getElementById('face-observer-body');
+    if (!status || !body) return;
+
+    if (!observer || observer.enabled === false) {
+        status.textContent = 'FaceRec 观察面板未启用';
+        body.className = 'face-empty';
+        body.textContent = '启动时加入 --face-rec-observer 可开启实时相似度观察。';
+        return;
+    }
+
+    const tracks = Array.isArray(observer.tracks) ? observer.tracks : [];
+    if (!tracks.length) {
+        status.textContent = '等待 AdaFace 输入帧...';
+        body.className = 'face-empty';
+        body.textContent = '暂无人脸识别 crop。只有实际送入 AdaFace 的帧会更新这里。';
+        return;
+    }
+
+    status.textContent = `显示最近 ${tracks.length} 个 FaceID / 待建库样本的 AdaFace 输入`;
+    body.className = 'face-track-grid';
+    body.innerHTML = tracks.map(t => {
+        const anchor = t.frontal_anchor || null;
+        const gallery = t.gallery || {};
+        const primary = Array.isArray(gallery.primary) ? gallery.primary : [];
+        const supplement = Array.isArray(gallery.supplement) ? gallery.supplement : [];
+        const displayFace = t.target_face_id || t.face_id || t.raw_face_id || '待建库';
+        const currentCrop = _cropCard('实时人脸', t.current_crop, null);
+        const anchorHtml = anchor
+            ? _cropCard(`正脸基准 ${anchor.face_id || ''}`, anchor.crop, anchor.similarity)
+            : '<div class="face-empty" style="padding:12px;min-width:180px;">还没有符合主特征质量条件的正脸基准</div>';
+        const galleryCards = [
+            currentCrop,
+            ...primary.map((s, i) => _cropCard(`主特征 ${i + 1}`, s.crop, s.similarity)),
+            ...supplement.map((s, i) => _cropCard(`姿态 ${i + 1}`, s.crop, s.similarity))
+        ].join('');
+        const galleryEmpty = (!primary.length && !supplement.length)
+            ? '<div class="face-empty" style="padding:12px;min-width:180px;">当前 FaceID 还没有可显示的特征库样本</div>'
+            : '';
+        return `
+            <div class="face-track-card">
+                <div class="face-track-head">
+                    <strong>Face ${_escHtml(displayFace)}</strong>
+                    <span class="face-badge">最近 Track ${_escHtml(t.track_id)}</span>
+                </div>
+                <div class="face-quality">
+                    frame=${_escHtml(t.frame_id)} ｜ event=${_escHtml(t.event || '—')} ｜
+                    score=${_simText(t.score)} ｜ second=${_simText(t.second_score)}
+                </div>
+                <div class="face-system">
+                    <div class="face-system-title">
+                        <div>方案一：最正脸基准对比</div>
+                        <span>当前 crop vs 该 FaceID 最正脸样本</span>
+                    </div>
+                    <div class="face-row">${currentCrop}${anchorHtml}</div>
+                </div>
+                <div class="face-system">
+                    <div class="face-system-title">
+                        <div>方案二：主特征 + 多姿态样本</div>
+                        <span>当前 crop vs 主特征/姿态样本</span>
+                    </div>
+                    <div class="face-row">${galleryCards}${galleryEmpty}</div>
+                </div>
+                <div class="face-quality">${_qualityLine(t.quality, t.top_scores)}</div>
+            </div>`;
+    }).join('');
+}
+
+let _faceObserverWs = null;
+async function _parseInferencePayload(data) {
+    if (typeof data === 'string') return JSON.parse(data);
+    if (data instanceof ArrayBuffer) {
+        return JSON.parse(new TextDecoder('utf-8').decode(data));
+    }
+    if (data instanceof Blob) {
+        return JSON.parse(await data.text());
+    }
+    return null;
+}
+
+function initFaceObserverWs() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws/inference`;
+    try {
+        _faceObserverWs = new WebSocket(url);
+        _faceObserverWs.binaryType = 'arraybuffer';
+        _faceObserverWs.onmessage = async e => {
+            try {
+                const payload = await _parseInferencePayload(e.data);
+                renderFaceObserver(payload && payload.face_rec_observer);
+            } catch (_) {}
+        };
+        _faceObserverWs.onclose = () => setTimeout(initFaceObserverWs, 2000);
+        _faceObserverWs.onerror = () => { try { _faceObserverWs.close(); } catch (_) {} };
+    } catch (_) {
+        setTimeout(initFaceObserverWs, 2000);
+    }
+}
+
 async function updateMetrics() {
     try {
         const r = await fetch('/performance');
@@ -542,6 +764,7 @@ function showToast(msg) {
 
 setInterval(updateMetrics, 1000);
 updateMetrics();
+initFaceObserverWs();
 </script>
 </body>
 </html>"""

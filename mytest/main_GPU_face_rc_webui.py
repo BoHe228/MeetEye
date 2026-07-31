@@ -4,9 +4,9 @@ GPU WebUI entry with face recognition kept separate from TrackID.
 This file intentionally leaves main_GPU_webui.py untouched. It reuses the
 existing WebUI pipeline, enables the existing FaceRecManager path by default,
 and patches only presentation/JSON behavior for this entry:
-  - TrackID is still shown as ID:<track_id>
+  - display_id is shown as ID:<display_id> when present
   - face recognition is shown as an additional Face:<name> label
-  - JSON keeps "id" as TrackID and adds a separate "face_recognition" object
+  - JSON keeps track_id separately and adds a separate "face_recognition" object
 """
 import importlib.util
 import importlib.machinery
@@ -15,6 +15,16 @@ import sys
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _argv_has_option(option: str) -> bool:
+    prefix = option + "="
+    return any(arg == option or arg.startswith(prefix) for arg in sys.argv[1:])
+
+
+def _set_default_arg(args, attr: str, option: str, value) -> None:
+    if not _argv_has_option(option):
+        setattr(args, attr, value)
 
 
 def _preload_face_rec_manager() -> None:
@@ -76,6 +86,36 @@ def _patch_parse_args_default_face_rec() -> None:
         if '--no-use-face-rec' not in sys.argv:
             args.use_face_rec = True
         args.face_rec_dynamic_library = True
+        _set_default_arg(args, 'face_rec_threshold', '--face-rec-threshold', 0.55)
+        _set_default_arg(args, 'face_rec_cooldown', '--face-rec-cooldown', 10)
+        _set_default_arg(args, 'face_rec_align_mode', '--face-rec-align-mode', 'five-point')
+        _set_default_arg(args, 'face_rec_five_point_scale', '--face-rec-five-point-scale', 1.20)
+        _set_default_arg(args, 'dynamic_face_max_samples', '--dynamic-face-max-samples', 12)
+        _set_default_arg(args, 'dynamic_face_update_similarity', '--dynamic-face-update-similarity', 0.65)
+        _set_default_arg(args, 'dynamic_face_pose_sample_similarity', '--dynamic-face-pose-sample-similarity', 0.55)
+        _set_default_arg(args, 'dynamic_face_pose_library_similarity', '--dynamic-face-pose-library-similarity', 0.55)
+        _set_default_arg(args, 'dynamic_face_pose_library_max_similarity', '--dynamic-face-pose-library-max-similarity', 0.90)
+        _set_default_arg(args, 'dynamic_face_pose_sample_interval', '--dynamic-face-pose-sample-interval', 30)
+        _set_default_arg(args, 'dynamic_face_pending_seed_samples', '--dynamic-face-pending-seed-samples', 2)
+        _set_default_arg(args, 'dynamic_face_locked_sample_similarity', '--dynamic-face-locked-sample-similarity', 0.35)
+        _set_default_arg(args, 'dynamic_face_primary_max_yaw', '--dynamic-face-primary-max-yaw', 10.0)
+        _set_default_arg(args, 'dynamic_face_primary_ema_alpha', '--dynamic-face-primary-ema-alpha', 0.1)
+        _set_default_arg(args, 'dynamic_face_enroll_confirm_frames', '--dynamic-face-enroll-confirm-frames', 3)
+        _set_default_arg(args, 'dynamic_face_binding_ttl', '--dynamic-face-binding-ttl', 900)
+        _set_default_arg(args, 'dynamic_face_min_height', '--dynamic-face-min-height', 100)
+        _set_default_arg(args, 'dynamic_face_min_keypoint_conf', '--dynamic-face-min-keypoint-conf', 0.6)
+        _set_default_arg(args, 'dynamic_face_update_min_height', '--dynamic-face-update-min-height', 100)
+        _set_default_arg(args, 'dynamic_face_update_min_keypoint_conf', '--dynamic-face-update-min-keypoint-conf', 0.7)
+        _set_default_arg(args, 'dynamic_face_update_min_score', '--dynamic-face-update-min-score', 0.5)
+        _set_default_arg(args, 'dynamic_face_primary_min_height', '--dynamic-face-primary-min-height', 110)
+        _set_default_arg(args, 'dynamic_face_primary_min_keypoint_conf', '--dynamic-face-primary-min-keypoint-conf', 0.8)
+        _set_default_arg(args, 'dynamic_face_primary_min_score', '--dynamic-face-primary-min-score', 0.6)
+        _set_default_arg(args, 'dynamic_face_match_margin', '--dynamic-face-match-margin', 0.08)
+        _set_default_arg(args, 'dynamic_face_alias_threshold', '--dynamic-face-alias-threshold', 0.55)
+        if (not _argv_has_option('--face-rec-observer')
+                and not _argv_has_option('--no-face-rec-observer')):
+            args.face_rec_observer = True
+        _set_default_arg(args, 'face_rec_observer_pending_ttl', '--face-rec-observer-pending-ttl', 90)
         return args
 
     config.parse_args = parse_args_face_rec_default
@@ -106,11 +146,59 @@ def _patch_processor_face_rec_manager() -> None:
                     kwargs['dynamic_update_similarity'] = getattr(
                         self_args, 'dynamic_face_update_similarity', None
                     )
+                    kwargs['dynamic_pose_sample_similarity'] = getattr(
+                        self_args, 'dynamic_face_pose_sample_similarity', None
+                    )
+                    kwargs['dynamic_pose_library_similarity'] = getattr(
+                        self_args, 'dynamic_face_pose_library_similarity', None
+                    )
+                    kwargs['dynamic_pose_library_max_similarity'] = getattr(
+                        self_args, 'dynamic_face_pose_library_max_similarity', 0.90
+                    )
+                    kwargs['dynamic_pose_sample_interval'] = getattr(
+                        self_args, 'dynamic_face_pose_sample_interval', 30
+                    )
+                    kwargs['dynamic_pending_seed_samples'] = getattr(
+                        self_args, 'dynamic_face_pending_seed_samples', 2
+                    )
+                    kwargs['dynamic_locked_sample_similarity'] = getattr(
+                        self_args, 'dynamic_face_locked_sample_similarity', 0.35
+                    )
                     kwargs['dynamic_min_sample_diversity'] = getattr(
                         self_args, 'dynamic_face_min_sample_diversity', 0.015
                     )
                     kwargs['dynamic_primary_max_yaw_deg'] = getattr(
                         self_args, 'dynamic_face_primary_max_yaw', 20.0
+                    )
+                    kwargs['dynamic_primary_ema_alpha'] = getattr(
+                        self_args, 'dynamic_face_primary_ema_alpha', 0.1
+                    )
+                    kwargs['dynamic_enroll_confirm_frames'] = getattr(
+                        self_args, 'dynamic_face_enroll_confirm_frames', 3
+                    )
+                    kwargs['dynamic_binding_ttl_frames'] = getattr(
+                        self_args, 'dynamic_face_binding_ttl', 900
+                    )
+                    kwargs['dynamic_min_keypoint_conf'] = getattr(
+                        self_args, 'dynamic_face_min_keypoint_conf', 0.6
+                    )
+                    kwargs['dynamic_update_min_face_height'] = getattr(
+                        self_args, 'dynamic_face_update_min_height', None
+                    )
+                    kwargs['dynamic_update_min_keypoint_conf'] = getattr(
+                        self_args, 'dynamic_face_update_min_keypoint_conf', 0.7
+                    )
+                    kwargs['dynamic_update_min_score'] = getattr(
+                        self_args, 'dynamic_face_update_min_score', 0.5
+                    )
+                    kwargs['dynamic_primary_min_face_height'] = getattr(
+                        self_args, 'dynamic_face_primary_min_height', None
+                    )
+                    kwargs['dynamic_primary_min_keypoint_conf'] = getattr(
+                        self_args, 'dynamic_face_primary_min_keypoint_conf', 0.8
+                    )
+                    kwargs['dynamic_primary_min_score'] = getattr(
+                        self_args, 'dynamic_face_primary_min_score', 0.6
                     )
                     kwargs['dynamic_supplement_fallback_threshold'] = getattr(
                         self_args, 'dynamic_face_supplement_fallback_threshold', None
@@ -160,6 +248,12 @@ def _patch_processor_face_rec_manager() -> None:
                     kwargs['dynamic_lock_to_track'] = getattr(
                         self_args, 'dynamic_face_lock_to_track', True
                     )
+                    kwargs['align_mode'] = getattr(
+                        self_args, 'face_rec_align_mode', 'eye'
+                    )
+                    kwargs['five_point_scale'] = getattr(
+                        self_args, 'face_rec_five_point_scale', 1.20
+                    )
                     kwargs['debug_dump_dir'] = getattr(
                         self_args, 'face_debug_dump_dir', None
                     )
@@ -168,6 +262,18 @@ def _patch_processor_face_rec_manager() -> None:
                     )
                     kwargs['debug_dump_max'] = getattr(
                         self_args, 'face_debug_dump_max', 0
+                    )
+                    kwargs['observer_enabled'] = getattr(
+                        self_args, 'face_rec_observer', False
+                    )
+                    kwargs['observer_max_tracks'] = getattr(
+                        self_args, 'face_rec_observer_max_tracks', 4
+                    )
+                    kwargs['observer_jpeg_size'] = getattr(
+                        self_args, 'face_rec_observer_jpeg_size', 96
+                    )
+                    kwargs['observer_pending_ttl_frames'] = getattr(
+                        self_args, 'face_rec_observer_pending_ttl', 90
                     )
                     super().__init__(*args, **kwargs)
 
@@ -180,7 +286,7 @@ def _patch_processor_face_rec_manager() -> None:
 
     processor.FisheyePanoramaYOLOPose = DynamicFaceRecProcessor
     base.FisheyePanoramaYOLOPose = DynamicFaceRecProcessor
-    print("[FaceRC] 人脸库策略: 第一帧动态建库，后续定时匹配更新")
+    print("[FaceRC] 人脸库策略: TrackID绑定保留 + 三帧确认动态建库 + 高质量样本更新")
 
 
 def _draw_detections_keep_track_id(
@@ -245,7 +351,8 @@ def _draw_detections_keep_track_id(
         lines = []
         first_line = []
         if show_id and track_id != -1:
-            first_line.append(f"ID:{track_id}")
+            label_id = det.get('display_id') or track_id
+            first_line.append(f"ID:{label_id}")
         if show_conf:
             first_line.append(f"{confidence:.2f}")
         if first_line:
@@ -314,11 +421,14 @@ def _patch_inference_json() -> None:
         try:
             payload = json.loads(raw.decode())
             face_name_map = getattr(ws.processor, '_face_name_map', {}) or {}
+            face_rec = getattr(ws.processor, 'face_rec', None)
+            if face_rec is not None and hasattr(face_rec, 'get_debug_snapshot'):
+                payload['face_rec_observer'] = face_rec.get_debug_snapshot()
             targets = payload.get('targets')
             if isinstance(targets, dict):
                 for tid_str, target in targets.items():
                     try:
-                        tid = int(tid_str)
+                        tid = int(target.get('track_id', tid_str))
                     except (TypeError, ValueError):
                         tid = int(target.get('id', -1))
                     name = face_name_map.get(tid)
