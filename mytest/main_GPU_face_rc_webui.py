@@ -27,6 +27,24 @@ def _set_default_arg(args, attr: str, option: str, value) -> None:
         setattr(args, attr, value)
 
 
+def _load_known_face_photo_detector(model_path: str):
+    path = str(model_path or '').strip()
+    if not path:
+        return None
+    if not os.path.exists(path):
+        print(f"[FaceRec] known face photo detector not found: {path}")
+        return None
+    try:
+        from ultralytics import YOLO
+        task = 'pose' if path.lower().endswith('.engine') else None
+        detector = YOLO(path, task=task) if task else YOLO(path)
+        print(f"[FaceRec] known face photo detector: {path}")
+        return detector
+    except Exception as exc:
+        print(f"[FaceRec] known face photo detector load failed: {type(exc).__name__}: {exc}")
+        return None
+
+
 def _preload_face_rec_manager() -> None:
     """
     Load face_rec.face_rec_manager before webui.processor is imported.
@@ -86,6 +104,8 @@ def _patch_parse_args_default_face_rec() -> None:
         if '--no-use-face-rec' not in sys.argv:
             args.use_face_rec = True
         args.face_rec_dynamic_library = True
+        if getattr(args, 'known_face_dir', None) is None:
+            args.known_face_dir = getattr(args, 'face_library_dir', None)
         _set_default_arg(args, 'face_rec_threshold', '--face-rec-threshold', 0.55)
         _set_default_arg(args, 'face_rec_cooldown', '--face-rec-cooldown', 10)
         _set_default_arg(args, 'face_rec_align_mode', '--face-rec-align-mode', 'five-point')
@@ -248,6 +268,30 @@ def _patch_processor_face_rec_manager() -> None:
                     kwargs['dynamic_lock_to_track'] = getattr(
                         self_args, 'dynamic_face_lock_to_track', True
                     )
+                    kwargs['known_face_dir'] = getattr(
+                        self_args, 'known_face_dir', None
+                    )
+                    kwargs['known_feature_library'] = getattr(
+                        self_args, 'known_face_feature_library', False
+                    )
+                    kwargs['known_feature_dir'] = getattr(
+                        self_args, 'known_face_feature_dir', None
+                    )
+                    kwargs['known_feature_update_threshold'] = getattr(
+                        self_args, 'known_face_feature_update_threshold', 0.65
+                    )
+                    kwargs['known_feature_pose_threshold'] = getattr(
+                        self_args, 'known_face_feature_pose_threshold', 0.60
+                    )
+                    kwargs['known_feature_update_margin'] = getattr(
+                        self_args, 'known_face_feature_update_margin', 0.08
+                    )
+                    kwargs['known_feature_primary_ema_alpha'] = getattr(
+                        self_args, 'known_face_feature_primary_ema_alpha', 0.1
+                    )
+                    kwargs['known_feature_max_samples_per_id'] = getattr(
+                        self_args, 'known_face_feature_max_samples', 12
+                    )
                     kwargs['align_mode'] = getattr(
                         self_args, 'face_rec_align_mode', 'eye'
                     )
@@ -280,7 +324,24 @@ def _patch_processor_face_rec_manager() -> None:
             self_args = self.args
             processor.FaceRecManager = DynamicFaceRecManager
             try:
-                return super().initialize()
+                ok = super().initialize()
+                if ok and self.face_rec is not None and hasattr(self.face_rec, 'load_known_face_images'):
+                    known_dir = getattr(self.args, 'known_face_dir', None)
+                    if known_dir and (self.is_wide_angle or _argv_has_option('--known-face-dir')):
+                        photo_detector = _load_known_face_photo_detector(
+                            getattr(self.args, 'known_face_detector_model', '')
+                        )
+                        if photo_detector is None:
+                            print("[FaceRec] known face photo detector fallback to live YOLO detector")
+                            photo_detector = self.yolo_detector
+                        self.face_rec.load_known_face_images(
+                            known_dir,
+                            detector=photo_detector,
+                            imgsz=getattr(self, '_active_yolo_imgsz', None),
+                            conf=getattr(self.args, 'conf_threshold', 0.1),
+                            iou=getattr(self.args, 'iou_threshold', 0.99),
+                        )
+                return ok
             finally:
                 processor.FaceRecManager = original_face_rec_cls
 
@@ -311,6 +372,11 @@ def _draw_detections_keep_track_id(
     """
     import cv2
     from utils.visualizer import compute_stable_bbox_from_keypoints, draw_keypoints
+    try:
+        import webui.state as ws
+        face_rec = getattr(ws.processor, 'face_rec', None)
+    except Exception:
+        face_rec = None
 
     annotated = image.copy()
     face_name_map = face_name_map or {}
@@ -358,9 +424,16 @@ def _draw_detections_keep_track_id(
         if first_line:
             lines.append(" ".join(first_line))
 
-        face_name = face_name_map.get(track_id)
-        if face_name:
-            lines.append(f"Face:{face_name}")
+        face_id = face_name_map.get(track_id)
+        face_label = (
+            face_rec.get_identity_label(face_id)
+            if face_rec is not None and hasattr(face_rec, 'get_identity_label')
+            else None
+        )
+        if face_id:
+            lines.append(f"FaceID:{face_id}")
+        if face_label:
+            lines.append(f"Name:{face_label}")
         if det.get('talking'):
             lines.append("Speaking")
 
@@ -424,6 +497,61 @@ def _patch_inference_json() -> None:
             face_rec = getattr(ws.processor, 'face_rec', None)
             if face_rec is not None and hasattr(face_rec, 'get_debug_snapshot'):
                 payload['face_rec_observer'] = face_rec.get_debug_snapshot()
+
+            def _face_payload(face_id, track_id=None):
+                name = (
+                    face_rec.get_identity_label(face_id)
+                    if face_rec is not None and hasattr(face_rec, 'get_identity_label')
+                    else None
+                )
+                payload = {
+                    'name': name,
+                    'face_id': face_id,
+                    'matched': bool(face_id),
+                    'known_matched': bool(name),
+                }
+                if (track_id is not None and face_rec is not None
+                        and hasattr(face_rec, 'get_track_face_debug')):
+                    debug = face_rec.get_track_face_debug(track_id)
+                    if debug:
+                        quality = debug.get('quality') or {}
+                        payload.update({
+                            'event': debug.get('event'),
+                            'score': debug.get('score'),
+                            'second_score': debug.get('second_score'),
+                            'raw_face_id': debug.get('raw_face_id'),
+                            'known_update_reason': quality.get('known_update_reason'),
+                            'known_update_score': quality.get('known_update_score'),
+                            'known_update_second_score': quality.get('known_update_second_score'),
+                            'known_update_threshold': quality.get('known_update_threshold'),
+                            'known_update_pose_threshold': quality.get('known_update_pose_threshold'),
+                            'known_update_match_threshold': quality.get('known_update_match_threshold'),
+                            'known_update_margin': quality.get('known_update_margin'),
+                            'known_update_best_existing': quality.get('known_update_best_existing'),
+                            'known_update_image_score': quality.get('known_update_image_score'),
+                            'known_update_primary_score': quality.get('known_update_primary_score'),
+                            'known_update_pose_score': quality.get('known_update_pose_score'),
+                            'known_update_duplicate_threshold': quality.get('known_update_duplicate_threshold'),
+                            'known_update_primary_ema_alpha': quality.get('known_update_primary_ema_alpha'),
+                            'known_update_sample_count': quality.get('known_update_sample_count'),
+                            'known_update_role': quality.get('known_update_role'),
+                            'known_update_updated': quality.get('known_update_updated'),
+                            'known_bind_reason': quality.get('known_bind_reason'),
+                            'known_bind_dynamic_id': quality.get('known_bind_dynamic_id'),
+                            'known_bind_feature_count': quality.get('known_bind_feature_count'),
+                            'known_bind_min_hits': quality.get('known_bind_min_hits'),
+                            'known_bind_selected_name': quality.get('known_bind_selected_name'),
+                            'known_bind_selected_score': quality.get('known_bind_selected_score'),
+                            'known_bind_selected_hits': quality.get('known_bind_selected_hits'),
+                            'known_bind_current_name': quality.get('known_bind_current_name'),
+                            'known_bind_current_score': quality.get('known_bind_current_score'),
+                            'known_bind_current_hits': quality.get('known_bind_current_hits'),
+                            'known_bind_result_name': quality.get('known_bind_result_name'),
+                            'known_bind_votes': quality.get('known_bind_votes'),
+                            'known_bind_scores': quality.get('known_bind_scores'),
+                        })
+                return payload
+
             targets = payload.get('targets')
             if isinstance(targets, dict):
                 for tid_str, target in targets.items():
@@ -431,12 +559,7 @@ def _patch_inference_json() -> None:
                         tid = int(target.get('track_id', tid_str))
                     except (TypeError, ValueError):
                         tid = int(target.get('id', -1))
-                    name = face_name_map.get(tid)
-                    target['face_recognition'] = {
-                        'name': name,
-                        'face_id': name,
-                        'matched': bool(name),
-                    }
+                    target['face_recognition'] = _face_payload(face_name_map.get(tid), tid)
             sectors = payload.get('sectors')
             if isinstance(sectors, dict):
                 _sectors, rep_indices = aggregate_sectors(
@@ -447,7 +570,6 @@ def _patch_inference_json() -> None:
                         continue
                     det = tracked[idx]
                     tid = int(det.get('track_id', -1))
-                    name = face_name_map.get(tid)
                     persons = (angle_info or {}).get('persons', [])
                     angle = persons[idx] if idx < len(persons) else None
                     if angle is None:
@@ -457,11 +579,7 @@ def _patch_inference_json() -> None:
                                     % max(1, int(payload.get('num_sectors', len(sectors) or 8))))
                     if sector_id in sectors:
                         sectors[sector_id]['track_id'] = tid
-                        sectors[sector_id]['face_recognition'] = {
-                            'name': name,
-                            'face_id': name,
-                            'matched': bool(name),
-                        }
+                        sectors[sector_id]['face_recognition'] = _face_payload(face_name_map.get(tid), tid)
             return json.dumps(payload, ensure_ascii=False).encode()
         except Exception:
             return raw

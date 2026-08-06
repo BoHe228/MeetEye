@@ -150,6 +150,28 @@ def parse_args():
                         help='是否启用人脸识别（AdaFace IR-18，默认: False）')
     parser.add_argument('--face-library-dir', type=str, default='face_library',
                         help='人脸特征库目录，每个 .npy 文件对应一人，文件名即为人名 (默认: face_library)')
+    parser.add_argument('--known-face-dir', type=str, default='mytest/face_rec/face_photos',
+                        help='已知人脸照片目录；每张 jpg/png/webp/bmp 的文件名去后缀作为显示姓名。'
+                             '默认使用 mytest/face_rec/face_photos')
+    parser.add_argument('--known-face-detector-model', type=str, default='./yolo_model/yolov8n-face.pt',
+                        help='加载已知人脸照片时使用的独立人脸检测模型；避免复用实时 TensorRT engine 影响主推理状态 '
+                             '(默认: ./yolo_model/yolov8n-face.pt)')
+    parser.add_argument('--known-face-feature-library', action=argparse.BooleanOptionalAction, default=False,
+                        help='是否启用已知人脸持久特征库；开启后优先读取 .npy 特征并允许高置信样本更新特征，'
+                             '但不会修改原始照片 (默认: False)')
+    parser.add_argument('--known-face-feature-dir', type=str, default='mytest/face_rec/face_photo_features',
+                        help='已知人脸持久特征库目录，每个 .npy 文件名需对应 face_photos 中同名照片 (默认: mytest/face_rec/face_photo_features)')
+    parser.add_argument('--known-face-feature-update-threshold', type=float, default=0.65,
+                        help='开启持久特征库后，实时样本与照片原始特征相似度达到该值才允许 EMA 更新主特征 (默认: 0.65)')
+    parser.add_argument('--known-face-feature-pose-threshold', type=float, default=0.60,
+                        help='开启持久特征库后，实时样本与照片原始特征相似度达到该值才允许作为姿态样本；'
+                             '低于主特征阈值、高于该阈值时只更新姿态 (默认: 0.60)')
+    parser.add_argument('--known-face-feature-update-margin', type=float, default=0.08,
+                        help='开启持久特征库后，更新样本时 top1 至少高出 top2 的相似度 margin (默认: 0.08)')
+    parser.add_argument('--known-face-feature-primary-ema-alpha', type=float, default=0.1,
+                        help='已知人脸持久特征库主特征 EMA 更新系数 (默认: 0.1)')
+    parser.add_argument('--known-face-feature-max-samples', type=int, default=12,
+                        help='每个已知姓名最多保存多少个姿态特征；另有照片原始特征和 EMA 主特征，因此 .npy 最多 14 行 (默认: 12)')
     parser.add_argument('--face-rec-model', type=str,
                         default='face_rec_model/adaface_ir18_vgg2.ckpt',
                         help='AdaFace IR-18 模型权重路径')

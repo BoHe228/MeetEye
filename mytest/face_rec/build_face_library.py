@@ -118,10 +118,7 @@ def build_library(
         device=device,
     )
 
-    image_files = [
-        f for f in os.listdir(photo_dir)
-        if os.path.splitext(f)[1].lower() in _IMG_EXTS
-    ]
+    image_files = manager._select_known_face_image_files(photo_dir)
 
     if not image_files:
         print(f"[Error] {photo_dir} 中没有找到图片文件")
@@ -131,8 +128,7 @@ def build_library(
 
     success, skipped, failed = 0, 0, 0
 
-    for fname in sorted(image_files):
-        name = os.path.splitext(fname)[0]
+    for fname, name, aligned_crop in image_files:
         out_path = os.path.join(library_dir, f"{name}.npy")
 
         print(f"[{name}]  {fname}")
@@ -149,7 +145,11 @@ def build_library(
             failed += 1
             continue
 
-        face_112 = detect_and_crop_face(img, yolo_model_path)
+        if aligned_crop:
+            face_112 = cv2.resize(img, (112, 112))
+            print("    ✓ 已标记为对齐人脸，跳过二次检测")
+        else:
+            face_112 = detect_and_crop_face(img, yolo_model_path)
 
         # 保存裁切结果供人工检查
         preview_dir = os.path.join(library_dir, '_preview')

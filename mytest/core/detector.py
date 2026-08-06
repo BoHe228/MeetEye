@@ -5,10 +5,27 @@ import cv2
 import numpy as np
 import time
 import torch
+import logging
 from typing import List, Dict, Optional
 import config
 
 _USE_HALF = torch.cuda.is_available()  # FP16 only on GPU; set once at import time
+
+
+def _suppress_ultralytics_half_deprecation_warning() -> None:
+    try:
+        from ultralytics.utils import LOGGER
+    except Exception:
+        return
+    if getattr(LOGGER, "_meeteye_half_deprecation_filter", False):
+        return
+
+    class _HalfDeprecationFilter(logging.Filter):
+        def filter(self, record):
+            return "'half' is deprecated and will be removed" not in record.getMessage()
+
+    LOGGER.addFilter(_HalfDeprecationFilter())
+    setattr(LOGGER, "_meeteye_half_deprecation_filter", True)
 
 
 class YOLOPoseDetector:
@@ -21,6 +38,7 @@ class YOLOPoseDetector:
         """
         print(f"加载YOLO姿态估计模型: {model_path}")
         from ultralytics import YOLO
+        _suppress_ultralytics_half_deprecation_warning()
         # .engine 不带 task 元数据时 ultralytics 默认按 detect 解析：pose/face 模型的
         # 关键点通道会被误当作类别，argmax 落到无效类别 → KeyError。按文件名显式指定 task：
         #   名含 pose/face → 'pose'（17 点 / 人脸 5 点）；其余（如 yolo26n.engine）→ 'detect'

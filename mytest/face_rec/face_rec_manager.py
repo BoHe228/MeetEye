@@ -5,6 +5,7 @@ The wider AdaFace project is intentionally not imported wholesale here. This
 module keeps only the pieces MeetEye needs:
   - load an IR-18 AdaFace checkpoint
   - load a directory of .npy identity features
+  - load a directory of known face photos, using the filename stem as identity
   - align a face from YOLO pose keypoints
   - extract and match a 512D L2-normalized feature
   - cache recognition attempts by TrackID
@@ -45,6 +46,13 @@ _FACE_NOSE = 2
 _FACE_LEFT_MOUTH = 3
 _FACE_RIGHT_MOUTH = 4
 _NOSE_SCALE = 0.6
+_KNOWN_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_ALIGNED_KNOWN_FACE_SUFFIXES = (
+    "_aligned",
+    "_adaface112",
+    "_crop112",
+    "_facecrop",
+)
 
 _ARCFACE_TEMPLATE_112 = np.asarray(
     [
@@ -139,6 +147,7 @@ class FaceRecManager:
         self,
         model_path: str,
         library_dir: str,
+        known_face_dir: Optional[str] = None,
         threshold: float = 0.35,
         frontal_yaw_thresh: float = 0.35,
         cooldown_frames: int = 30,
@@ -184,6 +193,13 @@ class FaceRecManager:
         dynamic_lock_to_track: bool = True,
         align_mode: str = "eye",
         five_point_scale: float = 1.20,
+        known_feature_library: bool = False,
+        known_feature_dir: Optional[str] = None,
+        known_feature_update_threshold: float = 0.65,
+        known_feature_pose_threshold: float = 0.60,
+        known_feature_update_margin: float = 0.08,
+        known_feature_primary_ema_alpha: float = 0.1,
+        known_feature_max_samples_per_id: int = 12,
         debug_dump_dir: Optional[str] = None,
         debug_dump_every: int = 1,
         debug_dump_max: int = 0,
@@ -194,6 +210,7 @@ class FaceRecManager:
     ):
         self.model_path = model_path
         self.library_dir = library_dir
+        self.known_face_dir = known_face_dir
         self.threshold = float(threshold)
         self.frontal_yaw_thresh = float(frontal_yaw_thresh)
         self.cooldown_frames = max(1, int(cooldown_frames))
@@ -273,6 +290,17 @@ class FaceRecManager:
         self.dynamic_lock_to_track = bool(dynamic_lock_to_track)
         self.align_mode = _normalize_align_mode(align_mode)
         self.five_point_scale = min(1.60, max(0.70, float(five_point_scale)))
+        self.known_feature_library = bool(known_feature_library)
+        self.known_feature_dir = known_feature_dir or os.path.join(
+            _DIR, "face_photo_features"
+        )
+        self.known_feature_update_threshold = float(known_feature_update_threshold)
+        self.known_feature_pose_threshold = float(known_feature_pose_threshold)
+        self.known_feature_update_margin = max(0.0, float(known_feature_update_margin))
+        self.known_feature_primary_ema_alpha = min(
+            1.0, max(0.0, float(known_feature_primary_ema_alpha))
+        )
+        self.known_feature_max_samples_per_id = max(1, int(known_feature_max_samples_per_id))
         self.dynamic_library_dir = dynamic_library_dir or os.path.join(
             "face_library_dynamic",
             f"session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}",
@@ -290,6 +318,7 @@ class FaceRecManager:
         self.observer_jpeg_size = max(48, min(160, int(observer_jpeg_size or 96)))
         self.observer_pending_ttl_frames = max(0, int(observer_pending_ttl_frames or 0))
         self._observer_latest: Dict[str, dict] = {}
+        self._track_face_debug: Dict[int, dict] = {}
         if self.debug_dump_dir:
             os.makedirs(self.debug_dump_dir, exist_ok=True)
             os.makedirs(os.path.join(self.debug_dump_dir, "aligned_faces"), exist_ok=True)
@@ -298,9 +327,16 @@ class FaceRecManager:
             print(f"[FaceRecDebug] dump enabled: {self.debug_dump_dir}")
 
         self.model = self._load_model(model_path)
+        self.known_names, self.known_matrix = [], None
+        self._known_name_set = set()
+        self._known_feature_layout_loaded = set()
+        self._known_feature_update_debug_seen = set()
         if self.dynamic_library:
             os.makedirs(self.dynamic_library_dir, exist_ok=True)
             os.makedirs(os.path.join(self.dynamic_library_dir, "_preview"), exist_ok=True)
+            if library_dir and os.path.isdir(library_dir):
+                self.known_names, self.known_matrix = self._load_library(library_dir)
+                self._known_name_set = set(self.known_names)
             self.lib_names, self.lib_matrix = [], None
             self._dynamic_id_features: Dict[str, Dict[str, list]] = {}
             self._dynamic_anchor_by_id: Dict[str, dict] = {}
@@ -313,6 +349,8 @@ class FaceRecManager:
             self._dynamic_aliases: Dict[str, str] = {}
             self._dynamic_alias_votes: Dict[Tuple[str, str], int] = {}
             self._dynamic_alias_probe_features: Dict[str, list] = {}
+            self._dynamic_identity_labels: Dict[str, dict] = {}
+            self._known_bind_consecutive: Dict[str, dict] = {}
             self._dynamic_pending_enroll: Dict[int, dict] = {}
             self._dynamic_last_seen_frame: Dict[int, int] = {}
             self._dynamic_last_pose_sample_frame: Dict[str, int] = {}
@@ -321,6 +359,9 @@ class FaceRecManager:
             print("[FaceRec] dynamic library starts empty; previous sessions are not loaded")
         else:
             self.lib_names, self.lib_matrix = self._load_library(library_dir)
+            self.known_names = list(self.lib_names)
+            self.known_matrix = self.lib_matrix
+            self._known_name_set = set(self.known_names)
         self._last_attempt_frame: Dict[int, int] = {}
 
     # ------------------------------------------------------------------
@@ -400,6 +441,813 @@ class FaceRecManager:
         matrix = np.stack(feats).astype(np.float32)
         print(f"[FaceRec] loaded {len(names)} face feature(s) from {library_dir}")
         return names, matrix
+
+    def _append_known_features(self, names: list, feats: list) -> int:
+        valid_names, valid_feats = [], []
+        for name, feat in zip(names, feats):
+            feat = self._normalize_feature(feat)
+            if not name or feat.size != 512 or np.linalg.norm(feat) <= 1e-6:
+                continue
+            valid_names.append(str(name))
+            valid_feats.append(feat.astype(np.float32))
+        if not valid_feats:
+            return 0
+
+        if self.known_matrix is None or not self.known_names:
+            self.known_names = valid_names
+            self.known_matrix = np.stack(valid_feats).astype(np.float32)
+        else:
+            self.known_names.extend(valid_names)
+            self.known_matrix = np.concatenate(
+                [self.known_matrix, np.stack(valid_feats).astype(np.float32)],
+                axis=0,
+            )
+        self._known_name_set = set(self.known_names)
+        return len(valid_feats)
+
+    def _known_features_for_name(self, name: str) -> list:
+        if self.known_matrix is None or not self.known_names:
+            return []
+        return [
+            self._normalize_feature(feature)
+            for known_name, feature in zip(self.known_names, self.known_matrix)
+            if known_name == name
+        ]
+
+    def _rebuild_known_features_for_name(self, name: str, feats: list) -> None:
+        keep_names, keep_feats = [], []
+        if self.known_matrix is not None and self.known_names:
+            for known_name, feature in zip(self.known_names, self.known_matrix):
+                if known_name == name:
+                    continue
+                keep_names.append(known_name)
+                keep_feats.append(self._normalize_feature(feature))
+        for feature in feats:
+            keep_names.append(name)
+            keep_feats.append(self._normalize_feature(feature))
+        self.known_names = keep_names
+        self.known_matrix = (
+            np.stack(keep_feats).astype(np.float32) if keep_feats else None
+        )
+        self._known_name_set = set(self.known_names)
+
+    def _known_feature_path(self, name: str) -> str:
+        return os.path.join(self.known_feature_dir, f"{name}.npy")
+
+    def _known_feature_meta_path(self, name: str) -> str:
+        return os.path.join(self.known_feature_dir, f"{name}.json")
+
+    def _known_feature_has_layout_file(self, name: str) -> bool:
+        path = self._known_feature_meta_path(name)
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return False
+        return meta.get("layout") == "image_primary_pose_v1"
+
+    def _known_feature_has_layout_meta(self, name: str) -> bool:
+        return name in self._known_feature_layout_loaded or self._known_feature_has_layout_file(name)
+
+    def _save_known_features_for_name(self, name: str) -> None:
+        if not self.known_feature_library:
+            return
+        feats = self._known_features_for_name(name)
+        if not feats:
+            return
+        os.makedirs(self.known_feature_dir, exist_ok=True)
+        np.save(self._known_feature_path(name), np.stack(feats).astype(np.float32))
+        meta = {
+            "layout": "image_primary_pose_v1",
+            "image_index": 0,
+            "primary_index": 1 if len(feats) >= 2 else None,
+            "pose_start_index": 2,
+            "max_pose_samples": int(self.known_feature_max_samples_per_id),
+            "primary_ema_alpha": float(self.known_feature_primary_ema_alpha),
+        }
+        with open(self._known_feature_meta_path(name), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        self._known_feature_layout_loaded.add(name)
+
+    def _known_feature_layout_for_name(
+        self, name: str
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], list]:
+        rows = self._known_features_for_name(name)
+        if not rows:
+            return None, None, []
+        image_feature = rows[0]
+        has_meta = self._known_feature_has_layout_meta(name)
+        if has_meta and len(rows) >= 2:
+            primary_feature = rows[1]
+            pose_features = rows[2:]
+        else:
+            # Legacy files were flat [photo, sample1, sample2, ...]. Treat only
+            # row0 as the immutable image feature and rebuild primary from it.
+            primary_feature = image_feature
+            pose_features = rows[1:]
+        return (
+            self._normalize_feature(image_feature),
+            self._normalize_feature(primary_feature),
+            [self._normalize_feature(row) for row in pose_features[:self.known_feature_max_samples_per_id]],
+        )
+
+    def _rebuild_known_feature_layout_for_name(
+        self,
+        name: str,
+        image_feature: np.ndarray,
+        primary_feature: np.ndarray,
+        pose_features: list,
+    ) -> None:
+        rows = [
+            self._normalize_feature(image_feature),
+            self._normalize_feature(primary_feature),
+        ]
+        rows.extend(
+            self._normalize_feature(row)
+            for row in pose_features[:self.known_feature_max_samples_per_id]
+        )
+        self._rebuild_known_features_for_name(name, rows)
+
+    def _set_known_image_feature_for_name(
+        self,
+        name: str,
+        image_feature: np.ndarray,
+    ) -> None:
+        image_feature = self._normalize_feature(image_feature)
+        old_image, old_primary, old_poses = self._known_feature_layout_for_name(name)
+        if old_image is None or not self._known_feature_has_layout_file(name):
+            primary_feature = image_feature
+        else:
+            primary_feature = old_primary if old_primary is not None else image_feature
+        self._rebuild_known_feature_layout_for_name(
+            name,
+            image_feature,
+            primary_feature,
+            old_poses,
+        )
+        self._save_known_features_for_name(name)
+
+    def _load_known_feature_library(self, allowed_names: set) -> int:
+        if not self.known_feature_library or not self.known_feature_dir:
+            return 0
+        if not os.path.isdir(self.known_feature_dir):
+            return 0
+
+        names, feats = [], []
+        for fname in sorted(os.listdir(self.known_feature_dir)):
+            stem, ext = os.path.splitext(fname)
+            if ext.lower() != ".npy" or stem not in allowed_names:
+                continue
+            path = os.path.join(self.known_feature_dir, fname)
+            try:
+                arr = np.load(path)
+            except Exception as exc:
+                print(f"[FaceRec] skip invalid known feature {path}: {exc}")
+                continue
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            rows = []
+            for row in arr:
+                feat = self._normalize_feature(row)
+                if feat.size != 512 or np.linalg.norm(feat) <= 1e-6:
+                    continue
+                rows.append(feat)
+            if not rows:
+                continue
+            if self._known_feature_has_layout_file(stem) and len(rows) >= 2:
+                layout_rows = rows[:2 + self.known_feature_max_samples_per_id]
+            else:
+                layout_rows = [rows[0], rows[0]]
+                layout_rows.extend(rows[1:1 + self.known_feature_max_samples_per_id])
+            self._known_feature_layout_loaded.add(stem)
+            names.extend([stem] * len(layout_rows))
+            feats.extend(layout_rows)
+        added = self._append_known_features(names, feats)
+        if added:
+            print(f"[FaceRec] loaded {added} known face feature(s) from {self.known_feature_dir}")
+        return added
+
+    def _append_known_feature_sample(self, name: str, feature: np.ndarray) -> bool:
+        if not self.known_feature_library or not name:
+            return False
+        feat = self._normalize_feature(feature)
+        image_feature, primary_feature, pose_features = self._known_feature_layout_for_name(name)
+        if image_feature is None:
+            image_feature = feat
+            primary_feature = feat
+            pose_features = []
+        existing = [image_feature, primary_feature] + pose_features
+        if existing:
+            best_existing = max(float(np.dot(old, feat)) for old in existing)
+            if best_existing >= 1.0 - self.dynamic_min_sample_diversity:
+                return False
+
+        pose_features.append(feat)
+        pose_features = pose_features[-self.known_feature_max_samples_per_id:]
+        self._rebuild_known_feature_layout_for_name(
+            name, image_feature, primary_feature, pose_features
+        )
+        self._save_known_features_for_name(name)
+        return True
+
+    def _set_known_update_debug(
+        self,
+        quality: Optional[dict],
+        *,
+        reason: str,
+        name: Optional[str] = None,
+        matched_name: Optional[str] = None,
+        score: Optional[float] = None,
+        second_score: Optional[float] = None,
+        best_existing: Optional[float] = None,
+        sample_count: Optional[int] = None,
+        image_score: Optional[float] = None,
+        primary_score: Optional[float] = None,
+        pose_score: Optional[float] = None,
+        updated_role: Optional[str] = None,
+        updated: bool = False,
+    ) -> None:
+        if quality is None:
+            return
+        quality["known_update_reason"] = reason
+        quality["known_update_name"] = name
+        quality["known_update_matched_name"] = matched_name
+        quality["known_update_score"] = None if score is None else float(score)
+        quality["known_update_second_score"] = (
+            None if second_score is None else float(second_score)
+        )
+        quality["known_update_threshold"] = float(self.known_feature_update_threshold)
+        quality["known_update_pose_threshold"] = float(self.known_feature_pose_threshold)
+        quality["known_update_match_threshold"] = float(self.threshold)
+        quality["known_update_margin"] = float(self.known_feature_update_margin)
+        quality["known_update_best_existing"] = (
+            None if best_existing is None else float(best_existing)
+        )
+        quality["known_update_image_score"] = (
+            None if image_score is None else float(image_score)
+        )
+        quality["known_update_primary_score"] = (
+            None if primary_score is None else float(primary_score)
+        )
+        quality["known_update_pose_score"] = (
+            None if pose_score is None else float(pose_score)
+        )
+        quality["known_update_duplicate_threshold"] = float(
+            1.0 - self.dynamic_min_sample_diversity
+        )
+        quality["known_update_primary_ema_alpha"] = float(
+            self.known_feature_primary_ema_alpha
+        )
+        quality["known_update_sample_count"] = sample_count
+        quality["known_update_role"] = updated_role
+        quality["known_update_updated"] = bool(updated)
+
+    @staticmethod
+    def _score_debug_value(score: Optional[float]) -> Optional[float]:
+        return None if score is None else round(float(score), 6)
+
+    def _set_known_bind_debug(
+        self,
+        quality: Optional[dict],
+        *,
+        reason: str,
+        canonical: Optional[str] = None,
+        feature_count: Optional[int] = None,
+        min_hits: Optional[int] = None,
+        sample_scores: Optional[list] = None,
+        votes: Optional[Dict[str, dict]] = None,
+        selected_name: Optional[str] = None,
+        selected_score: Optional[float] = None,
+        selected_hits: Optional[int] = None,
+        current_name: Optional[str] = None,
+        current_score: Optional[float] = None,
+        current_hits: Optional[int] = None,
+        result_name: Optional[str] = None,
+    ) -> None:
+        if quality is None:
+            return
+        quality["known_bind_reason"] = reason
+        quality["known_bind_dynamic_id"] = canonical
+        quality["known_bind_feature_count"] = feature_count
+        quality["known_bind_min_hits"] = min_hits
+        quality["known_bind_selected_name"] = selected_name
+        quality["known_bind_selected_score"] = self._score_debug_value(selected_score)
+        quality["known_bind_selected_hits"] = selected_hits
+        quality["known_bind_current_name"] = current_name
+        quality["known_bind_current_score"] = self._score_debug_value(current_score)
+        quality["known_bind_current_hits"] = current_hits
+        quality["known_bind_result_name"] = result_name
+
+        if sample_scores is not None:
+            quality["known_bind_scores"] = sample_scores
+        if votes is not None:
+            vote_rows = []
+            for name, info in votes.items():
+                vote_rows.append({
+                    "name": name,
+                    "hits": int(info.get("hits") or 0),
+                    "best": self._score_debug_value(info.get("best")),
+                })
+            vote_rows.sort(key=lambda row: (row["hits"], row["best"] or 0.0), reverse=True)
+            quality["known_bind_votes"] = vote_rows
+
+    def _known_sample_scores_debug(self, scores: list, sample_index: int) -> dict:
+        name, score, second_score = self._match_from_scores(scores)
+        second_name = scores[1][0] if len(scores) >= 2 else None
+        accepted_vote = (
+            name is not None
+            and score >= second_score + self.dynamic_match_margin
+        )
+        return {
+            "sample": int(sample_index),
+            "winner": name,
+            "score": self._score_debug_value(score),
+            "second_name": second_name,
+            "second_score": self._score_debug_value(second_score),
+            "margin": self._score_debug_value(score - second_score),
+            "required_margin": self._score_debug_value(self.dynamic_match_margin),
+            "accepted_vote": bool(accepted_vote),
+            "top": [
+                {"name": top_name, "score": self._score_debug_value(top_score)}
+                for top_name, top_score in scores[:8]
+            ],
+        }
+
+    def _print_known_update_skip_once(
+        self,
+        name: Optional[str],
+        reason: str,
+        score: Optional[float],
+        second_score: Optional[float],
+        best_existing: Optional[float],
+    ) -> None:
+        if reason == "updated":
+            return
+        key = (str(name or "null"), str(reason))
+        if key in self._known_feature_update_debug_seen:
+            return
+        self._known_feature_update_debug_seen.add(key)
+        score_text = "N/A" if score is None else f"{score:.3f}"
+        second_text = "N/A" if second_score is None else f"{second_score:.3f}"
+        existing_text = "N/A" if best_existing is None else f"{best_existing:.3f}"
+        print(
+            f"[FaceRec] known feature skip {name or 'null'}: {reason} "
+            f"(score={score_text}, second={second_text}, existing={existing_text})"
+        )
+
+    def _maybe_update_known_feature_library(
+        self,
+        name: Optional[str],
+        feature: Optional[np.ndarray],
+        quality: Optional[dict] = None,
+    ) -> bool:
+        if not self.known_feature_library:
+            self._set_known_update_debug(quality, reason="disabled", name=name)
+            return False
+        if not name:
+            self._set_known_update_debug(quality, reason="missing_name", name=name)
+            return False
+        if feature is None:
+            self._set_known_update_debug(quality, reason="missing_feature", name=name)
+            return False
+        if self.known_matrix is None or not self.known_names:
+            self._set_known_update_debug(quality, reason="empty_known_library", name=name)
+            self._print_known_update_skip_once(name, "empty_known_library", None, None, None)
+            return False
+
+        known_scores = self._dedup_scores_by_name(self._known_identity_scores(feature))
+        matched_name, score, second_score = self._match_from_scores(known_scores)
+        top_name = known_scores[0][0] if known_scores else None
+        if score < self.threshold:
+            self._set_known_update_debug(
+                quality,
+                reason="known_match_below_threshold",
+                name=name,
+                matched_name=top_name,
+                score=score,
+                second_score=second_score,
+            )
+            self._print_known_update_skip_once(
+                name, "known_match_below_threshold", score, second_score, None
+            )
+            return False
+        if matched_name is None:
+            self._set_known_update_debug(
+                quality,
+                reason="known_match_ambiguous",
+                name=name,
+                matched_name=top_name,
+                score=score,
+                second_score=second_score,
+            )
+            self._print_known_update_skip_once(
+                name, "known_match_ambiguous", score, second_score, None
+            )
+            return False
+        if matched_name != name:
+            self._set_known_update_debug(
+                quality,
+                reason="matched_other_name",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+            )
+            self._print_known_update_skip_once(
+                name, "matched_other_name", score, second_score, None
+            )
+            return False
+        if score < self.known_feature_update_threshold:
+            self._set_known_update_debug(
+                quality,
+                reason="low_similarity",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+            )
+            self._print_known_update_skip_once(
+                name, "low_similarity", score, second_score, None
+            )
+            return False
+        if score < second_score + self.known_feature_update_margin:
+            self._set_known_update_debug(
+                quality,
+                reason="ambiguous_margin",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+            )
+            self._print_known_update_skip_once(
+                name, "ambiguous_margin", score, second_score, None
+            )
+            return False
+
+        feat = self._normalize_feature(feature)
+        image_feature, primary_feature, pose_features = self._known_feature_layout_for_name(name)
+        if image_feature is None or primary_feature is None:
+            self._set_known_update_debug(
+                quality,
+                reason="missing_image_feature",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+            )
+            self._print_known_update_skip_once(
+                name, "missing_image_feature", score, second_score, None
+            )
+            return False
+
+        image_score = float(np.dot(image_feature, feat))
+        primary_score = float(np.dot(primary_feature, feat))
+        pose_score = (
+            max(float(np.dot(row, feat)) for row in pose_features)
+            if pose_features else None
+        )
+        existing = [image_feature, primary_feature] + pose_features
+        best_existing = max(float(np.dot(old, feat)) for old in existing)
+        sample_count = len(existing)
+        duplicate_threshold = 1.0 - self.dynamic_min_sample_diversity
+
+        if image_score >= self.known_feature_update_threshold:
+            if primary_score >= duplicate_threshold:
+                self._set_known_update_debug(
+                    quality,
+                    reason="primary_too_similar",
+                    name=name,
+                    matched_name=matched_name,
+                    score=score,
+                    second_score=second_score,
+                    best_existing=best_existing,
+                    sample_count=sample_count,
+                    image_score=image_score,
+                    primary_score=primary_score,
+                    pose_score=pose_score,
+                    updated_role="primary",
+                )
+                self._print_known_update_skip_once(
+                    name, "primary_too_similar", score, second_score, best_existing
+                )
+                return False
+            alpha = self.known_feature_primary_ema_alpha
+            new_primary = self._normalize_feature(
+                (1.0 - alpha) * primary_feature + alpha * feat
+            )
+            self._rebuild_known_feature_layout_for_name(
+                name, image_feature, new_primary, pose_features
+            )
+            self._save_known_features_for_name(name)
+            count = len(self._known_features_for_name(name))
+            self._set_known_update_debug(
+                quality,
+                reason="primary_ema_updated",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+                best_existing=best_existing,
+                sample_count=count,
+                image_score=image_score,
+                primary_score=primary_score,
+                pose_score=pose_score,
+                updated_role="primary",
+                updated=True,
+            )
+            print(
+                f"[FaceRec] known feature update {name}: primary EMA, "
+                f"{count} sample(s), image_score={image_score:.3f}"
+            )
+            return True
+
+        if image_score < self.known_feature_pose_threshold:
+            self._set_known_update_debug(
+                quality,
+                reason="low_image_similarity",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+                best_existing=best_existing,
+                sample_count=sample_count,
+                image_score=image_score,
+                primary_score=primary_score,
+                pose_score=pose_score,
+            )
+            self._print_known_update_skip_once(
+                name, "low_image_similarity", score, second_score, best_existing
+            )
+            return False
+
+        if best_existing >= duplicate_threshold:
+            self._set_known_update_debug(
+                quality,
+                reason="pose_too_similar",
+                name=name,
+                matched_name=matched_name,
+                score=score,
+                second_score=second_score,
+                best_existing=best_existing,
+                sample_count=sample_count,
+                image_score=image_score,
+                primary_score=primary_score,
+                pose_score=pose_score,
+                updated_role="pose",
+            )
+            self._print_known_update_skip_once(
+                name, "pose_too_similar", score, second_score, best_existing
+            )
+            return False
+
+        pose_features.append(feat)
+        pose_features = pose_features[-self.known_feature_max_samples_per_id:]
+        self._rebuild_known_feature_layout_for_name(
+            name, image_feature, primary_feature, pose_features
+        )
+        self._save_known_features_for_name(name)
+        count = len(self._known_features_for_name(name))
+        self._set_known_update_debug(
+            quality,
+            reason="pose_sample_updated",
+            name=name,
+            matched_name=matched_name,
+            score=score,
+            second_score=second_score,
+            best_existing=best_existing,
+            sample_count=count,
+            image_score=image_score,
+            primary_score=primary_score,
+            pose_score=pose_score,
+            updated_role="pose",
+            updated=True,
+        )
+        print(
+            f"[FaceRec] known feature update {name}: pose sample, "
+            f"{count} sample(s), image_score={image_score:.3f}"
+        )
+        return True
+
+    def _read_image_bgr(self, path: str) -> Optional[np.ndarray]:
+        cv2 = _cv2()
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+        except Exception:
+            return None
+        if data.size == 0:
+            return None
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        return img if img is not None and img.size else None
+
+    def _center_reference_face(self, image_bgr: np.ndarray) -> Optional[np.ndarray]:
+        cv2 = _cv2()
+        if image_bgr is None or image_bgr.size == 0:
+            return None
+        h, w = image_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return None
+        side = min(h, w)
+        x1 = max(0, (w - side) // 2)
+        y1 = max(0, (h - side) // 2)
+        crop = image_bgr[y1:y1 + side, x1:x1 + side]
+        if crop.size == 0:
+            return None
+        return cv2.resize(crop, (112, 112), interpolation=cv2.INTER_LINEAR)
+
+    @staticmethod
+    def _known_face_identity_from_stem(stem: str) -> Tuple[str, bool]:
+        lower = stem.lower()
+        for suffix in _ALIGNED_KNOWN_FACE_SUFFIXES:
+            if lower.endswith(suffix) and len(stem) > len(suffix):
+                return stem[:-len(suffix)], True
+        return stem, False
+
+    def _select_known_face_image_files(self, image_dir: str) -> List[Tuple[str, str, bool]]:
+        selected: Dict[str, Tuple[str, bool]] = {}
+        for fname in sorted(os.listdir(image_dir)):
+            stem, ext = os.path.splitext(fname)
+            if ext.lower() not in _KNOWN_IMAGE_EXTENSIONS:
+                continue
+            name, aligned_crop = self._known_face_identity_from_stem(stem)
+            if not name:
+                continue
+            current = selected.get(name)
+            if current is None or (aligned_crop and not current[1]):
+                selected[name] = (fname, aligned_crop)
+        return [(fname, name, aligned_crop) for name, (fname, aligned_crop) in selected.items()]
+
+    def _aligned_reference_face(self, image_bgr: np.ndarray) -> Optional[np.ndarray]:
+        cv2 = _cv2()
+        if image_bgr is None or image_bgr.size == 0:
+            return None
+        return cv2.resize(image_bgr, (112, 112), interpolation=cv2.INTER_LINEAR)
+
+    def _detect_reference_face(
+        self,
+        image_bgr: np.ndarray,
+        detector=None,
+        imgsz: Optional[int] = None,
+        conf: float = 0.1,
+        iou: float = 0.99,
+    ) -> Tuple[Optional[np.ndarray], str]:
+        if detector is None or image_bgr is None or image_bgr.size == 0:
+            return self._center_reference_face(image_bgr), "center_crop"
+        # Prefer the public Ultralytics YOLO.predict API. YOLOPoseDetector
+        # wrappers store that object in .model, while a raw YOLO instance's
+        # .model is the lower-level BaseModel and does not accept imgsz/conf.
+        model = detector if hasattr(detector, "predict") else getattr(detector, "model", detector)
+        predict_kwargs = {
+            "imgsz": int(imgsz or 864),
+            "conf": float(conf),
+            "iou": float(iou),
+            "verbose": False,
+        }
+        if torch.cuda.is_available():
+            predict_kwargs.update({"half": True, "device": 0})
+        try:
+            results = model.predict(image_bgr, **predict_kwargs)
+        except AssertionError as exc:
+            msg = str(exc)
+            if "input size" not in msg or "max model size" not in msg:
+                print(f"[FaceRec] known face detector failed, fallback center crop: {exc}")
+                return self._center_reference_face(image_bgr), "center_crop"
+            try:
+                batch_size = 3
+                results = model.predict(
+                    [image_bgr, image_bgr.copy(), image_bgr.copy()],
+                    **predict_kwargs,
+                )
+                results = list(results or [])[:1]
+                print(
+                    "[FaceRec] known face detector retried with "
+                    f"duplicated batch={batch_size}"
+                )
+            except Exception as retry_exc:
+                print(
+                    "[FaceRec] known face detector batch retry failed, "
+                    f"fallback center crop: {retry_exc}"
+                )
+                return self._center_reference_face(image_bgr), "center_crop"
+        except Exception as exc:
+            print(f"[FaceRec] known face detector failed, fallback center crop: {exc}")
+            return self._center_reference_face(image_bgr), "center_crop"
+
+        best = None
+        for result in results or []:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            boxes_data = boxes.xyxy.cpu().numpy()
+            confidences = boxes.conf.cpu().numpy()
+            keypoints_data = []
+            if hasattr(result, "keypoints") and result.keypoints is not None:
+                keypoints_data = result.keypoints.data.cpu().numpy()
+            for idx, (box, score) in enumerate(zip(boxes_data, confidences)):
+                x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+                area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                rank = area * max(0.01, float(score))
+                kps = keypoints_data[idx].tolist() if idx < len(keypoints_data) else None
+                if best is None or rank > best[0]:
+                    best = (rank, [x1, y1, x2, y2], kps)
+        if best is None:
+            return self._center_reference_face(image_bgr), "center_crop"
+
+        _rank, bbox, keypoints = best
+        if keypoints is not None:
+            face = self.align_face(image_bgr, keypoints)
+            if face is not None:
+                return face, "detector_align"
+
+        safe = self._safe_bbox(bbox, image_bgr.shape[1], image_bgr.shape[0])
+        if safe is None:
+            return self._center_reference_face(image_bgr), "center_crop"
+        x1, y1, x2, y2 = safe
+        crop = image_bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            return self._center_reference_face(image_bgr), "center_crop"
+        return _cv2().resize(crop, (112, 112), interpolation=_cv2().INTER_LINEAR), "detector_bbox"
+
+    def load_known_face_images(
+        self,
+        image_dir: Optional[str] = None,
+        *,
+        detector=None,
+        imgsz: Optional[int] = None,
+        conf: float = 0.1,
+        iou: float = 0.99,
+    ) -> int:
+        """Load known people from photos. The filename stem is the displayed identity."""
+        image_dir = image_dir or self.known_face_dir
+        if not image_dir:
+            return 0
+        if not os.path.isdir(image_dir):
+            print(f"[FaceRec] known face image dir not found: {image_dir}")
+            return 0
+
+        image_files = self._select_known_face_image_files(image_dir)
+        image_names = {name for _fname, name, _aligned_crop in image_files}
+        if self.known_feature_library:
+            os.makedirs(self.known_feature_dir, exist_ok=True)
+            self._load_known_feature_library(image_names)
+
+        names, feats = [], []
+        align_counts: Dict[str, int] = {}
+        skipped_existing = 0
+        refreshed_existing = 0
+        for fname, name, aligned_crop in image_files:
+            path = os.path.join(image_dir, fname)
+            img = self._read_image_bgr(path)
+            if img is None:
+                print(f"[FaceRec] skip invalid known face image: {path}")
+                continue
+            if aligned_crop:
+                face, mode = self._aligned_reference_face(img), "aligned_crop"
+            else:
+                face, mode = self._detect_reference_face(
+                    img, detector=detector, imgsz=imgsz, conf=conf, iou=iou
+                )
+            if face is None:
+                print(f"[FaceRec] skip known face image without usable face: {path}")
+                continue
+            try:
+                feat = self.extract_feature(face)
+            except Exception as exc:
+                print(f"[FaceRec] known face feature failed {path}: {exc}")
+                continue
+            if self.known_feature_library and name in self._known_name_set:
+                self._set_known_image_feature_for_name(name, feat)
+                refreshed_existing += 1
+                align_counts[mode] = align_counts.get(mode, 0) + 1
+                continue
+            names.append(name)
+            feats.append(feat)
+            align_counts[mode] = align_counts.get(mode, 0) + 1
+
+        added = self._append_known_features(names, feats)
+        if self.known_feature_library:
+            for name in names:
+                self._set_known_image_feature_for_name(
+                    name, self._known_features_for_name(name)[0]
+                )
+                self._save_known_features_for_name(name)
+        if added:
+            detail = ", ".join(f"{k}={v}" for k, v in sorted(align_counts.items()))
+            print(f"[FaceRec] loaded {added} known face image(s) from {image_dir}"
+                  + (f" ({detail})" if detail else ""))
+            if self.known_feature_library:
+                print(f"[FaceRec] known feature library initialized/filled in {self.known_feature_dir}")
+        elif skipped_existing or refreshed_existing:
+            print(
+                "[FaceRec] known face images mapped to existing feature library: "
+                f"{skipped_existing + refreshed_existing}"
+            )
+        elif any(os.path.splitext(f)[1].lower() in _KNOWN_IMAGE_EXTENSIONS
+                 for f in os.listdir(image_dir)):
+            print(f"[FaceRec] no usable known face image in: {image_dir}")
+        return added
 
     # ------------------------------------------------------------------
     def is_frontal(self, keypoints) -> bool:
@@ -482,7 +1330,65 @@ class FaceRecManager:
             "pose_library_max_similarity": None if quality.get("pose_library_max_similarity") is None else round(float(quality.get("pose_library_max_similarity")), 3),
             "pose_sample_interval": quality.get("pose_sample_interval"),
             "pose_sample_missing_frames": quality.get("pose_sample_missing_frames"),
+            "known_update_reason": quality.get("known_update_reason"),
+            "known_update_name": quality.get("known_update_name"),
+            "known_update_matched_name": quality.get("known_update_matched_name"),
+            "known_update_score": None if quality.get("known_update_score") is None else round(float(quality.get("known_update_score")), 3),
+            "known_update_second_score": None if quality.get("known_update_second_score") is None else round(float(quality.get("known_update_second_score")), 3),
+            "known_update_threshold": None if quality.get("known_update_threshold") is None else round(float(quality.get("known_update_threshold")), 3),
+            "known_update_pose_threshold": None if quality.get("known_update_pose_threshold") is None else round(float(quality.get("known_update_pose_threshold")), 3),
+            "known_update_match_threshold": None if quality.get("known_update_match_threshold") is None else round(float(quality.get("known_update_match_threshold")), 3),
+            "known_update_margin": None if quality.get("known_update_margin") is None else round(float(quality.get("known_update_margin")), 3),
+            "known_update_best_existing": None if quality.get("known_update_best_existing") is None else round(float(quality.get("known_update_best_existing")), 3),
+            "known_update_image_score": None if quality.get("known_update_image_score") is None else round(float(quality.get("known_update_image_score")), 3),
+            "known_update_primary_score": None if quality.get("known_update_primary_score") is None else round(float(quality.get("known_update_primary_score")), 3),
+            "known_update_pose_score": None if quality.get("known_update_pose_score") is None else round(float(quality.get("known_update_pose_score")), 3),
+            "known_update_duplicate_threshold": None if quality.get("known_update_duplicate_threshold") is None else round(float(quality.get("known_update_duplicate_threshold")), 3),
+            "known_update_primary_ema_alpha": None if quality.get("known_update_primary_ema_alpha") is None else round(float(quality.get("known_update_primary_ema_alpha")), 3),
+            "known_update_sample_count": quality.get("known_update_sample_count"),
+            "known_update_role": quality.get("known_update_role"),
+            "known_update_updated": bool(quality.get("known_update_updated", False)),
+            "known_bind_reason": quality.get("known_bind_reason"),
+            "known_bind_dynamic_id": quality.get("known_bind_dynamic_id"),
+            "known_bind_feature_count": quality.get("known_bind_feature_count"),
+            "known_bind_min_hits": quality.get("known_bind_min_hits"),
+            "known_bind_selected_name": quality.get("known_bind_selected_name"),
+            "known_bind_selected_score": quality.get("known_bind_selected_score"),
+            "known_bind_selected_hits": quality.get("known_bind_selected_hits"),
+            "known_bind_current_name": quality.get("known_bind_current_name"),
+            "known_bind_current_score": quality.get("known_bind_current_score"),
+            "known_bind_current_hits": quality.get("known_bind_current_hits"),
+            "known_bind_result_name": quality.get("known_bind_result_name"),
+            "known_bind_votes": quality.get("known_bind_votes"),
+            "known_bind_scores": quality.get("known_bind_scores"),
         }
+
+    def _remember_track_face_debug(
+        self,
+        *,
+        track_id: int,
+        frame_id: int,
+        quality: Optional[dict],
+        face_id: Optional[str],
+        raw_face_id: Optional[str],
+        event: str,
+        score: Optional[float],
+        second_score: Optional[float],
+    ) -> None:
+        self._track_face_debug[int(track_id)] = {
+            "track_id": int(track_id),
+            "frame_id": int(frame_id),
+            "face_id": face_id,
+            "raw_face_id": raw_face_id,
+            "event": event,
+            "score": None if score is None else round(float(score), 3),
+            "second_score": None if second_score is None else round(float(second_score), 3),
+            "quality": self._observer_quality_payload(quality),
+        }
+
+    def get_track_face_debug(self, track_id: int) -> Optional[dict]:
+        item = self._track_face_debug.get(int(track_id))
+        return dict(item) if item else None
 
     def _observer_feature_similarity(self, feature: np.ndarray, ref: np.ndarray) -> float:
         return float(np.dot(self._normalize_feature(feature), self._normalize_feature(ref)))
@@ -592,6 +1498,16 @@ class FaceRecManager:
         score: Optional[float],
         second_score: Optional[float],
     ) -> None:
+        self._remember_track_face_debug(
+            track_id=track_id,
+            frame_id=frame_id,
+            quality=quality,
+            face_id=face_id,
+            raw_face_id=raw_face_id,
+            event=event,
+            score=score,
+            second_score=second_score,
+        )
         if not self.observer_enabled or feature is None or face_bgr is None:
             return
         target_name = raw_face_id or face_id
@@ -903,6 +1819,37 @@ class FaceRecManager:
                 "pose_library_max_similarity",
                 "pose_sample_interval",
                 "pose_sample_missing_frames",
+                "known_update_reason",
+                "known_update_name",
+                "known_update_matched_name",
+                "known_update_score",
+                "known_update_second_score",
+                "known_update_threshold",
+                "known_update_pose_threshold",
+                "known_update_match_threshold",
+                "known_update_margin",
+                "known_update_best_existing",
+                "known_update_image_score",
+                "known_update_primary_score",
+                "known_update_pose_score",
+                "known_update_duplicate_threshold",
+                "known_update_primary_ema_alpha",
+                "known_update_sample_count",
+                "known_update_role",
+                "known_update_updated",
+                "known_bind_reason",
+                "known_bind_dynamic_id",
+                "known_bind_feature_count",
+                "known_bind_min_hits",
+                "known_bind_selected_name",
+                "known_bind_selected_score",
+                "known_bind_selected_hits",
+                "known_bind_current_name",
+                "known_bind_current_score",
+                "known_bind_current_hits",
+                "known_bind_result_name",
+                "known_bind_votes",
+                "known_bind_scores",
             ):
                 if key in quality:
                     value = quality.get(key)
@@ -1038,7 +1985,7 @@ class FaceRecManager:
 
     def _identity_scores(self, feature: np.ndarray) -> list:
         query = self._normalize_feature(feature)
-        scores = []
+        scores = [] if self.dynamic_library else self._known_identity_scores(query)
         if self.dynamic_library and self._dynamic_id_features:
             for name, groups in self._dynamic_id_features.items():
                 if self._resolve_dynamic_alias(name) != name:
@@ -1063,19 +2010,59 @@ class FaceRecManager:
                 score = max(primary_score, supplement_score)
                 scores.append((self._resolve_dynamic_alias(name), score))
             scores.sort(key=lambda item: item[1], reverse=True)
-            return scores
+            return self._dedup_scores_by_name(scores)
 
         if self.lib_matrix is None or not self.lib_names:
-            return []
+            return self._dedup_scores_by_name(scores)
 
         sims = self.lib_matrix @ query
-        best_by_name: Dict[str, float] = {}
         for name, score in zip(self.lib_names, sims):
+            scores.append((name, float(score)))
+        return self._dedup_scores_by_name(scores)
+
+    def _known_identity_scores(self, feature: np.ndarray) -> list:
+        if self.known_matrix is None or not self.known_names:
+            return []
+        query = self._normalize_feature(feature)
+        return [
+            (name, float(score))
+            for name, score in zip(self.known_names, self.known_matrix @ query)
+        ]
+
+    @staticmethod
+    def _dedup_scores_by_name(scores: list) -> list:
+        best_by_name: Dict[str, float] = {}
+        for name, score in scores:
             score = float(score)
-            if score > best_by_name.get(name, 0.0):
+            if score > best_by_name.get(name, -1.0):
                 best_by_name[name] = score
-        scores = sorted(best_by_name.items(), key=lambda item: item[1], reverse=True)
-        return scores
+        return sorted(best_by_name.items(), key=lambda item: item[1], reverse=True)
+
+    def _is_known_identity(self, name: Optional[str]) -> bool:
+        return bool(name) and name in self._known_name_set
+
+    def _known_match_detailed(self, feature: np.ndarray) -> Tuple[Optional[str], float, float]:
+        return self._match_from_scores(
+            self._dedup_scores_by_name(self._known_identity_scores(feature))
+        )
+
+    def _identity_score_for_name(self, name: str, feature: np.ndarray) -> float:
+        query = self._normalize_feature(feature)
+        if self._is_known_identity(name) and self.known_matrix is not None:
+            best = 0.0
+            for known_name, known_feature in zip(self.known_names, self.known_matrix):
+                if known_name == name:
+                    best = max(best, float(np.dot(known_feature, query)))
+            return best
+        if self.dynamic_library:
+            return self._dynamic_identity_score(name, query)
+        if self.lib_matrix is not None and self.lib_names:
+            best = 0.0
+            for lib_name, lib_feature in zip(self.lib_names, self.lib_matrix):
+                if lib_name == name:
+                    best = max(best, float(np.dot(lib_feature, query)))
+            return best
+        return 0.0
 
     def _match_from_scores(self, scores: list) -> Tuple[Optional[str], float, float]:
         if not scores:
@@ -1179,6 +2166,8 @@ class FaceRecManager:
         return True
 
     def _add_dynamic_alias_probe(self, name: str, feature: np.ndarray) -> None:
+        if self._is_known_identity(name):
+            return
         canonical = self._resolve_dynamic_alias(name) or name
         feat = self._normalize_feature(feature)
         bucket = self._dynamic_alias_probe_features.setdefault(canonical, [])
@@ -1238,6 +2227,8 @@ class FaceRecManager:
         return float(np.max(src_matrix @ dst_matrix.T))
 
     def _maybe_auto_alias_dynamic_identity(self, name: str) -> Optional[str]:
+        if self._is_known_identity(name):
+            return name
         if not self.dynamic_auto_alias:
             return self._resolve_dynamic_alias(name)
 
@@ -1286,6 +2277,378 @@ class FaceRecManager:
             f"(identity_sim={best_score:.3f}, votes={votes})"
         )
         return best_target
+
+    def _final_identity_name(self, name: str) -> str:
+        if self._is_known_identity(name):
+            return name
+        final_name = self._maybe_auto_alias_dynamic_identity(name) or name
+        return self._resolve_dynamic_alias(final_name) or final_name
+
+    def _dynamic_identity_label_features(
+        self,
+        face_id: str,
+        extra_feature: Optional[np.ndarray] = None,
+    ) -> list:
+        canonical = self._resolve_dynamic_alias(face_id) or face_id
+        feats = self._dynamic_identity_stored_features_for_alias(canonical)
+        if extra_feature is not None:
+            feats.append(self._normalize_feature(extra_feature))
+        return feats
+
+    def _maybe_bind_known_label(
+        self,
+        face_id: str,
+        feature: Optional[np.ndarray] = None,
+        quality: Optional[dict] = None,
+    ) -> Optional[str]:
+        if not self.dynamic_library or self.known_matrix is None or not self.known_names:
+            self._set_known_bind_debug(
+                quality,
+                reason="empty_known_library",
+                canonical=face_id,
+                result_name=None,
+            )
+            self._set_known_update_debug(
+                quality,
+                reason="empty_known_library",
+                name=face_id,
+            )
+            return None
+        canonical = self._resolve_dynamic_alias(face_id) or face_id
+        if canonical not in self._dynamic_id_features:
+            result_name = self.get_identity_label(canonical)
+            self._set_known_bind_debug(
+                quality,
+                reason="missing_dynamic_identity",
+                canonical=canonical,
+                result_name=result_name,
+            )
+            self._set_known_update_debug(
+                quality,
+                reason="missing_dynamic_identity",
+                name=canonical,
+            )
+            return result_name
+
+        direct_scores = (
+            self._dedup_scores_by_name(self._known_identity_scores(feature))
+            if feature is not None else []
+        )
+        direct_debug = self._known_sample_scores_debug(direct_scores, -1) if direct_scores else None
+        direct_name = direct_debug.get("winner") if direct_debug else None
+        direct_score = float(direct_debug.get("score") or 0.0) if direct_debug else 0.0
+        direct_second_score = (
+            float(direct_debug.get("second_score") or 0.0) if direct_debug else 0.0
+        )
+        direct_ok = (
+            direct_name is not None
+            and direct_score >= self.threshold
+            and direct_score >= direct_second_score + self.dynamic_match_margin
+        )
+        direct_state = self._known_bind_consecutive.get(canonical, {})
+        if direct_ok:
+            if direct_state.get("name") == direct_name:
+                direct_hits = int(direct_state.get("hits") or 0) + 1
+            else:
+                direct_hits = 1
+            direct_state = {
+                "name": direct_name,
+                "hits": direct_hits,
+                "score": max(float(direct_state.get("score") or 0.0), direct_score)
+                if direct_state.get("name") == direct_name else direct_score,
+                "second_score": direct_second_score,
+            }
+            self._known_bind_consecutive[canonical] = direct_state
+        else:
+            self._known_bind_consecutive.pop(canonical, None)
+            direct_hits = 0
+
+        if direct_ok and direct_hits >= 2:
+            current = self._dynamic_identity_labels.get(canonical)
+            current_name = current.get("name") if current else None
+            current_score = float(current.get("score") or 0.0) if current else 0.0
+            current_hits = int(current.get("hits") or 0) if current else 0
+            if current_name and current_name != direct_name:
+                if direct_score < current_score + self.dynamic_match_margin:
+                    self._set_known_bind_debug(
+                        quality,
+                        reason="known_bind_keep_existing_margin",
+                        canonical=canonical,
+                        feature_count=1,
+                        min_hits=2,
+                        sample_scores=[direct_debug] if direct_debug else None,
+                        votes={direct_name: {"hits": direct_hits, "best": direct_score}},
+                        selected_name=direct_name,
+                        selected_score=direct_score,
+                        selected_hits=direct_hits,
+                        current_name=current_name,
+                        current_score=current_score,
+                        current_hits=current_hits,
+                        result_name=current_name,
+                    )
+                    self._set_known_update_debug(
+                        quality,
+                        reason="known_bind_keep_existing_margin",
+                        name=canonical,
+                        matched_name=direct_name,
+                        score=direct_score,
+                        second_score=direct_second_score,
+                        sample_count=direct_hits,
+                    )
+                    return current_name
+            self._dynamic_identity_labels[canonical] = {
+                "name": direct_name,
+                "score": max(current_score, direct_score),
+                "hits": max(current_hits, direct_hits),
+            }
+            self._set_known_bind_debug(
+                quality,
+                reason="known_bind_consecutive_selected",
+                canonical=canonical,
+                feature_count=1,
+                min_hits=2,
+                sample_scores=[direct_debug] if direct_debug else None,
+                votes={direct_name: {"hits": direct_hits, "best": direct_score}},
+                selected_name=direct_name,
+                selected_score=direct_score,
+                selected_hits=direct_hits,
+                current_name=current_name,
+                current_score=current_score if current else None,
+                current_hits=current_hits if current else None,
+                result_name=direct_name,
+            )
+            print(
+                f"[FaceRec] bind dynamic {canonical} -> name {direct_name} "
+                f"(consecutive_score={direct_score:.3f}, hits={direct_hits})"
+            )
+            self._maybe_update_known_feature_library(direct_name, feature, quality)
+            return direct_name
+
+        feats = self._dynamic_identity_label_features(canonical, feature)
+        if not feats:
+            result_name = self.get_identity_label(canonical)
+            self._set_known_bind_debug(
+                quality,
+                reason="missing_dynamic_features",
+                canonical=canonical,
+                result_name=result_name,
+            )
+            self._set_known_update_debug(
+                quality,
+                reason="missing_dynamic_features",
+                name=canonical,
+            )
+            return result_name
+
+        votes: Dict[str, dict] = {}
+        sample_scores = []
+        for sample_index, feat in enumerate(feats):
+            known_scores = self._dedup_scores_by_name(self._known_identity_scores(feat))
+            sample_debug = self._known_sample_scores_debug(known_scores, sample_index)
+            sample_scores.append(sample_debug)
+            name = sample_debug.get("winner")
+            score = float(sample_debug.get("score") or 0.0)
+            second_score = float(sample_debug.get("second_score") or 0.0)
+            if name is None:
+                continue
+            if score < second_score + self.dynamic_match_margin:
+                continue
+            bucket = votes.setdefault(name, {"hits": 0, "best": 0.0})
+            bucket["hits"] += 1
+            bucket["best"] = max(float(bucket["best"]), float(score))
+
+        if not votes:
+            result_name = self.get_identity_label(canonical)
+            self._set_known_bind_debug(
+                quality,
+                reason="known_bind_no_votes",
+                canonical=canonical,
+                feature_count=len(feats),
+                sample_scores=sample_scores,
+                votes=votes,
+                result_name=result_name,
+            )
+            self._set_known_update_debug(
+                quality,
+                reason="known_bind_no_votes",
+                name=canonical,
+            )
+            return result_name
+
+        best_name, best_info = max(
+            votes.items(),
+            key=lambda item: (int(item[1]["hits"]), float(item[1]["best"])),
+        )
+        hits = int(best_info["hits"])
+        best_score = float(best_info["best"])
+        min_hits = 2 if len(feats) >= 2 else 1
+        if hits < min_hits:
+            result_name = self.get_identity_label(canonical)
+            self._set_known_bind_debug(
+                quality,
+                reason="known_bind_insufficient_votes",
+                canonical=canonical,
+                feature_count=len(feats),
+                min_hits=min_hits,
+                sample_scores=sample_scores,
+                votes=votes,
+                selected_name=best_name,
+                selected_score=best_score,
+                selected_hits=hits,
+                result_name=result_name,
+            )
+            self._set_known_update_debug(
+                quality,
+                reason="known_bind_insufficient_votes",
+                name=canonical,
+                matched_name=best_name,
+                score=best_score,
+                sample_count=hits,
+            )
+            return result_name
+        if len(feats) < 2 and best_score < self.threshold + 0.10:
+            result_name = self.get_identity_label(canonical)
+            self._set_known_bind_debug(
+                quality,
+                reason="known_bind_low_single_feature_score",
+                canonical=canonical,
+                feature_count=len(feats),
+                min_hits=min_hits,
+                sample_scores=sample_scores,
+                votes=votes,
+                selected_name=best_name,
+                selected_score=best_score,
+                selected_hits=hits,
+                result_name=result_name,
+            )
+            self._set_known_update_debug(
+                quality,
+                reason="known_bind_low_single_feature_score",
+                name=canonical,
+                matched_name=best_name,
+                score=best_score,
+                sample_count=hits,
+            )
+            return result_name
+
+        current = self._dynamic_identity_labels.get(canonical)
+        if current:
+            current_name = current.get("name")
+            current_score = float(current.get("score") or 0.0)
+            current_hits = int(current.get("hits") or 0)
+            if current_name == best_name:
+                if best_score > current_score or hits > current_hits:
+                    current.update({"score": best_score, "hits": hits})
+                self._set_known_bind_debug(
+                    quality,
+                    reason="known_bind_keep_same_name",
+                    canonical=canonical,
+                    feature_count=len(feats),
+                    min_hits=min_hits,
+                    sample_scores=sample_scores,
+                    votes=votes,
+                    selected_name=best_name,
+                    selected_score=best_score,
+                    selected_hits=hits,
+                    current_name=current_name,
+                    current_score=current_score,
+                    current_hits=current_hits,
+                    result_name=best_name,
+                )
+                self._maybe_update_known_feature_library(best_name, feature, quality)
+                return best_name
+            if hits < current_hits and best_score < current_score + self.dynamic_match_margin:
+                self._set_known_bind_debug(
+                    quality,
+                    reason="known_bind_keep_existing_hits",
+                    canonical=canonical,
+                    feature_count=len(feats),
+                    min_hits=min_hits,
+                    sample_scores=sample_scores,
+                    votes=votes,
+                    selected_name=best_name,
+                    selected_score=best_score,
+                    selected_hits=hits,
+                    current_name=current_name,
+                    current_score=current_score,
+                    current_hits=current_hits,
+                    result_name=current_name,
+                )
+                self._set_known_update_debug(
+                    quality,
+                    reason="known_bind_keep_existing_hits",
+                    name=canonical,
+                    matched_name=best_name,
+                    score=best_score,
+                    sample_count=hits,
+                )
+                return current_name
+            if best_score < current_score + self.dynamic_match_margin:
+                self._set_known_bind_debug(
+                    quality,
+                    reason="known_bind_keep_existing_margin",
+                    canonical=canonical,
+                    feature_count=len(feats),
+                    min_hits=min_hits,
+                    sample_scores=sample_scores,
+                    votes=votes,
+                    selected_name=best_name,
+                    selected_score=best_score,
+                    selected_hits=hits,
+                    current_name=current_name,
+                    current_score=current_score,
+                    current_hits=current_hits,
+                    result_name=current_name,
+                )
+                self._set_known_update_debug(
+                    quality,
+                    reason="known_bind_keep_existing_margin",
+                    name=canonical,
+                    matched_name=best_name,
+                    score=best_score,
+                    sample_count=hits,
+                )
+                return current_name
+
+        self._dynamic_identity_labels[canonical] = {
+            "name": best_name,
+            "score": best_score,
+            "hits": hits,
+        }
+        self._set_known_bind_debug(
+            quality,
+            reason="known_bind_selected",
+            canonical=canonical,
+            feature_count=len(feats),
+            min_hits=min_hits,
+            sample_scores=sample_scores,
+            votes=votes,
+            selected_name=best_name,
+            selected_score=best_score,
+            selected_hits=hits,
+            result_name=best_name,
+        )
+        print(
+            f"[FaceRec] bind dynamic {canonical} -> name {best_name} "
+            f"(known_score={best_score:.3f}, hits={hits})"
+        )
+        self._maybe_update_known_feature_library(best_name, feature, quality)
+        return best_name
+
+    def get_identity_label(self, face_id: Optional[str]) -> Optional[str]:
+        if not face_id:
+            return None
+        if self._is_known_identity(face_id):
+            return face_id
+        canonical = self._resolve_dynamic_alias(face_id) if self.dynamic_library else face_id
+        item = self._dynamic_identity_labels.get(canonical) if canonical else None
+        return item.get("name") if item else None
+
+    def get_track_label(self, track_id: int) -> Optional[str]:
+        if not self.dynamic_library:
+            return None
+        face_id = self._dynamic_track_bindings.get(int(track_id))
+        return self.get_identity_label(face_id)
 
     def _rebuild_dynamic_matrix(self) -> None:
         names, feats = [], []
@@ -1667,6 +3030,7 @@ class FaceRecManager:
             self._last_attempt_frame.pop(track_id, None)
             self._dynamic_track_bindings.pop(track_id, None)
             self._dynamic_pending_enroll.pop(track_id, None)
+            self._track_face_debug.pop(track_id, None)
 
     def _is_faceid_available_this_frame(self, name: str, track_id: int) -> bool:
         owner = self._dynamic_frame_assignments.get(name)
@@ -1681,8 +3045,7 @@ class FaceRecManager:
         face_name_map: Dict[int, str],
         raw_name: str,
     ) -> str:
-        final_name = self._maybe_auto_alias_dynamic_identity(raw_name) or raw_name
-        final_name = self._resolve_dynamic_alias(final_name) or final_name
+        final_name = self._final_identity_name(raw_name)
         self._dynamic_track_bindings[track_id] = final_name
         face_name_map[track_id] = final_name
         return final_name
@@ -1806,10 +3169,10 @@ class FaceRecManager:
         })
 
         if bound_name is not None:
-            bound_score = self._dynamic_identity_score(bound_name, feature)
+            bound_score = self._identity_score_for_name(bound_name, feature)
             raw_name = bound_name
             event = "dynamic_ambiguous_keep" if ambiguous_match else "dynamic_lock_keep"
-            final_name = self._resolve_dynamic_alias(raw_name) or raw_name
+            final_name = self._final_identity_name(raw_name)
             if (not ambiguous_match
                     or (self.dynamic_ambiguous_keep_bound
                         and bound_score >= self.dynamic_ambiguous_keep_min_score)):
@@ -1830,7 +3193,7 @@ class FaceRecManager:
                 and score >= bound_score + self.dynamic_switch_margin
             )
             if should_switch:
-                final_name = self._resolve_dynamic_alias(name) or name
+                final_name = self._final_identity_name(name)
                 record["candidates"].append({
                     "raw": name,
                     "final": final_name,
@@ -1842,7 +3205,7 @@ class FaceRecManager:
             return record
 
         if name is not None:
-            final_name = self._resolve_dynamic_alias(name) or name
+            final_name = self._final_identity_name(name)
             record["candidates"].append({
                 "raw": name,
                 "final": final_name,
@@ -1934,8 +3297,7 @@ class FaceRecManager:
     ) -> None:
         track_id = int(record["track_id"])
         raw_name = candidate["raw"]
-        final_name = self._maybe_auto_alias_dynamic_identity(raw_name) or raw_name
-        final_name = self._resolve_dynamic_alias(final_name) or final_name
+        final_name = self._final_identity_name(raw_name)
         if not self._is_faceid_available_this_frame(final_name, track_id):
             face_name_map.pop(track_id, None)
             feature = record.get("feature")
@@ -2010,6 +3372,7 @@ class FaceRecManager:
                 print(f"[FaceRec] dynamic update {raw_name}: "
                       f"{n_primary} primary, {n_supp} supplement "
                       f"(+{update_kind}, yaw={yaw_text})")
+        self._maybe_bind_known_label(final_name, feature, record.get("quality"))
         observer_event = event if not update_kind else f"{event}+{update_kind}"
         self._update_observer_observation(
             track_id=track_id,
@@ -2100,12 +3463,12 @@ class FaceRecManager:
                 )
                 return
             self._add_dynamic_alias_probe(raw_name, feature)
-            final_name = self._maybe_auto_alias_dynamic_identity(raw_name) or raw_name
-            final_name = self._resolve_dynamic_alias(final_name) or final_name
+            final_name = self._final_identity_name(raw_name)
             if self._is_faceid_available_this_frame(final_name, track_id):
                 self._dynamic_track_bindings[track_id] = final_name
                 face_name_map[track_id] = final_name
                 self._reserve_faceid_this_frame(final_name, track_id)
+                self._maybe_bind_known_label(final_name, feature, record.get("quality"))
                 kind = "primary" if record.get("is_primary") else "supplement"
                 yaw_deg = record.get("yaw_deg")
                 yaw_text = f"{yaw_deg:.1f}°" if yaw_deg is not None else "N/A"
@@ -2220,7 +3583,7 @@ class FaceRecManager:
         is_primary = bool(quality.get("primary_ok"))
         can_enroll = bool(quality.get("sample_ok"))
         if bound_name is not None:
-            bound_score = self._dynamic_identity_score(bound_name, feature)
+            bound_score = self._identity_score_for_name(bound_name, feature)
             name, score = self.match(feature)
             bound_name = self._resolve_dynamic_alias(bound_name) or bound_name
             should_switch = (
@@ -2233,7 +3596,7 @@ class FaceRecManager:
                 and score >= bound_score + self.dynamic_switch_margin
             )
             raw_name = name if should_switch else bound_name
-            final_name = self._resolve_dynamic_alias(raw_name) or raw_name
+            final_name = self._final_identity_name(raw_name)
             if not self._is_faceid_available_this_frame(final_name, track_id):
                 print(f"[FaceRec] dynamic conflict: skip track {track_id}, "
                       f"{final_name} already used this frame")
@@ -2277,6 +3640,7 @@ class FaceRecManager:
                       f"(+{update_kind}, yaw={yaw_text})")
             final_name = self._apply_dynamic_alias_to_track(track_id, face_name_map, raw_name)
             self._reserve_faceid_this_frame(final_name, track_id)
+            self._maybe_bind_known_label(final_name, feature, quality)
             self._dump_debug_sample(
                 panorama_bgr=panorama_bgr, face_bgr=face, feature=feature,
                 track_id=track_id, frame_id=frame_id, face_id=final_name,
@@ -2290,7 +3654,7 @@ class FaceRecManager:
         name, score = self.match(feature)
         if name is not None:
             raw_name = name
-            final_name = self._resolve_dynamic_alias(raw_name) or raw_name
+            final_name = self._final_identity_name(raw_name)
             if not self._is_faceid_available_this_frame(final_name, track_id):
                 print(f"[FaceRec] dynamic conflict: skip track {track_id}, "
                       f"{final_name} already used this frame")
@@ -2328,6 +3692,7 @@ class FaceRecManager:
                       f"(+{update_kind}, yaw={yaw_text})")
             final_name = self._apply_dynamic_alias_to_track(track_id, face_name_map, raw_name)
             self._reserve_faceid_this_frame(final_name, track_id)
+            self._maybe_bind_known_label(final_name, feature, quality)
             self._dump_debug_sample(
                 panorama_bgr=panorama_bgr, face_bgr=face, feature=feature,
                 track_id=track_id, frame_id=frame_id, face_id=final_name,
@@ -2368,6 +3733,7 @@ class FaceRecManager:
         self._add_dynamic_alias_probe(raw_name, feature)
         final_name = self._apply_dynamic_alias_to_track(track_id, face_name_map, raw_name)
         self._reserve_faceid_this_frame(final_name, track_id)
+        self._maybe_bind_known_label(final_name, feature, quality)
         kind = "primary" if is_primary else "supplement"
         yaw_text = f"{yaw_deg:.1f}°" if yaw_deg is not None else "N/A"
         alias_text = "" if raw_name == final_name else f" alias->{final_name}"
@@ -2429,7 +3795,7 @@ class FaceRecManager:
             event="static_match" if name is not None else "static_unknown",
             score=score, bbox=bbox, confidence=confidence,
             yaw_deg=self._yaw_deg(keypoints), is_primary=self.is_frontal(keypoints),
-            quality=quality,
+            quality=None,
         )
         if name is not None:
             face_name_map[track_id] = name
@@ -2479,3 +3845,4 @@ class FaceRecManager:
             # binding to carry FaceID without re-enrolling a person.
             return
         self._last_attempt_frame.pop(track_id, None)
+        self._track_face_debug.pop(track_id, None)
