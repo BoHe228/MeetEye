@@ -172,8 +172,15 @@ static int run(Config cfg) {
   }
   std::unique_ptr<FaceRecognitionRuntime> face_rec;
   if (cfg.face_rec_enabled) {
+    std::function<bool(const Image&, std::array<float, kDetectionFields>*, std::string*)>
+        known_photo_detector =
+            [&runtime](const Image& image,
+                       std::array<float, kDetectionFields>* det,
+                       std::string* error) {
+              return runtime.detect_known_face_photo(image, det, error);
+            };
     face_rec.reset(new FaceRecognitionRuntime(
-        cfg, runtime.meta(), runtime.base_map_x(), runtime.base_map_y()));
+        cfg, runtime.meta(), runtime.base_map_x(), runtime.base_map_y(), known_photo_detector));
   }
 
   std::ofstream jsonl;

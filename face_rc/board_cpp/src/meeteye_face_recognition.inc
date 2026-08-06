@@ -19,8 +19,15 @@ class FaceRecognitionRuntime {
   FaceRecognitionRuntime(const Config& cfg,
                          const MapMeta& meta,
                          const std::vector<float>* base_map_x,
-                         const std::vector<float>* base_map_y)
+                         const std::vector<float>* base_map_y,
+                         std::function<bool(const Image&,
+                                            std::array<float, kDetectionFields>*,
+                                            std::string*)> known_photo_detector =
+                             std::function<bool(const Image&,
+                                                std::array<float, kDetectionFields>*,
+                                                std::string*)>())
       : cfg_(cfg), meta_(meta), base_map_x_(base_map_x), base_map_y_(base_map_y) {
+    known_photo_detector_ = std::move(known_photo_detector);
     char err[4096] = {0};
     std::vector<int> core_masks;
     if (cfg_.face_rec_async || is_wide_angle_projection(meta_.projection_mode)) {
@@ -64,6 +71,7 @@ class FaceRecognitionRuntime {
       ensure_dir_exists(cfg_.face_rec_debug_crop_dir);
     }
     load_feature_library(cfg_.face_rec_library_dir);
+    load_known_face_library(cfg_.known_face_dir);
     if (cfg_.face_rec_async) {
       start_async_worker();
     }
@@ -79,6 +87,12 @@ class FaceRecognitionRuntime {
       std::cerr << core_masks[static_cast<size_t>(i)];
     }
     std::cerr << " bind=raw_track_id";
+    if (!known_identities_.empty()) {
+      std::cerr << " known_faces=" << known_identities_.size();
+      if (cfg_.known_face_feature_library) {
+        std::cerr << " known_feature_dir=" << cfg_.known_face_feature_dir;
+      }
+    }
     if (cfg_.face_rec_async) {
       std::cerr << " async=on"
                 << " max_pending=" << cfg_.face_rec_async_max_pending
@@ -992,6 +1006,7 @@ class FaceRecognitionRuntime {
                              : "tentative_confirm";
         assigned.debug_reason = assigned.event;
         apply_update_debug(update, &assigned);
+        apply_known_face_label(assigned.face_id, feature, &assigned);
         mark_face_check_success(binding_id, frame_id, &assigned);
         bindings_[binding_id] = assigned;
         current_[binding_id] = assigned;
@@ -1083,6 +1098,7 @@ class FaceRecognitionRuntime {
           assigned.debug_blocked_by_owner = false;
           assigned.debug_reserved_owner = binding_id;
           apply_update_debug(update, &assigned);
+          apply_known_face_label(assigned.face_id, feature, &assigned);
           mark_face_check_success(binding_id, frame_id, &assigned);
           bindings_[binding_id] = assigned;
           current_[binding_id] = assigned;
@@ -1203,12 +1219,65 @@ class FaceRecognitionRuntime {
         assigned.debug_reserved_owner =
             relink_candidate ? reserved_owner_for_face(relink_name) : binding_id;
         apply_update_debug(update, &assigned);
+        apply_known_face_label(assigned.face_id, feature, &assigned);
         mark_face_check_success(binding_id, frame_id, &assigned);
         bindings_[binding_id] = assigned;
         current_[binding_id] = assigned;
         used_this_frame->insert(assigned.face_id);
         return;
       }
+    }
+
+    const KnownFaceMatchResult known_match = match_known_identity_debug(feature);
+    if (known_match.pass && !known_match.best_name.empty()) {
+      pending_dynamic_enroll_.erase(binding_id);
+      std::string enrolled_name;
+      bool enrolled_dynamic = false;
+      if (cfg_.face_rec_dynamic_library) {
+        enrolled_name = create_dynamic_identity(feature, feature_quality);
+        enrolled_dynamic = is_dynamic_identity(enrolled_name);
+      }
+      if (enrolled_name.empty()) {
+        enrolled_name = known_match.best_name;
+      }
+      assigned.has_face = true;
+      assigned.face_id = enrolled_name;
+      assigned.score = known_match.best_score;
+      assigned.second_score = known_match.second_score;
+      assigned.dynamic = enrolled_dynamic;
+      assigned.updated = enrolled_dynamic;
+      assigned.event = enrolled_dynamic ? "known_match_enroll" : "known_match";
+      assigned.has_debug = true;
+      assigned.debug_reason = assigned.event;
+      assigned.debug_rknn_ran = true;
+      assigned.debug_best_name = known_match.best_name;
+      assigned.debug_best_score = known_match.best_score;
+      assigned.debug_second_score = known_match.second_score;
+      assigned.debug_strong_identity_match = true;
+      assigned.debug_best_reserved_by_other = false;
+      assigned.debug_used_by_other_this_frame = false;
+      assigned.debug_blocked_by_owner = false;
+      assigned.debug_reserved_owner = binding_id;
+      assigned.known_matched = true;
+      assigned.known_name = known_match.best_name;
+      assigned.known_score = known_match.best_score;
+      assigned.known_second_score = known_match.second_score;
+      apply_known_match_debug(known_match, &assigned);
+      known_labels_by_face_id_[assigned.face_id] =
+          KnownFaceLabel{known_match.best_name,
+                         known_match.best_score,
+                         known_match.second_score,
+                         1};
+      KnownFeatureUpdate update =
+          maybe_update_known_feature_library(known_match.best_name, feature);
+      apply_known_update_debug(update, &assigned);
+      mark_face_check_success(binding_id, frame_id, &assigned);
+      bindings_[binding_id] = assigned;
+      current_[binding_id] = assigned;
+      (*reserved_face_owner)[assigned.face_id] = binding_id;
+      used_this_frame->insert(assigned.face_id);
+      pending_face_relink_.erase(binding_id);
+      return;
     }
 
     std::string best_name;
@@ -1240,6 +1309,7 @@ class FaceRecognitionRuntime {
     debug_binding.debug_blocked_by_owner = strong_match_blocked_by_owner;
     debug_binding.debug_reserved_owner =
         best_name.empty() ? 0 : reserved_owner_for_face(best_name);
+    apply_known_match_debug(known_match, &debug_binding);
     if (!best_name.empty() &&
         strong_identity_match &&
         !used_by_other_this_frame &&
@@ -1320,6 +1390,7 @@ class FaceRecognitionRuntime {
     }
 
     if (assigned.has_face) {
+      apply_known_face_label(assigned.face_id, feature, &assigned);
       mark_face_check_success(binding_id, frame_id, &assigned);
       bindings_[binding_id] = assigned;
       current_[binding_id] = assigned;
@@ -1354,6 +1425,20 @@ class FaceRecognitionRuntime {
         target.face_recognition_updated = binding.updated;
         target.face_recognition_tentative = binding.tentative;
         target.face_recognition_event = binding.event;
+        if (binding.known_matched && !binding.known_name.empty()) {
+          target.has_known_face = true;
+          target.known_name = binding.known_name;
+          target.face_recognition_known_score = binding.known_score;
+          target.face_recognition_known_second_score = binding.known_second_score;
+        }
+        target.face_recognition_known_updated = binding.known_feature_updated;
+        target.face_recognition_known_update_reason = binding.known_update_reason;
+        target.face_recognition_known_update_role = binding.known_update_role;
+        target.face_recognition_known_update_score = binding.known_update_score;
+        target.face_recognition_known_update_second_score = binding.known_update_second_score;
+        target.face_recognition_known_update_image_score = binding.known_update_image_score;
+        target.face_recognition_known_update_primary_score = binding.known_update_primary_score;
+        target.face_recognition_known_update_pose_score = binding.known_update_pose_score;
       }
       if (binding.has_debug) {
         target.has_face_recognition_debug = true;
@@ -1384,10 +1469,20 @@ class FaceRecognitionRuntime {
             binding.debug_locked_pose_quality_ok;
         target.face_recognition_debug_has_pose_library_similarity =
             binding.debug_has_pose_library_similarity;
+        target.face_recognition_debug_has_known_face_match =
+            binding.debug_has_known_face_match;
+        target.face_recognition_debug_known_face_pass =
+            binding.debug_known_face_pass;
         target.face_recognition_debug_pose_sample_missing_frames =
             binding.debug_pose_sample_missing_frames;
+        target.face_recognition_debug_known_face_loaded_count =
+            binding.debug_known_face_loaded_count;
         target.face_recognition_debug_update_reason =
             binding.debug_update_reason;
+        target.face_recognition_debug_known_face_best_name =
+            binding.debug_known_face_best_name;
+        target.face_recognition_debug_known_face_reject_reason =
+            binding.debug_known_face_reject_reason;
         target.face_recognition_debug_identity_score =
             binding.debug_identity_score;
         target.face_recognition_debug_sample_similarity =
@@ -1396,6 +1491,16 @@ class FaceRecognitionRuntime {
             binding.debug_pose_library_similarity;
         target.face_recognition_debug_pose_library_max_similarity =
             binding.debug_pose_library_max_similarity;
+        target.face_recognition_debug_known_face_best_score =
+            binding.debug_known_face_best_score;
+        target.face_recognition_debug_known_face_second_score =
+            binding.debug_known_face_second_score;
+        target.face_recognition_debug_known_face_threshold =
+            binding.debug_known_face_threshold;
+        target.face_recognition_debug_known_face_margin =
+            binding.debug_known_face_margin;
+        target.face_recognition_debug_known_face_candidates =
+            binding.debug_known_face_candidates;
       }
     }
   }
@@ -1412,6 +1517,46 @@ class FaceRecognitionRuntime {
     std::vector<FaceFeatureQuality> qualities;
     std::vector<int> frames;
     int last_frame = 0;
+  };
+
+  struct KnownFaceIdentity {
+    std::string name;
+    std::vector<std::vector<float>> features;
+  };
+
+  struct KnownFaceLabel {
+    std::string name;
+    float score = 0.0f;
+    float second_score = 0.0f;
+    int hits = 0;
+    std::string pending_name;
+    float pending_score = 0.0f;
+    float pending_second_score = 0.0f;
+    int pending_hits = 0;
+  };
+
+  struct KnownFeatureUpdate {
+    std::string reason;
+    std::string role;
+    float score = 0.0f;
+    float second_score = 0.0f;
+    float image_score = 0.0f;
+    float primary_score = 0.0f;
+    float pose_score = 0.0f;
+    bool updated = false;
+  };
+
+  struct KnownFaceMatchResult {
+    bool available = false;
+    bool pass = false;
+    int loaded_count = 0;
+    std::string best_name;
+    std::string reject_reason;
+    float best_score = 0.0f;
+    float second_score = 0.0f;
+    float threshold = 0.0f;
+    float margin = 0.0f;
+    std::vector<KnownFaceDebugCandidate> candidates;
   };
 
   struct AdaFaceHandle {
@@ -1454,6 +1599,410 @@ class FaceRecognitionRuntime {
         update_next_dynamic_id(id.name);
         identities_.push_back(std::move(id));
       }
+    }
+  }
+
+  static std::string lower_ext(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) {
+      return "";
+    }
+    std::string ext = path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return ext;
+  }
+
+  static bool is_known_face_jpeg(const std::string& path) {
+    const std::string ext = lower_ext(path);
+    return ext == ".jpg" || ext == ".jpeg";
+  }
+
+  struct KnownFacePhotoEntry {
+    std::string path;
+    std::string name;
+    bool aligned_crop = false;
+  };
+
+  static bool ends_with_case_insensitive(const std::string& text, const std::string& suffix) {
+    if (text.size() < suffix.size()) {
+      return false;
+    }
+    const size_t offset = text.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+      const unsigned char a = static_cast<unsigned char>(text[offset + i]);
+      const unsigned char b = static_cast<unsigned char>(suffix[i]);
+      if (std::tolower(a) != std::tolower(b)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static KnownFacePhotoEntry parse_known_face_photo_entry(const std::string& path) {
+    KnownFacePhotoEntry entry;
+    entry.path = path;
+    entry.name = basename_without_ext(path);
+    static const char* kAlignedSuffixes[] = {
+        "_aligned",
+        "_adaface112",
+        "_crop112",
+        "_facecrop",
+    };
+    for (const char* suffix : kAlignedSuffixes) {
+      const std::string suffix_str(suffix);
+      if (ends_with_case_insensitive(entry.name, suffix_str) &&
+          entry.name.size() > suffix_str.size()) {
+        entry.name.resize(entry.name.size() - suffix_str.size());
+        entry.aligned_crop = true;
+        break;
+      }
+    }
+    return entry;
+  }
+
+  static std::vector<KnownFacePhotoEntry> collect_known_face_photo_entries(
+      const std::string& dir) {
+    std::map<std::string, KnownFacePhotoEntry> selected;
+    for (const std::string& path : list_dir_paths(dir)) {
+      if (!is_known_face_jpeg(path)) {
+        continue;
+      }
+      KnownFacePhotoEntry entry = parse_known_face_photo_entry(path);
+      if (entry.name.empty()) {
+        continue;
+      }
+      auto it = selected.find(entry.name);
+      if (it == selected.end() || (entry.aligned_crop && !it->second.aligned_crop)) {
+        selected[entry.name] = std::move(entry);
+      }
+    }
+    std::vector<KnownFacePhotoEntry> entries;
+    entries.reserve(selected.size());
+    for (auto& kv : selected) {
+      entries.push_back(std::move(kv.second));
+    }
+    return entries;
+  }
+
+  bool extract_five_point_photo_tensor(const Image& image,
+                                       const float* det,
+                                       std::vector<float>* out_nchw) const {
+    if (out_nchw == nullptr || det == nullptr || image.width <= 0 || image.height <= 0 ||
+        image.bgr.size() != static_cast<size_t>(image.width) * image.height * 3 ||
+        input_h_ <= 0 || input_w_ <= 0 || input_c_ != 3) {
+      return false;
+    }
+    static const float kArcFaceTemplate[5][2] = {
+        {38.2946f, 51.6963f},
+        {73.5318f, 51.5014f},
+        {56.0252f, 71.7366f},
+        {41.5493f, 92.3655f},
+        {70.7299f, 92.2041f},
+    };
+    std::array<std::array<float, 2>, 5> src{};
+    for (int i = 0; i < 5; ++i) {
+      const float* kp = det + 5 + i * 3;
+      if (!valid_keypoint(kp)) {
+        return false;
+      }
+      src[static_cast<size_t>(i)][0] = kp[0];
+      src[static_cast<size_t>(i)][1] = kp[1];
+    }
+
+    float mean_src_x = 0.0f;
+    float mean_src_y = 0.0f;
+    float mean_dst_x = 0.0f;
+    float mean_dst_y = 0.0f;
+    for (int i = 0; i < 5; ++i) {
+      mean_src_x += src[static_cast<size_t>(i)][0];
+      mean_src_y += src[static_cast<size_t>(i)][1];
+      mean_dst_x += kArcFaceTemplate[i][0];
+      mean_dst_y += kArcFaceTemplate[i][1];
+    }
+    mean_src_x /= 5.0f;
+    mean_src_y /= 5.0f;
+    mean_dst_x /= 5.0f;
+    mean_dst_y /= 5.0f;
+
+    float denom = 0.0f;
+    float a_num = 0.0f;
+    float b_num = 0.0f;
+    for (int i = 0; i < 5; ++i) {
+      const float dx = kArcFaceTemplate[i][0] - mean_dst_x;
+      const float dy = kArcFaceTemplate[i][1] - mean_dst_y;
+      const float sx = src[static_cast<size_t>(i)][0] - mean_src_x;
+      const float sy = src[static_cast<size_t>(i)][1] - mean_src_y;
+      denom += dx * dx + dy * dy;
+      a_num += sx * dx + sy * dy;
+      b_num += sy * dx - sx * dy;
+    }
+    if (denom <= 1.0e-6f) {
+      return false;
+    }
+    const float a = a_num / denom;
+    const float b = b_num / denom;
+    const float scale = std::sqrt(a * a + b * b);
+    if (!std::isfinite(scale) || scale <= 1.0e-3f) {
+      return false;
+    }
+    const float tx = mean_src_x - a * mean_dst_x + b * mean_dst_y;
+    const float ty = mean_src_y - b * mean_dst_x - a * mean_dst_y;
+    const float cx = (static_cast<float>(input_w_) - 1.0f) * 0.5f;
+    const float cy = (static_cast<float>(input_h_) - 1.0f) * 0.5f;
+    const float crop_scale = cfg_.face_rec_five_point_scale;
+
+    out_nchw->assign(static_cast<size_t>(input_c_) * input_h_ * input_w_, 0.0f);
+    for (int oy = 0; oy < input_h_; ++oy) {
+      for (int ox = 0; ox < input_w_; ++ox) {
+        const float x = cx + ((static_cast<float>(ox) + 0.5f) - cx) * crop_scale;
+        const float y = cy + ((static_cast<float>(oy) + 0.5f) - cy) * crop_scale;
+        const float px = a * x - b * y + tx;
+        const float py = b * x + a * y + ty;
+        float bgr[3] = {0.0f, 0.0f, 0.0f};
+        sample_source_bilinear(image, px, py, bgr);
+        for (int c = 0; c < input_c_; ++c) {
+          const float normalized = (bgr[c] / 255.0f - 0.5f) / 0.5f;
+          (*out_nchw)[(static_cast<size_t>(c) * input_h_ + oy) * input_w_ + ox] =
+              normalized;
+        }
+      }
+    }
+    return true;
+  }
+
+  bool extract_aligned_photo_tensor(const Image& image, std::vector<float>* out_nchw) const {
+    if (out_nchw == nullptr || image.width <= 0 || image.height <= 0 ||
+        image.bgr.size() != static_cast<size_t>(image.width) * image.height * 3 ||
+        input_h_ <= 0 || input_w_ <= 0 || input_c_ != 3) {
+      return false;
+    }
+    out_nchw->assign(static_cast<size_t>(input_c_) * input_h_ * input_w_, 0.0f);
+    for (int oy = 0; oy < input_h_; ++oy) {
+      for (int ox = 0; ox < input_w_; ++ox) {
+        const float sx = (static_cast<float>(ox) + 0.5f) *
+                         static_cast<float>(image.width) / static_cast<float>(input_w_) - 0.5f;
+        const float sy = (static_cast<float>(oy) + 0.5f) *
+                         static_cast<float>(image.height) / static_cast<float>(input_h_) - 0.5f;
+        float bgr[3] = {0.0f, 0.0f, 0.0f};
+        sample_source_bilinear(image, sx, sy, bgr);
+        for (int c = 0; c < input_c_; ++c) {
+          const float normalized = (bgr[c] / 255.0f - 0.5f) / 0.5f;
+          (*out_nchw)[(static_cast<size_t>(c) * input_h_ + oy) * input_w_ + ox] =
+              normalized;
+        }
+      }
+    }
+    return true;
+  }
+
+  bool extract_center_photo_tensor(const Image& image, std::vector<float>* out_nchw) const {
+    if (out_nchw == nullptr || image.width <= 0 || image.height <= 0 ||
+        image.bgr.size() != static_cast<size_t>(image.width) * image.height * 3 ||
+        input_h_ <= 0 || input_w_ <= 0 || input_c_ != 3) {
+      return false;
+    }
+    const float side = static_cast<float>(std::min(image.width, image.height));
+    if (side <= 1.0f) {
+      return false;
+    }
+    const float x0 = (static_cast<float>(image.width) - side) * 0.5f;
+    const float y0 = (static_cast<float>(image.height) - side) * 0.5f;
+    out_nchw->assign(static_cast<size_t>(input_c_) * input_h_ * input_w_, 0.0f);
+    for (int oy = 0; oy < input_h_; ++oy) {
+      for (int ox = 0; ox < input_w_; ++ox) {
+        const float sx = x0 + (static_cast<float>(ox) + 0.5f) * side / input_w_;
+        const float sy = y0 + (static_cast<float>(oy) + 0.5f) * side / input_h_;
+        float bgr[3] = {0.0f, 0.0f, 0.0f};
+        sample_source_bilinear(image, sx, sy, bgr);
+        for (int c = 0; c < input_c_; ++c) {
+          const float normalized = (bgr[c] / 255.0f - 0.5f) / 0.5f;
+          (*out_nchw)[(static_cast<size_t>(c) * input_h_ + oy) * input_w_ + ox] =
+              normalized;
+        }
+      }
+    }
+    return true;
+  }
+
+  bool extract_known_photo_feature(const std::string& path,
+                                   std::vector<float>* feature,
+                                   std::string* error,
+                                   bool aligned_photo = false) {
+    if (feature != nullptr) {
+      feature->clear();
+    }
+    try {
+      TurboJpegDecoder decoder;
+      const std::vector<uint8_t> bytes = read_bytes(path);
+      const Image image = decoder.decode_buffer(bytes.data(), bytes.size());
+      std::vector<float> input;
+      bool used_five_point = false;
+      std::string detect_error;
+      if (aligned_photo) {
+        if (!extract_aligned_photo_tensor(image, &input)) {
+          if (error != nullptr) {
+            *error = "cannot build aligned photo tensor";
+          }
+          return false;
+        }
+      } else if (cfg_.face_rec_align_mode == "five_point" && known_photo_detector_) {
+        std::array<float, kDetectionFields> det{};
+        if (known_photo_detector_(image, &det, &detect_error) &&
+            extract_five_point_photo_tensor(image, det.data(), &input)) {
+          used_five_point = true;
+        } else if (detect_error.empty()) {
+          detect_error = "cannot build five-point tensor";
+        }
+      }
+      if (input.empty() && !extract_center_photo_tensor(image, &input)) {
+        if (error != nullptr) {
+          *error = used_five_point ? "cannot build five-point tensor"
+                                      : "cannot build center crop tensor";
+        }
+        return false;
+      }
+      if (!used_five_point && cfg_.face_rec_align_mode == "five_point" && !detect_error.empty()) {
+        std::cerr << "[FaceRecCpp] known face photo fallback center crop: "
+                  << path << " reason=" << detect_error << "\n";
+      }
+      FaceRecInferTask task;
+      task.input = std::move(input);
+      task.feature.assign(static_cast<size_t>(feature_dim_), 0.0f);
+      run_single_infer_task(&task, adafaces_[0].get());
+      if (task.ret <= 0) {
+        if (error != nullptr) {
+          *error = task.error.empty() ? "AdaFace inference failed" : task.error;
+        }
+        return false;
+      }
+      normalize_feature(task.feature);
+      if (feature != nullptr) {
+        *feature = std::move(task.feature);
+      }
+      return true;
+    } catch (const std::exception& e) {
+      if (error != nullptr) {
+        *error = e.what();
+      }
+      return false;
+    }
+  }
+
+  void trim_known_identity_samples(KnownFaceIdentity* id) const {
+    if (id == nullptr || id->features.size() <= 2) {
+      return;
+    }
+    const size_t max_rows =
+        static_cast<size_t>(std::max(0, cfg_.known_face_feature_max_samples)) + 2;
+    if (id->features.size() <= max_rows) {
+      return;
+    }
+    const size_t remove_count = id->features.size() - max_rows;
+    id->features.erase(id->features.begin() + 2,
+                       id->features.begin() + 2 + static_cast<std::ptrdiff_t>(remove_count));
+  }
+
+  void save_known_identity(const KnownFaceIdentity& id) const {
+    if (!cfg_.known_face_feature_library || id.name.empty() || id.features.empty()) {
+      return;
+    }
+    if (!ensure_dir_exists(cfg_.known_face_feature_dir)) {
+      std::cerr << "[FaceRecCpp] cannot create known feature dir: "
+                << cfg_.known_face_feature_dir << "\n";
+      return;
+    }
+    const std::string npy_path = join_path(cfg_.known_face_feature_dir, id.name + ".npy");
+    write_npy_float32_2d(npy_path, id.features, feature_dim_);
+    const std::string meta_path = join_path(cfg_.known_face_feature_dir, id.name + ".json");
+    std::ofstream meta(meta_path.c_str(), std::ios::out | std::ios::trunc);
+    if (meta) {
+      meta << "{\n"
+           << "  \"name\": \"" << json_escape(id.name) << "\",\n"
+           << "  \"layout\": \"image_primary_pose_v1\",\n"
+           << "  \"image_index\": 0,\n"
+           << "  \"primary_index\": 1,\n"
+           << "  \"pose_start_index\": 2,\n"
+           << "  \"max_pose_samples\": " << cfg_.known_face_feature_max_samples << ",\n"
+           << "  \"primary_ema_alpha\": "
+           << std::fixed << std::setprecision(3)
+           << cfg_.known_face_feature_primary_ema_alpha << "\n"
+           << "}\n";
+    }
+  }
+
+  void load_known_face_library(const std::string& dir) {
+    if (dir.empty()) {
+      return;
+    }
+    int loaded = 0;
+    int photo_features = 0;
+    int aligned_features = 0;
+    int persisted = 0;
+    for (const KnownFacePhotoEntry& entry : collect_known_face_photo_entries(dir)) {
+      KnownFaceIdentity id;
+      id.name = entry.name;
+      if (id.name.empty()) {
+        continue;
+      }
+
+      if (cfg_.known_face_feature_library) {
+        const std::string feature_path =
+            join_path(cfg_.known_face_feature_dir, id.name + ".npy");
+        std::vector<std::vector<float>> rows;
+        std::string error;
+        if (file_exists(feature_path) &&
+            parse_npy_float32(feature_path, &rows, &error) && !rows.empty()) {
+          for (std::vector<float>& feat : rows) {
+            if (static_cast<int>(feat.size()) == feature_dim_) {
+              id.features.push_back(std::move(feat));
+            }
+          }
+          if (!id.features.empty()) {
+            persisted += 1;
+          }
+        }
+      }
+
+      std::vector<float> photo_feature;
+      std::string error;
+      if (extract_known_photo_feature(entry.path, &photo_feature, &error, entry.aligned_crop)) {
+        if (id.features.empty()) {
+          id.features.push_back(photo_feature);
+          id.features.push_back(photo_feature);
+        } else {
+          id.features[0] = photo_feature;
+          if (id.features.size() == 1) {
+            id.features.push_back(photo_feature);
+          }
+        }
+        photo_features += 1;
+        if (entry.aligned_crop) {
+          aligned_features += 1;
+        }
+      } else if (id.features.empty()) {
+        std::cerr << "[FaceRecCpp] skip known face photo " << entry.path
+                  << ": " << error << "\n";
+        continue;
+      }
+      trim_known_identity_samples(&id);
+      save_known_identity(id);
+      known_identities_.push_back(std::move(id));
+      loaded += 1;
+    }
+    if (loaded > 0) {
+      std::cerr << "[FaceRecCpp] loaded known face photo(s): " << loaded
+                << " from " << dir
+                << " photo_features=" << photo_features;
+      if (aligned_features > 0) {
+        std::cerr << " aligned=" << aligned_features;
+      }
+      if (cfg_.known_face_feature_library) {
+        std::cerr << " persisted_loaded=" << persisted
+                  << " feature_dir=" << cfg_.known_face_feature_dir;
+      }
+      std::cerr << "\n";
     }
   }
 
@@ -1968,6 +2517,439 @@ class FaceRecognitionRuntime {
     }
   }
 
+  float known_identity_score_for(const KnownFaceIdentity& id,
+                                 const std::vector<float>& feature) const {
+    float best = 0.0f;
+    for (const std::vector<float>& old : id.features) {
+      if (old.size() == feature.size()) {
+        best = std::max(best, dot(old, feature));
+      }
+    }
+    return best;
+  }
+
+  void match_known_identity(const std::vector<float>& feature,
+                            std::string* best_name,
+                            float* best_score,
+                            float* second_score) const {
+    if (best_name != nullptr) {
+      best_name->clear();
+    }
+    if (best_score != nullptr) {
+      *best_score = 0.0f;
+    }
+    if (second_score != nullptr) {
+      *second_score = 0.0f;
+    }
+    std::string best;
+    float best_val = 0.0f;
+    float second_val = 0.0f;
+    for (const KnownFaceIdentity& id : known_identities_) {
+      const float score = known_identity_score_for(id, feature);
+      if (score > best_val) {
+        second_val = best_val;
+        best_val = score;
+        best = id.name;
+      } else if (score > second_val) {
+        second_val = score;
+      }
+    }
+    if (best_name != nullptr) {
+      *best_name = best;
+    }
+    if (best_score != nullptr) {
+      *best_score = best_val;
+    }
+    if (second_score != nullptr) {
+      *second_score = second_val;
+    }
+  }
+
+  KnownFaceMatchResult match_known_identity_debug(
+      const std::vector<float>& feature) const {
+    KnownFaceMatchResult result;
+    result.loaded_count = static_cast<int>(known_identities_.size());
+    result.threshold = cfg_.face_rec_threshold;
+    result.margin = cfg_.known_face_feature_update_margin;
+    if (known_identities_.empty() || feature.empty()) {
+      result.reject_reason =
+          known_identities_.empty() ? "known_library_empty" : "known_feature_empty";
+      return result;
+    }
+    result.available = true;
+    result.candidates.reserve(known_identities_.size());
+    for (const KnownFaceIdentity& id : known_identities_) {
+      KnownFaceDebugCandidate candidate;
+      candidate.name = id.name;
+      candidate.score = known_identity_score_for(id, feature);
+      result.candidates.push_back(candidate);
+    }
+    std::sort(result.candidates.begin(), result.candidates.end(),
+              [](const KnownFaceDebugCandidate& a,
+                 const KnownFaceDebugCandidate& b) {
+                if (a.score != b.score) {
+                  return a.score > b.score;
+                }
+                return a.name < b.name;
+              });
+    if (!result.candidates.empty()) {
+      result.best_name = result.candidates[0].name;
+      result.best_score = result.candidates[0].score;
+      if (result.candidates.size() > 1) {
+        result.second_score = result.candidates[1].score;
+      }
+    }
+    const size_t max_debug_candidates = 8;
+    if (result.candidates.size() > max_debug_candidates) {
+      result.candidates.resize(max_debug_candidates);
+    }
+    if (result.best_name.empty()) {
+      result.reject_reason = "known_no_candidate";
+    } else if (result.best_score < result.threshold) {
+      result.reject_reason = "known_match_below_threshold";
+    } else if (result.best_score < result.second_score + result.margin) {
+      result.reject_reason = "known_match_margin_ambiguous";
+    } else {
+      result.pass = true;
+      result.reject_reason.clear();
+    }
+    return result;
+  }
+
+  FaceIdentity* find_identity_mutable(const std::string& name) {
+    for (FaceIdentity& id : identities_) {
+      if (id.name == name) {
+        return &id;
+      }
+    }
+    return nullptr;
+  }
+
+  const FaceIdentity* find_identity(const std::string& name) const {
+    for (const FaceIdentity& id : identities_) {
+      if (id.name == name) {
+        return &id;
+      }
+    }
+    return nullptr;
+  }
+
+  KnownFaceIdentity* find_known_identity_mutable(const std::string& name) {
+    for (KnownFaceIdentity& id : known_identities_) {
+      if (id.name == name) {
+        return &id;
+      }
+    }
+    return nullptr;
+  }
+
+  void apply_known_update_debug(const KnownFeatureUpdate& update,
+                                FaceRecognitionBinding* binding) const {
+    if (binding == nullptr) {
+      return;
+    }
+    binding->known_update_reason = update.reason;
+    binding->known_update_role = update.role;
+    binding->known_update_score = update.score;
+    binding->known_update_second_score = update.second_score;
+    binding->known_update_image_score = update.image_score;
+    binding->known_update_primary_score = update.primary_score;
+    binding->known_update_pose_score = update.pose_score;
+    binding->known_feature_updated = update.updated;
+  }
+
+  void apply_known_match_debug(const KnownFaceMatchResult& match,
+                               FaceRecognitionBinding* binding) const {
+    if (binding == nullptr) {
+      return;
+    }
+    binding->debug_has_known_face_match = true;
+    binding->debug_known_face_pass = match.pass;
+    binding->debug_known_face_loaded_count = match.loaded_count;
+    binding->debug_known_face_best_name = match.best_name;
+    binding->debug_known_face_best_score = match.best_score;
+    binding->debug_known_face_second_score = match.second_score;
+    binding->debug_known_face_threshold = match.threshold;
+    binding->debug_known_face_margin = match.margin;
+    binding->debug_known_face_reject_reason = match.reject_reason;
+    binding->debug_known_face_candidates = match.candidates;
+  }
+
+  KnownFeatureUpdate maybe_update_known_feature_library(
+      const std::string& name,
+      const std::vector<float>& feature) {
+    KnownFeatureUpdate update;
+    if (!cfg_.known_face_feature_library) {
+      update.reason = "disabled";
+      return update;
+    }
+    if (name.empty()) {
+      update.reason = "missing_name";
+      return update;
+    }
+    KnownFaceIdentity* id = find_known_identity_mutable(name);
+    if (id == nullptr || id->features.size() < 2) {
+      update.reason = "missing_known_identity";
+      return update;
+    }
+
+    std::string best_name;
+    float best_score = 0.0f;
+    float second_score = 0.0f;
+    match_known_identity(feature, &best_name, &best_score, &second_score);
+    update.score = best_score;
+    update.second_score = second_score;
+    if (best_name.empty() || best_score < cfg_.face_rec_threshold) {
+      update.reason = "known_match_below_threshold";
+      return update;
+    }
+    if (best_name != name) {
+      update.reason = "matched_other_name";
+      return update;
+    }
+    if (best_score < second_score + cfg_.known_face_feature_update_margin) {
+      update.reason = "ambiguous_margin";
+      return update;
+    }
+
+    const std::vector<float>& image_feature = id->features[0];
+    std::vector<float>& primary_feature = id->features[1];
+    update.image_score =
+        image_feature.size() == feature.size() ? dot(image_feature, feature) : 0.0f;
+    update.primary_score =
+        primary_feature.size() == feature.size() ? dot(primary_feature, feature) : 0.0f;
+    bool has_pose = false;
+    float best_pose = 0.0f;
+    for (size_t i = 2; i < id->features.size(); ++i) {
+      if (id->features[i].size() != feature.size()) {
+        continue;
+      }
+      best_pose = std::max(best_pose, dot(id->features[i], feature));
+      has_pose = true;
+    }
+    update.pose_score = has_pose ? best_pose : 0.0f;
+    float best_existing = std::max(update.image_score, update.primary_score);
+    if (has_pose) {
+      best_existing = std::max(best_existing, best_pose);
+    }
+    const float duplicate_threshold = 1.0f - cfg_.face_rec_min_sample_diversity;
+
+    if (update.image_score >= cfg_.known_face_feature_update_threshold) {
+      update.role = "primary";
+      if (update.primary_score >= duplicate_threshold) {
+        update.reason = "primary_too_similar";
+        return update;
+      }
+      const float alpha = cfg_.known_face_feature_primary_ema_alpha;
+      const float keep = 1.0f - alpha;
+      for (size_t i = 0; i < primary_feature.size() && i < feature.size(); ++i) {
+        primary_feature[i] = keep * primary_feature[i] + alpha * feature[i];
+      }
+      normalize_feature(primary_feature);
+      save_known_identity(*id);
+      update.reason = "primary_ema_updated";
+      update.updated = true;
+      return update;
+    }
+
+    update.role = "pose";
+    if (update.image_score < cfg_.known_face_feature_pose_threshold) {
+      update.reason = "low_image_similarity";
+      return update;
+    }
+    if (best_existing >= duplicate_threshold) {
+      update.reason = "pose_too_similar";
+      return update;
+    }
+    id->features.push_back(feature);
+    trim_known_identity_samples(id);
+    save_known_identity(*id);
+    update.reason = "pose_sample_updated";
+    update.updated = true;
+    return update;
+  }
+
+  void apply_known_face_label(const std::string& face_id,
+                              const std::vector<float>& feature,
+                              FaceRecognitionBinding* binding) {
+    if (binding == nullptr || face_id.empty()) {
+      return;
+    }
+    const KnownFaceMatchResult direct_match = match_known_identity_debug(feature);
+    apply_known_match_debug(direct_match, binding);
+    if (known_identities_.empty()) {
+      return;
+    }
+    KnownFaceLabel& direct_label = known_labels_by_face_id_[face_id];
+    if (direct_match.pass && !direct_match.best_name.empty()) {
+      if (direct_label.pending_name == direct_match.best_name) {
+        direct_label.pending_hits += 1;
+        direct_label.pending_score =
+            std::max(direct_label.pending_score, direct_match.best_score);
+      } else {
+        direct_label.pending_name = direct_match.best_name;
+        direct_label.pending_hits = 1;
+        direct_label.pending_score = direct_match.best_score;
+      }
+      direct_label.pending_second_score = direct_match.second_score;
+
+      if (direct_label.pending_hits >= 2) {
+        if (!direct_label.name.empty() &&
+            direct_label.name != direct_match.best_name &&
+            direct_match.best_score < direct_label.score + cfg_.known_face_feature_update_margin) {
+          binding->known_matched = true;
+          binding->known_name = direct_label.name;
+          binding->known_score = direct_label.score;
+          binding->known_second_score = direct_label.second_score;
+          KnownFeatureUpdate update;
+          update.reason = "known_bind_keep_existing_margin";
+          update.score = direct_match.best_score;
+          update.second_score = direct_match.second_score;
+          apply_known_update_debug(update, binding);
+          return;
+        }
+
+        direct_label.name = direct_match.best_name;
+        direct_label.score = std::max(direct_label.score, direct_match.best_score);
+        direct_label.second_score = direct_match.second_score;
+        direct_label.hits = std::max(direct_label.hits, direct_label.pending_hits);
+
+        binding->known_matched = true;
+        binding->known_name = direct_label.name;
+        binding->known_score = direct_label.score;
+        binding->known_second_score = direct_label.second_score;
+        KnownFeatureUpdate update =
+            maybe_update_known_feature_library(direct_label.name, feature);
+        if (!update.updated) {
+          update.reason = "known_bind_consecutive_selected";
+          update.score = direct_match.best_score;
+          update.second_score = direct_match.second_score;
+        }
+        apply_known_update_debug(update, binding);
+        return;
+      }
+    } else {
+      direct_label.pending_name.clear();
+      direct_label.pending_score = 0.0f;
+      direct_label.pending_second_score = 0.0f;
+      direct_label.pending_hits = 0;
+    }
+
+    std::vector<const std::vector<float>*> vote_features;
+    const FaceIdentity* dynamic_id = find_identity(face_id);
+    if (dynamic_id != nullptr && dynamic_id->dynamic) {
+      for (const std::vector<float>& old : dynamic_id->features) {
+        if (old.size() == feature.size()) {
+          vote_features.push_back(&old);
+        }
+      }
+    }
+    if (!feature.empty()) {
+      vote_features.push_back(&feature);
+    }
+    if (vote_features.empty()) {
+      return;
+    }
+
+    struct Vote {
+      int hits = 0;
+      float best = 0.0f;
+      float second = 0.0f;
+    };
+    std::map<std::string, Vote> votes;
+    for (const std::vector<float>* feat : vote_features) {
+      if (feat == nullptr) {
+        continue;
+      }
+      std::string best_name;
+      float best_score = 0.0f;
+      float second_score = 0.0f;
+      match_known_identity(*feat, &best_name, &best_score, &second_score);
+      if (best_name.empty() ||
+          best_score < cfg_.face_rec_threshold ||
+          best_score < second_score + cfg_.known_face_feature_update_margin) {
+        continue;
+      }
+      Vote& vote = votes[best_name];
+      vote.hits += 1;
+      if (best_score > vote.best) {
+        vote.best = best_score;
+        vote.second = second_score;
+      }
+    }
+    if (votes.empty()) {
+      KnownFeatureUpdate update;
+      update.reason = "known_bind_no_votes";
+      apply_known_update_debug(update, binding);
+      return;
+    }
+
+    std::string best_name;
+    Vote best_vote;
+    for (const auto& item : votes) {
+      if (best_name.empty() ||
+          item.second.hits > best_vote.hits ||
+          (item.second.hits == best_vote.hits && item.second.best > best_vote.best)) {
+        best_name = item.first;
+        best_vote = item.second;
+      }
+    }
+    const int min_hits = vote_features.size() >= 2 ? 2 : 1;
+    if (best_vote.hits < min_hits) {
+      KnownFeatureUpdate update;
+      update.reason = "known_bind_insufficient_votes";
+      update.score = best_vote.best;
+      update.second_score = best_vote.second;
+      apply_known_update_debug(update, binding);
+      return;
+    }
+    if (vote_features.size() < 2 &&
+        best_vote.best < cfg_.face_rec_threshold + 0.10f) {
+      KnownFeatureUpdate update;
+      update.reason = "known_bind_low_single_feature_score";
+      update.score = best_vote.best;
+      update.second_score = best_vote.second;
+      apply_known_update_debug(update, binding);
+      return;
+    }
+
+    auto label_it = known_labels_by_face_id_.find(face_id);
+    if (label_it != known_labels_by_face_id_.end()) {
+      const KnownFaceLabel& old = label_it->second;
+      if (old.name == best_name) {
+        if (best_vote.best > old.score || best_vote.hits > old.hits) {
+          label_it->second.score = best_vote.best;
+          label_it->second.second_score = best_vote.second;
+          label_it->second.hits = best_vote.hits;
+        }
+      } else if (best_vote.hits < old.hits &&
+                 best_vote.best < old.score + cfg_.known_face_feature_update_margin) {
+        best_name = old.name;
+        best_vote.best = old.score;
+        best_vote.second = old.second_score;
+        best_vote.hits = old.hits;
+      } else if (best_vote.best < old.score + cfg_.known_face_feature_update_margin) {
+        best_name = old.name;
+        best_vote.best = old.score;
+        best_vote.second = old.second_score;
+        best_vote.hits = old.hits;
+      } else {
+        label_it->second =
+            KnownFaceLabel{best_name, best_vote.best, best_vote.second, best_vote.hits};
+      }
+    } else {
+      known_labels_by_face_id_[face_id] =
+          KnownFaceLabel{best_name, best_vote.best, best_vote.second, best_vote.hits};
+    }
+
+    binding->known_matched = true;
+    binding->known_name = best_name;
+    binding->known_score = best_vote.best;
+    binding->known_second_score = best_vote.second;
+    KnownFeatureUpdate update = maybe_update_known_feature_library(best_name, feature);
+    apply_known_update_debug(update, binding);
+  }
+
   static bool parse_dynamic_face_number(const std::string& name, int* out) {
     if (out != nullptr) {
       *out = 0;
@@ -2257,6 +3239,16 @@ class FaceRecognitionRuntime {
         item.second.dynamic = is_dynamic_identity(to_name);
       }
     }
+    auto label_it = known_labels_by_face_id_.find(from_name);
+    if (label_it != known_labels_by_face_id_.end()) {
+      auto target_label_it = known_labels_by_face_id_.find(to_name);
+      if (target_label_it == known_labels_by_face_id_.end() ||
+          label_it->second.score > target_label_it->second.score ||
+          label_it->second.hits > target_label_it->second.hits) {
+        known_labels_by_face_id_[to_name] = label_it->second;
+      }
+      known_labels_by_face_id_.erase(label_it);
+    }
     const std::string old_path = join_path(cfg_.face_rec_dynamic_library_dir, from_name + ".npy");
     unlink(old_path.c_str());
     return true;
@@ -2531,6 +3523,9 @@ class FaceRecognitionRuntime {
   const MapMeta& meta_;
   const std::vector<float>* base_map_x_ = nullptr;
   const std::vector<float>* base_map_y_ = nullptr;
+  std::function<bool(const Image&,
+                     std::array<float, kDetectionFields>*,
+                     std::string*)> known_photo_detector_;
   std::array<AdaFaceHandle, 3> adafaces_;
   int adaface_runner_count_ = 0;
   int input_h_ = 0;
@@ -2539,6 +3534,8 @@ class FaceRecognitionRuntime {
   int feature_dim_ = 0;
   int next_dynamic_id_ = 1;
   std::vector<FaceIdentity> identities_;
+  std::vector<KnownFaceIdentity> known_identities_;
+  std::map<std::string, KnownFaceLabel> known_labels_by_face_id_;
   std::map<int, FaceRecognitionBinding> bindings_;
   std::map<int, FaceRecognitionBinding> current_;
   std::map<int, int> last_attempt_frame_;

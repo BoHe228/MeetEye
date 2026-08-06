@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>已知人脸库模式行为说明</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #64748b;
+      --line: #d6dee9;
+      --blue: #2563eb;
+      --blue-soft: #eaf1ff;
+      --green: #15803d;
+      --green-soft: #e9f8ef;
+      --amber: #b7791f;
+      --amber-soft: #fff6df;
+      --red: #c2410c;
+      --red-soft: #fff1e8;
+      --purple: #6d28d9;
+      --purple-soft: #f2eaff;
+      --shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.5;
+    }
+
+    header {
+      padding: 20px 28px 16px;
+      background: #172033;
+      color: #fff;
+    }
+
+    h1 {
+      margin: 0 0 7px;
+      font-size: 23px;
+      letter-spacing: 0;
+    }
+
+    header p {
+      margin: 0;
+      color: #cbd5e1;
+      font-size: 14px;
+      max-width: 1180px;
+    }
+
+    main {
+      padding: 18px 28px 32px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .mode-button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 9px 13px;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.05);
+    }
+
+    .mode-button.active {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #fff;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(560px, 1fr) 400px;
+      gap: 16px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    .panel h3 {
+      margin: 16px 0 8px;
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .metric {
+      background: #fbfdff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 14px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .flow {
+      display: grid;
+      gap: 10px;
+      overflow-x: auto;
+    }
+
+    .flow-inner {
+      min-width: 900px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .step {
+      border: 2px solid var(--blue);
+      border-radius: 8px;
+      background: var(--blue-soft);
+      padding: 11px 13px;
+    }
+
+    .step strong {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 15px;
+    }
+
+    .step span {
+      display: block;
+      color: #475569;
+      font-size: 13px;
+    }
+
+    .step.green {
+      border-color: var(--green);
+      background: var(--green-soft);
+    }
+
+    .step.amber {
+      border-color: var(--amber);
+      background: var(--amber-soft);
+    }
+
+    .step.red {
+      border-color: var(--red);
+      background: var(--red-soft);
+    }
+
+    .step.purple {
+      border-color: var(--purple);
+      background: var(--purple-soft);
+    }
+
+    .branch {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }
+
+    .lane {
+      border-left: 4px solid var(--line);
+      padding-left: 12px;
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+
+    .lane-title {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .arrow {
+      text-align: center;
+      color: var(--muted);
+      font-size: 20px;
+      font-weight: 900;
+      line-height: 1;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 13px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef3f9;
+      color: #334155;
+      font-weight: 800;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    pre {
+      margin: 8px 0 0;
+      white-space: pre-wrap;
+      overflow: auto;
+      background: #101827;
+      color: #e5e7eb;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    code {
+      background: #eef3f9;
+      border-radius: 5px;
+      padding: 1px 5px;
+      font-size: 12px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: #334155;
+    }
+
+    .tag.good {
+      color: var(--green);
+      background: var(--green-soft);
+      border-color: #b7e2c4;
+    }
+
+    .tag.warn {
+      color: var(--amber);
+      background: var(--amber-soft);
+      border-color: #eed28f;
+    }
+
+    .tag.stop {
+      color: var(--red);
+      background: var(--red-soft);
+      border-color: #f2c3ac;
+    }
+
+    .mode-view {
+      display: none;
+    }
+
+    .mode-view.active {
+      display: grid;
+      gap: 16px;
+    }
+
+    .note {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .check-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 8px;
+    }
+
+    .check-list li {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+      padding: 9px 10px;
+      font-size: 13px;
+    }
+
+    @media (max-width: 1020px) {
+      .grid,
+      .summary {
+        grid-template-columns: 1fr;
+      }
+
+      main {
+        padding: 16px;
+      }
+
+      header {
+        padding: 18px 16px 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>已知人脸库：不开持久库 vs 开启持久库</h1>
+    <p>这页说明实时人脸识别在两种模式下如何加载图片、如何绑定姓名、是否写回特征库，以及在 debug JSON 中应该看哪些字段。</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="summary">
+        <div class="metric">
+          <strong>共同输入</strong>
+          <span>实时检测到的人脸 crop 经五点对齐后送入 AdaFace，得到 512 维特征。</span>
+        </div>
+        <div class="metric">
+          <strong>共同绑定逻辑</strong>
+          <span>先尝试连续 2 次实时命中已知姓名，再用动态 FaceID 内部样本投票兜底。</span>
+        </div>
+        <div class="metric">
+          <strong>关键差异</strong>
+          <span>不开持久库只读照片特征；开启持久库会读写同名 .npy 特征。</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="toolbar" aria-label="模式选择">
+      <button class="mode-button active" data-mode="readonly">不开持久库</button>
+      <button class="mode-button" data-mode="persistent">开启持久库</button>
+      <button class="mode-button" data-mode="compare">对照表</button>
+    </section>
+
+    <section id="readonly" class="mode-view active">
+      <div class="grid">
+        <article class="panel">
+          <h2>模式 A：只使用图片即时特征</h2>
+          <p class="note">适合验证固定照片库、对比不同来源照片的识别差异、避免运行过程污染人脸库。</p>
+          <div class="flow">
+            <div class="flow-inner">
+              <div class="step"><strong>1. 启动加载照片</strong><span>从 <code>mytest/face_rec/face_photos</code> 或板端 <code>face_photos</code> 读取已知人脸图片。</span></div>
+              <div class="arrow">↓</div>
+              <div class="step"><strong>2. 图片提取特征</strong><span>普通照片会检测/五点对齐；<code>*_aligned.jpg</code> 直接作为已对齐人脸 resize 提特征。</span></div>
+              <div class="arrow">↓</div>
+              <div class="step amber"><strong>3. 特征只保存在内存</strong><span>每次程序启动都会重新从图片提特征，不读取也不更新持久 .npy。</span></div>
+              <div class="arrow">↓</div>
+              <div class="branch">
+                <div class="lane">
+                  <div class="lane-title">快速绑定路径</div>
+                  <div class="step green"><strong>连续 2 次实时命中</strong><span>top1 同名，score ≥ 0.55，margin ≥ 0.08。</span></div>
+                  <div class="step green"><strong>输出姓名</strong><span>debug: <code>known_bind_consecutive_selected</code></span></div>
+                </div>
+                <div class="lane">
+                  <div class="lane-title">兜底绑定路径</div>
+                  <div class="step purple"><strong>动态 FaceID 样本投票</strong><span>例如 face1 内部已有多张样本，都与已知人脸库比对。</span></div>
+                  <div class="step purple"><strong>输出姓名</strong><span>debug: <code>known_bind_selected</code> 或 <code>known_bind_keep_same_name</code></span></div>
+                </div>
+              </div>
+              <div class="arrow">↓</div>
+              <div class="step red"><strong>不会写回人脸库</strong><span>debug: <code>known_update_reason=disabled</code>，<code>known_update_updated=false</code>。</span></div>
+            </div>
+          </div>
+        </article>
+
+        <aside class="panel">
+          <h2>推荐命令</h2>
+          <h3>服务器端广角</h3>
+          <pre>python mytest/main_GPU_face_rc_webui.py \
+  --webui \
+  --projection-mode wide-angle \
+  --wide-model-path ./yolo_model/yolov8n-face.pt \
+  --wide-yolo-imgsz 864 \
+  --use-face-rec \
+  --save-json \
+  --json-output yolo_pose_output/wide_angle_face_debug.jsonl</pre>
+
+          <h3>服务器端鱼眼</h3>
+          <pre>python mytest/main_GPU_face_rc_webui.py \
+  --webui \
+  --projection-mode fisheye-panorama \
+  --model-path ./yolo_model/yolov8n-face.engine \
+  --yolo-imgsz 864 \
+  --no-use-osnet \
+  --use-face-rec \
+  --face-rec-align-mode five-point \
+  --known-face-dir mytest/face_rec/face_photos \
+  --save-json \
+  --json-output yolo_pose_output/fisheye_face_debug.jsonl</pre>
+
+          <h3>观察字段</h3>
+          <ul class="check-list">
+            <li><span class="tag good">姓名绑定</span> <code>name</code>、<code>known_matched</code>、<code>known_bind_reason</code></li>
+            <li><span class="tag warn">相似度</span> <code>known_bind_selected_score</code>、<code>known_bind_scores</code></li>
+            <li><span class="tag stop">不写回</span> <code>known_update_reason=disabled</code></li>
+          </ul>
+        </aside>
+      </div>
+    </section>
+
+    <section id="persistent" class="mode-view">
+      <div class="grid">
+        <article class="panel">
+          <h2>模式 B：开启持久特征库</h2>
+          <p class="note">适合让同一个姓名逐步积累更贴近当前摄像头的主特征和姿态样本。需要谨慎使用，防止错误样本写回。</p>
+          <div class="flow">
+            <div class="flow-inner">
+              <div class="step"><strong>1. 启动加载照片和持久特征</strong><span>照片仍作为基础来源；同时读取同名 <code>.npy</code> 和 <code>.json</code> 元数据。</span></div>
+              <div class="arrow">↓</div>
+              <div class="branch">
+                <div class="lane">
+                  <div class="lane-title">服务器端路径</div>
+                  <div class="step"><strong>默认特征目录</strong><span><code>mytest/face_rec/face_photo_features</code></span></div>
+                </div>
+                <div class="lane">
+                  <div class="lane-title">板端 C++ 路径</div>
+                  <div class="step"><strong>默认特征目录</strong><span><code>face_photos/face_photo_features_cpp</code></span></div>
+                </div>
+              </div>
+              <div class="arrow">↓</div>
+              <div class="step amber"><strong>2. 仍先完成姓名绑定</strong><span>连续 2 次实时命中或动态 FaceID 样本投票确认后，才能更新对应姓名。</span></div>
+              <div class="arrow">↓</div>
+              <div class="branch">
+                <div class="lane">
+                  <div class="lane-title">主特征更新</div>
+                  <div class="step green"><strong>score ≥ 0.65</strong><span>在图片特征基础上做主特征 EMA，debug: <code>primary_ema_updated</code>。</span></div>
+                </div>
+                <div class="lane">
+                  <div class="lane-title">姿态样本更新</div>
+                  <div class="step purple"><strong>score ≥ 0.60</strong><span>可追加多姿态样本；过于重复会跳过，避免库里全是相同角度。</span></div>
+                </div>
+              </div>
+              <div class="arrow">↓</div>
+              <div class="step green"><strong>3. 只更新同名特征，不改照片</strong><span>例如识别为某个已知姓名，只更新同名 <code>.npy</code>，不会改原始照片，也不会写到其他姓名下。</span></div>
+            </div>
+          </div>
+        </article>
+
+        <aside class="panel">
+          <h2>推荐命令</h2>
+          <h3>服务器端广角</h3>
+          <pre>python mytest/main_GPU_face_rc_webui.py \
+  --webui \
+  --projection-mode wide-angle \
+  --wide-model-path ./yolo_model/yolov8n-face.pt \
+  --wide-yolo-imgsz 864 \
+  --use-face-rec \
+  --save-json \
+  --known-face-feature-library \
+  --json-output yolo_pose_output/wide_angle_face_library_debug.jsonl</pre>
+
+          <h3>服务器端鱼眼</h3>
+          <pre>python mytest/main_GPU_face_rc_webui.py \
+  --webui \
+  --projection-mode fisheye-panorama \
+  --model-path ./yolo_model/yolov8n-face.engine \
+  --yolo-imgsz 864 \
+  --no-use-osnet \
+  --use-face-rec \
+  --face-rec-align-mode five-point \
+  --known-face-dir mytest/face_rec/face_photos \
+  --known-face-feature-library \
+  --save-json \
+  --json-output yolo_pose_output/fisheye_face_library_debug.jsonl</pre>
+
+          <h3>观察字段</h3>
+          <ul class="check-list">
+            <li><span class="tag good">写回成功</span> <code>known_update_updated=true</code></li>
+            <li><span class="tag good">主特征</span> <code>known_update_reason=primary_ema_updated</code></li>
+            <li><span class="tag good">姿态样本</span> <code>known_update_reason=pose_sample_updated</code></li>
+            <li><span class="tag warn">跳过原因</span> <code>low_similarity</code>、<code>known_match_below_threshold</code>、<code>known_match_ambiguous</code></li>
+          </ul>
+        </aside>
+      </div>
+    </section>
+
+    <section id="compare" class="mode-view">
+      <article class="panel">
+        <h2>两种模式对照</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>不开 <code>--known-face-feature-library</code></th>
+              <th>开启 <code>--known-face-feature-library</code></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>启动加载</td>
+              <td>从照片目录提取本次内存特征。</td>
+              <td>加载照片，同时读取或维护持久 <code>.npy</code> 特征。</td>
+            </tr>
+            <tr>
+              <td>已对齐照片</td>
+              <td><code>*_aligned.jpg</code> 直接 resize 提特征，不二次检测。</td>
+              <td>同左，并可作为该姓名的图片基础特征。</td>
+            </tr>
+            <tr>
+              <td>姓名绑定</td>
+              <td>连续 2 次实时命中优先；动态样本投票兜底。</td>
+              <td>同左，绑定成功后才允许考虑写回。</td>
+            </tr>
+            <tr>
+              <td>写回行为</td>
+              <td>完全不写回，debug 通常为 <code>disabled</code>。</td>
+              <td>满足阈值后更新同名 <code>.npy</code>，不改原始照片。</td>
+            </tr>
+            <tr>
+              <td>适用场景</td>
+              <td>调试、复现实验、比较不同采集来源照片、避免污染库。</td>
+              <td>长期运行、希望人脸库适应当前摄像头姿态和画质。</td>
+            </tr>
+            <tr>
+              <td>主要风险</td>
+              <td>每次启动重新提特征，不能积累当前场景特征。</td>
+              <td>如果错误绑定后写回，可能污染该姓名的持久特征。</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="panel">
+        <h2>建议使用原则</h2>
+        <ul class="check-list">
+          <li>做识别逻辑调试时，先不开持久库，确认 <code>name</code> 和 <code>known_bind_reason</code> 符合预期。</li>
+          <li>确认不会误认后，再打开 <code>--known-face-feature-library</code> 积累主特征和姿态样本。</li>
+          <li>鱼眼场景建议使用鱼眼链路采集的 <code>*_aligned.jpg</code> 作为独立参考，文件名仍按现场姓名或代号命名。</li>
+          <li>如果只是比较不同来源照片的差异，不要开启持久库，避免实时样本改变对比基准。</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const buttons = Array.from(document.querySelectorAll(".mode-button"));
+    const views = Array.from(document.querySelectorAll(".mode-view"));
+
+    function showMode(mode) {
+      buttons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.mode === mode);
+      });
+      views.forEach((view) => {
+        view.classList.toggle("active", view.id === mode);
+      });
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => showMode(button.dataset.mode));
+    });
+  </script>
+</body>
+</html>

@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <ifaddrs.h>
 #include <iomanip>

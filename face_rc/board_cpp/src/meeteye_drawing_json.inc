@@ -170,6 +170,7 @@ static void print_tracker_debug_json(std::ostream& os, const FrameResult& result
        << ",\"display_counter\":" << d.display_counter
        << ",\"display_max_count\":" << d.display_max_count
        << ",\"bbox_area\":" << d.bbox_area
+       << ",\"bbox_min_side\":" << d.bbox_min_side
        << ",\"replaced_bbox_area\":" << d.replaced_bbox_area
        << ",\"had_existing_binding\":" << (d.had_existing_binding ? "true" : "false")
        << ",\"reuse_spatial\":" << (d.reuse_spatial ? "true" : "false")
@@ -662,6 +663,11 @@ static void print_json_rounded_or_null(std::ostream& os, bool valid, double valu
   os << std::fixed << std::setprecision(3) << round_to(value, 1000.0);
 }
 
+struct KnownFaceDebugCandidate {
+  std::string name;
+  float score = 0.0f;
+};
+
 struct FaceRecognitionBinding {
   bool has_face = false;
   std::string face_id;
@@ -676,6 +682,18 @@ struct FaceRecognitionBinding {
   int face_check_count = 0;
   int face_bound_frame = 0;
   std::string event;
+  std::string known_name;
+  float known_score = 0.0f;
+  float known_second_score = 0.0f;
+  bool known_matched = false;
+  bool known_feature_updated = false;
+  std::string known_update_reason;
+  std::string known_update_role;
+  float known_update_score = 0.0f;
+  float known_update_second_score = 0.0f;
+  float known_update_image_score = 0.0f;
+  float known_update_primary_score = 0.0f;
+  float known_update_pose_score = 0.0f;
   bool has_debug = false;
   bool debug_rknn_ran = false;
   bool debug_strong_identity_match = false;
@@ -686,12 +704,17 @@ struct FaceRecognitionBinding {
   bool debug_pose_sample_quality_ok = false;
   bool debug_locked_pose_quality_ok = false;
   bool debug_has_pose_library_similarity = false;
+  bool debug_has_known_face_match = false;
+  bool debug_known_face_pass = false;
   int debug_reserved_owner = 0;
   int debug_nearest_public_id = 0;
   int debug_pose_sample_missing_frames = -1;
+  int debug_known_face_loaded_count = 0;
   std::string debug_reason;
   std::string debug_best_name;
   std::string debug_update_reason;
+  std::string debug_known_face_best_name;
+  std::string debug_known_face_reject_reason;
   float debug_best_score = 0.0f;
   float debug_second_score = 0.0f;
   float debug_nearest_feature_score = 0.0f;
@@ -699,6 +722,11 @@ struct FaceRecognitionBinding {
   float debug_sample_similarity = 0.0f;
   float debug_pose_library_similarity = 0.0f;
   float debug_pose_library_max_similarity = 0.0f;
+  float debug_known_face_best_score = 0.0f;
+  float debug_known_face_second_score = 0.0f;
+  float debug_known_face_threshold = 0.0f;
+  float debug_known_face_margin = 0.0f;
+  std::vector<KnownFaceDebugCandidate> debug_known_face_candidates;
 };
 
 struct FaceIdentity {
@@ -738,6 +766,8 @@ struct TargetInfo {
   bool has_distance = false;
   bool has_face_recognition = false;
   bool has_face_recognition_debug = false;
+  bool has_known_face = false;
+  bool face_recognition_known_updated = false;
   bool face_recognition_dynamic = false;
   bool face_recognition_quality = false;
   bool face_recognition_updated = false;
@@ -751,21 +781,36 @@ struct TargetInfo {
   bool face_recognition_debug_pose_sample_quality_ok = false;
   bool face_recognition_debug_locked_pose_quality_ok = false;
   bool face_recognition_debug_has_pose_library_similarity = false;
+  bool face_recognition_debug_has_known_face_match = false;
+  bool face_recognition_debug_known_face_pass = false;
   int face_recognition_debug_reserved_owner = 0;
   int face_recognition_debug_nearest_public_id = 0;
   int face_recognition_debug_pose_sample_missing_frames = -1;
+  int face_recognition_debug_known_face_loaded_count = 0;
   double azimuth = 0.0;
   double elevation = 0.0;
   double face_yaw = 0.0;
   double eye_pixel_dist = 0.0;
   double distance = 0.0;
   std::string face_id;
+  std::string known_name;
   std::string face_recognition_event;
   std::string face_recognition_debug_reason;
   std::string face_recognition_debug_best_name;
   std::string face_recognition_debug_update_reason;
+  std::string face_recognition_debug_known_face_best_name;
+  std::string face_recognition_debug_known_face_reject_reason;
+  std::string face_recognition_known_update_reason;
+  std::string face_recognition_known_update_role;
   double face_recognition_score = 0.0;
   double face_recognition_second_score = 0.0;
+  double face_recognition_known_score = 0.0;
+  double face_recognition_known_second_score = 0.0;
+  double face_recognition_known_update_score = 0.0;
+  double face_recognition_known_update_second_score = 0.0;
+  double face_recognition_known_update_image_score = 0.0;
+  double face_recognition_known_update_primary_score = 0.0;
+  double face_recognition_known_update_pose_score = 0.0;
   double face_recognition_debug_best_score = 0.0;
   double face_recognition_debug_second_score = 0.0;
   double face_recognition_debug_nearest_feature_score = 0.0;
@@ -773,6 +818,11 @@ struct TargetInfo {
   double face_recognition_debug_sample_similarity = 0.0;
   double face_recognition_debug_pose_library_similarity = 0.0;
   double face_recognition_debug_pose_library_max_similarity = 0.0;
+  double face_recognition_debug_known_face_best_score = 0.0;
+  double face_recognition_debug_known_face_second_score = 0.0;
+  double face_recognition_debug_known_face_threshold = 0.0;
+  double face_recognition_debug_known_face_margin = 0.0;
+  std::vector<KnownFaceDebugCandidate> face_recognition_debug_known_face_candidates;
 };
 
 static void write_face_recognition_debug_json(std::ostream& os, const TargetInfo& target) {
@@ -841,13 +891,47 @@ static void write_face_recognition_debug_json(std::ostream& os, const TargetInfo
      << (target.face_recognition_debug_pose_sample_quality_ok ? "true" : "false")
      << ",\"locked_pose_quality_ok\":"
      << (target.face_recognition_debug_locked_pose_quality_ok ? "true" : "false");
+  if (target.face_recognition_debug_has_known_face_match) {
+    os << ",\"known_face\":{"
+       << "\"loaded_count\":" << target.face_recognition_debug_known_face_loaded_count
+       << ",\"best_name\":";
+    if (target.face_recognition_debug_known_face_best_name.empty()) {
+      os << "null";
+    } else {
+      os << "\"" << json_escape(target.face_recognition_debug_known_face_best_name) << "\"";
+    }
+    os << ",\"best_score\":" << std::fixed << std::setprecision(3)
+       << target.face_recognition_debug_known_face_best_score
+       << ",\"second_score\":" << target.face_recognition_debug_known_face_second_score
+       << ",\"threshold\":" << target.face_recognition_debug_known_face_threshold
+       << ",\"margin\":" << target.face_recognition_debug_known_face_margin
+       << ",\"pass\":"
+       << (target.face_recognition_debug_known_face_pass ? "true" : "false")
+       << ",\"reject_reason\":";
+    if (target.face_recognition_debug_known_face_reject_reason.empty()) {
+      os << "null";
+    } else {
+      os << "\"" << json_escape(target.face_recognition_debug_known_face_reject_reason) << "\"";
+    }
+    os << ",\"candidates\":[";
+    for (size_t i = 0; i < target.face_recognition_debug_known_face_candidates.size(); ++i) {
+      const KnownFaceDebugCandidate& candidate =
+          target.face_recognition_debug_known_face_candidates[i];
+      if (i > 0) {
+        os << ",";
+      }
+      os << "{\"name\":\"" << json_escape(candidate.name) << "\",\"score\":"
+         << std::fixed << std::setprecision(3) << candidate.score << "}";
+    }
+    os << "]}";
+  }
   os << "}";
 }
 
 static void write_face_recognition_json(std::ostream& os, const TargetInfo& target) {
   os << "\"face_recognition\":{";
   if (!target.has_face_recognition || target.face_id.empty()) {
-    os << "\"matched\":false,\"face_id\":null,\"name\":null";
+    os << "\"matched\":false,\"face_id\":null,\"name\":null,\"known_name\":null";
     if (target.has_face_recognition_debug) {
       os << ",";
       write_face_recognition_debug_json(os, target);
@@ -855,9 +939,33 @@ static void write_face_recognition_json(std::ostream& os, const TargetInfo& targ
     os << "}";
     return;
   }
+  const std::string display_name =
+      target.has_known_face && !target.known_name.empty()
+          ? target.known_name
+          : target.face_id;
   os << "\"matched\":true"
      << ",\"face_id\":\"" << json_escape(target.face_id) << "\""
-     << ",\"name\":\"" << json_escape(target.face_id) << "\""
+     << ",\"name\":\"" << json_escape(display_name) << "\""
+     << ",\"known_name\":";
+  if (target.has_known_face && !target.known_name.empty()) {
+    os << "\"" << json_escape(target.known_name) << "\"";
+  } else {
+    os << "null";
+  }
+  os << ",\"known_score\":";
+  if (target.has_known_face) {
+    os << std::fixed << std::setprecision(3) << target.face_recognition_known_score;
+  } else {
+    os << "null";
+  }
+  os << ",\"known_second_score\":";
+  if (target.has_known_face) {
+    os << std::fixed << std::setprecision(3)
+       << target.face_recognition_known_second_score;
+  } else {
+    os << "null";
+  }
+  os
      << ",\"score\":" << std::fixed << std::setprecision(3) << target.face_recognition_score
      << ",\"second_score\":" << target.face_recognition_second_score
      << ",\"dynamic\":" << (target.face_recognition_dynamic ? "true" : "false")
@@ -865,6 +973,24 @@ static void write_face_recognition_json(std::ostream& os, const TargetInfo& targ
      << ",\"updated\":" << (target.face_recognition_updated ? "true" : "false")
      << ",\"tentative\":" << (target.face_recognition_tentative ? "true" : "false")
      << ",\"event\":\"" << json_escape(target.face_recognition_event) << "\"";
+  if (!target.face_recognition_known_update_reason.empty()) {
+    os << ",\"known_update\":{"
+       << "\"reason\":\"" << json_escape(target.face_recognition_known_update_reason) << "\""
+       << ",\"updated\":" << (target.face_recognition_known_updated ? "true" : "false")
+       << ",\"role\":";
+    if (target.face_recognition_known_update_role.empty()) {
+      os << "null";
+    } else {
+      os << "\"" << json_escape(target.face_recognition_known_update_role) << "\"";
+    }
+    os << ",\"score\":" << std::fixed << std::setprecision(3)
+       << target.face_recognition_known_update_score
+       << ",\"second_score\":" << target.face_recognition_known_update_second_score
+       << ",\"image_score\":" << target.face_recognition_known_update_image_score
+       << ",\"primary_score\":" << target.face_recognition_known_update_primary_score
+       << ",\"pose_score\":" << target.face_recognition_known_update_pose_score
+       << "}";
+  }
   if (target.has_face_recognition_debug) {
     os << ",";
     write_face_recognition_debug_json(os, target);

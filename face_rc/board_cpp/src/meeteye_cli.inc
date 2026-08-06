@@ -22,9 +22,12 @@ static void print_usage(const char* argv0) {
       << "  --no-ws-json          disable /ws/inference JSON WebSocket server\n"
       << "  --webui               enable C++ WebUI with annotated frame stream\n"
       << "  --webui-host HOST     WebUI bind host, default: 0.0.0.0\n"
-      << "  --webui-port PORT     WebUI HTTP port, default: 8080\n"
-      << "  --webui-jpeg-quality N  annotated JPEG quality, default: 80\n"
-      << "  --webui-frame-scale VALUE  downscale WebUI JPEG frame before sending, default: 1.0\n"
+	      << "  --webui-port PORT     WebUI HTTP port, default: 8080\n"
+	      << "  --webui-jpeg-quality N  annotated JPEG quality, default: 80\n"
+	      << "  --webui-frame-scale VALUE  downscale WebUI JPEG frame before sending, default: 1.0\n"
+	      << "  --webui-slot-fps VALUE  display slot crop WebSocket FPS limit, default: 10\n"
+	      << "  --webui-show-hidden-targets  draw targets without display_id on WebUI, default: on\n"
+      << "  --no-webui-show-hidden-targets  hide targets without display_id on WebUI\n"
       << "  --sector-output       emit Python-compatible sector aggregate JSON\n"
       << "  --num-sectors N       sector count for --sector-output, default: 8\n"
       << "  --target-output-limit N  max targets in non-sector JSON, default: 8; 0 means unlimited\n"
@@ -41,8 +44,10 @@ static void print_usage(const char* argv0) {
       << "  --display-id-reuse-fallback-min-frames N  legacy frame override for display_id fallback reuse\n"
       << "  --display-id-public-binding-ttl N  legacy frame override for display_id exclusive binding\n"
       << "  --display-id-max-count N  max reusable display IDs, default: 8; 0 means unlimited\n"
-      << "  --display-id-replace-confirm-frames N  consecutive frames before area replacement, default: 3\n"
-      << "  --display-id-replace-area-ratio VALUE  replace smallest displayed slot when new area is larger by ratio, default: 1.10\n"
+      << "  --display-id-replace-confirm-seconds VALUE  consecutive seconds before area replacement, default: 1\n"
+      << "  --display-id-replace-confirm-frames N  legacy frame override for area replacement confirmation\n"
+      << "  --display-id-replace-area-ratio VALUE  replace smallest displayed slot when new area is larger by ratio, default: 1.50\n"
+      << "  --display-id-min-box-size VALUE  min bbox short side allowed to occupy display slot, default: 40\n"
       << "  --display-id-reuse-center-thresh VALUE  spatial display_id center gate, default: 2.0\n"
       << "  --display-id-reuse-size-ratio VALUE  spatial display_id size gate, default: 0.4\n"
       << "  --display-id-reuse-ambiguity-margin VALUE  spatial display_id unique-best gate, default: 0.25\n"
@@ -51,11 +56,20 @@ static void print_usage(const char* argv0) {
       << "  --face-rec-model PATH AdaFace RKNN model path, default: models/adaface_ir18_112.rknn\n"
       << "  --face-rec-model-preset NAME  AdaFace model preset: ir18_webface4m or ir50_webface4m\n"
       << "  --face-library-dir DIR  static .npy feature library, default: face_library\n"
+      << "  --known-face-dir DIR  known face JPEG photo dir, default: face_photos\n"
+      << "  --known-face-feature-library  persist/update known face features, default: off\n"
+      << "  --no-known-face-feature-library  match known photos only, no feature writeback\n"
+      << "  --known-face-feature-dir DIR  known feature dir, default: face_photos/face_photo_features_cpp\n"
+      << "  --known-face-feature-update-threshold VALUE  image-feature gate for primary EMA, default: 0.65\n"
+      << "  --known-face-feature-pose-threshold VALUE  image-feature gate for pose sample, default: 0.60\n"
+      << "  --known-face-feature-update-margin VALUE  top1-top2 known update margin, default: 0.08\n"
+      << "  --known-face-feature-primary-ema-alpha VALUE  known primary EMA alpha, default: 0.1\n"
+      << "  --known-face-feature-max-samples N  max known pose samples; plus image+primary rows, default: 12\n"
       << "  --face-rec-dynamic-library  enroll unknown faces as runtime face1/face2 ids\n"
       << "  --dynamic-face-library-dir DIR  output dir for C++ dynamic .npy features\n"
       << "  --face-rec-debug-crops  save actual 112x112 AdaFace input crops, default: off\n"
       << "  --face-rec-debug-crop-dir DIR  output dir for debug crops, default: board_output/face_rec_crops\n"
-      << "  --face-rec-align-mode MODE  AdaFace crop alignment: eye or five-point, default: eye\n"
+      << "  --face-rec-align-mode MODE  AdaFace crop alignment: eye or five-point, default: five-point\n"
       << "  --face-rec-five-point-scale VALUE  enlarge five-point aligned crop, default: 1.20\n"
       << "  --face-rec-min-box-size VALUE  trigger only when min bbox side >= VALUE, default: 100\n"
       << "  --face-rec-min-keypoint-conf VALUE  eye/nose keypoint confidence gate, default: 0.6\n"
@@ -296,10 +310,16 @@ static Config parse_args(int argc, char** argv) {
       cfg.webui_host = need_value(arg);
     } else if (arg == "--webui-port" || arg == "--port") {
       cfg.webui_port = std::stoi(need_value(arg));
-    } else if (arg == "--webui-jpeg-quality") {
-      cfg.webui_jpeg_quality = std::stoi(need_value(arg));
-    } else if (arg == "--webui-frame-scale") {
-      cfg.webui_frame_scale = std::stod(need_value(arg));
+	    } else if (arg == "--webui-jpeg-quality") {
+	      cfg.webui_jpeg_quality = std::stoi(need_value(arg));
+	    } else if (arg == "--webui-frame-scale") {
+	      cfg.webui_frame_scale = std::stod(need_value(arg));
+	    } else if (arg == "--webui-slot-fps") {
+	      cfg.webui_slot_fps = std::stod(need_value(arg));
+	    } else if (arg == "--webui-show-hidden-targets") {
+	      cfg.webui_show_hidden_targets = true;
+    } else if (arg == "--no-webui-show-hidden-targets") {
+      cfg.webui_show_hidden_targets = false;
     } else if (arg == "--sector-output") {
       cfg.sector_output = true;
     } else if (arg == "--num-sectors") {
@@ -335,10 +355,15 @@ static Config parse_args(int argc, char** argv) {
       cfg.display_id_public_binding_ttl = std::stoi(need_value(arg));
     } else if (arg == "--display-id-max-count") {
       cfg.display_id_max_count = std::stoi(need_value(arg));
+    } else if (arg == "--display-id-replace-confirm-seconds") {
+      cfg.display_id_replace_confirm_seconds = std::stod(need_value(arg));
+      cfg.display_id_replace_confirm_frames = -1;
     } else if (arg == "--display-id-replace-confirm-frames") {
       cfg.display_id_replace_confirm_frames = std::stoi(need_value(arg));
     } else if (arg == "--display-id-replace-area-ratio") {
       cfg.display_id_replace_area_ratio = std::stof(need_value(arg));
+    } else if (arg == "--display-id-min-box-size") {
+      cfg.display_id_min_box_size = std::stof(need_value(arg));
     } else if (arg == "--display-id-reuse-center-thresh") {
       cfg.display_id_reuse_center_thresh = std::stof(need_value(arg));
     } else if (arg == "--display-id-reuse-size-ratio") {
@@ -355,6 +380,24 @@ static Config parse_args(int argc, char** argv) {
       cfg.face_rec_model_path = face_rec_model_path_for_preset(need_value(arg));
     } else if (arg == "--face-library-dir") {
       cfg.face_rec_library_dir = need_value(arg);
+    } else if (arg == "--known-face-dir") {
+      cfg.known_face_dir = need_value(arg);
+    } else if (arg == "--known-face-feature-library") {
+      cfg.known_face_feature_library = true;
+    } else if (arg == "--no-known-face-feature-library") {
+      cfg.known_face_feature_library = false;
+    } else if (arg == "--known-face-feature-dir") {
+      cfg.known_face_feature_dir = need_value(arg);
+    } else if (arg == "--known-face-feature-update-threshold") {
+      cfg.known_face_feature_update_threshold = std::stof(need_value(arg));
+    } else if (arg == "--known-face-feature-pose-threshold") {
+      cfg.known_face_feature_pose_threshold = std::stof(need_value(arg));
+    } else if (arg == "--known-face-feature-update-margin") {
+      cfg.known_face_feature_update_margin = std::stof(need_value(arg));
+    } else if (arg == "--known-face-feature-primary-ema-alpha") {
+      cfg.known_face_feature_primary_ema_alpha = std::stof(need_value(arg));
+    } else if (arg == "--known-face-feature-max-samples") {
+      cfg.known_face_feature_max_samples = std::stoi(need_value(arg));
     } else if (arg == "--face-rec-dynamic-library" || arg == "--dynamic-face-library") {
       cfg.face_rec_dynamic_library = true;
     } else if (arg == "--no-face-rec-dynamic-library" || arg == "--no-dynamic-face-library") {
@@ -795,6 +838,9 @@ static Config parse_args(int argc, char** argv) {
   require_nonnegative_seconds(
       cfg.display_id_public_binding_ttl_seconds,
       "--display-id-public-binding-ttl-seconds");
+  require_nonnegative_seconds(
+      cfg.display_id_replace_confirm_seconds,
+      "--display-id-replace-confirm-seconds");
   require_nonnegative_seconds(cfg.face_rec_cooldown_seconds, "--face-rec-cooldown-seconds");
   require_nonnegative_seconds(
       cfg.face_rec_newly_bound_cooldown_seconds,
@@ -835,6 +881,10 @@ static Config parse_args(int argc, char** argv) {
   if (cfg.display_id_public_binding_ttl < 0) {
     cfg.display_id_public_binding_ttl =
         seconds_to_frames(cfg.display_id_public_binding_ttl_seconds, effective_fps);
+  }
+  if (cfg.display_id_replace_confirm_frames < 0) {
+    cfg.display_id_replace_confirm_frames =
+        seconds_to_frames(cfg.display_id_replace_confirm_seconds, effective_fps);
   }
   if (cfg.face_rec_cooldown < 0) {
     cfg.face_rec_cooldown =
@@ -881,10 +931,13 @@ static Config parse_args(int argc, char** argv) {
   if (cfg.webui_jpeg_quality < 1 || cfg.webui_jpeg_quality > 100) {
     throw std::runtime_error("--webui-jpeg-quality must be in 1..100");
   }
-  if (!(cfg.webui_frame_scale > 0.0) || cfg.webui_frame_scale > 1.0) {
-    throw std::runtime_error("--webui-frame-scale must be in (0, 1]");
-  }
-  if (cfg.max_frames < 0) {
+	  if (!(cfg.webui_frame_scale > 0.0) || cfg.webui_frame_scale > 1.0) {
+	    throw std::runtime_error("--webui-frame-scale must be in (0, 1]");
+	  }
+	  if (!(cfg.webui_slot_fps > 0.0) || cfg.webui_slot_fps > 60.0) {
+	    throw std::runtime_error("--webui-slot-fps must be in (0, 60]");
+	  }
+	  if (cfg.max_frames < 0) {
     throw std::runtime_error("--max-frames must be non-negative");
   }
   if (cfg.num_sectors <= 0) {
@@ -1056,6 +1109,8 @@ static Config parse_args(int argc, char** argv) {
       std::max(1, std::min(cfg.display_id_replace_confirm_frames, 1000));
   cfg.display_id_replace_area_ratio =
       std::max(1.0f, std::min(cfg.display_id_replace_area_ratio, 10.0f));
+  cfg.display_id_min_box_size =
+      std::max(0.0f, std::min(cfg.display_id_min_box_size, 1000.0f));
   cfg.display_id_reuse_center_thresh =
       std::max(0.0f, std::min(cfg.display_id_reuse_center_thresh, 10.0f));
   cfg.display_id_reuse_size_ratio_thresh =
@@ -1119,6 +1174,16 @@ static Config parse_args(int argc, char** argv) {
       std::max(0.0f, std::min(cfg.face_rec_primary_ema_alpha, 1.0f));
   cfg.face_rec_five_point_scale =
       std::max(0.70f, std::min(cfg.face_rec_five_point_scale, 1.60f));
+  cfg.known_face_feature_update_threshold =
+      std::max(-1.0f, std::min(cfg.known_face_feature_update_threshold, 1.0f));
+  cfg.known_face_feature_pose_threshold =
+      std::max(-1.0f, std::min(cfg.known_face_feature_pose_threshold, 1.0f));
+  cfg.known_face_feature_update_margin =
+      std::max(0.0f, std::min(cfg.known_face_feature_update_margin, 1.0f));
+  cfg.known_face_feature_primary_ema_alpha =
+      std::max(0.0f, std::min(cfg.known_face_feature_primary_ema_alpha, 1.0f));
+  cfg.known_face_feature_max_samples =
+      std::max(0, std::min(cfg.known_face_feature_max_samples, 100));
   cfg.face_rec_max_per_frame = std::min(cfg.face_rec_max_per_frame, 3);
   cfg.face_rec_newly_bound_cooldown =
       std::max(1, std::min(cfg.face_rec_newly_bound_cooldown, 10000));

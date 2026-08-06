@@ -95,6 +95,10 @@ static float bbox_area4(const std::array<float, 4>& b) {
   return bbox_width(b) * bbox_height(b);
 }
 
+static float bbox_min_side(const std::array<float, 4>& b) {
+  return std::min(bbox_width(b), bbox_height(b));
+}
+
 static std::array<float, 2> bbox_center(const std::array<float, 4>& b) {
   return std::array<float, 2>{{(b[0] + b[2]) * 0.5f, (b[1] + b[3]) * 0.5f}};
 }
@@ -911,7 +915,7 @@ class NativeHybridSortTracker {
       }
       const std::array<float, 4> a =
           bbox4_from_ptr(result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
-      const BoundarySide side_a = boundary_side_for_bbox(a);
+      const BoundarySide side_a = boundary_duplicate_side_for_bbox(a);
       if (side_a == BoundarySide::None) {
         continue;
       }
@@ -921,8 +925,16 @@ class NativeHybridSortTracker {
         }
         const std::array<float, 4> b =
             bbox4_from_ptr(result.detections.data() + static_cast<size_t>(j) * kDetectionFields);
-        const BoundarySide side_b = boundary_side_for_bbox(b);
-        if (!is_final_boundary_duplicate(a, side_a, b, side_b)) {
+        const BoundarySide side_b = boundary_duplicate_side_for_bbox(b);
+        const int raw_i =
+            i < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(i)] : -1;
+        const int raw_j =
+            j < static_cast<int>(raw_ids.size()) ? raw_ids[static_cast<size_t>(j)] : -1;
+        const bool same_public_boundary_residual =
+            same_mapped_public_for_raws(raw_i, raw_j) &&
+            is_boundary_residual_duplicate(a, side_a, b, side_b);
+        if (!is_final_boundary_duplicate(a, side_a, b, side_b) &&
+            !same_public_boundary_residual) {
           continue;
         }
         const int drop = choose_final_boundary_duplicate_drop(result, raw_ids, i, j);
@@ -1195,6 +1207,43 @@ class NativeHybridSortTracker {
            area_ratio > cfg_.final_boundary_dedup_size_ratio_thresh;
   }
 
+  bool is_boundary_residual_duplicate(const std::array<float, 4>& a,
+                                      BoundarySide side_a,
+                                      const std::array<float, 4>& b,
+                                      BoundarySide side_b) const {
+    if (side_a == BoundarySide::None || side_b == BoundarySide::None ||
+        opposite_boundary(side_a) != side_b || !finite_bbox(a) || !finite_bbox(b)) {
+      return false;
+    }
+    const float area_a = bbox_area4(a);
+    const float area_b = bbox_area4(b);
+    const float small_area = std::min(area_a, area_b);
+    const float large_area = std::max(area_a, area_b);
+    if (small_area <= 0.0f || large_area <= 0.0f) {
+      return false;
+    }
+
+    // This branch is only for seam residuals: one side is a clipped fragment
+    // of a larger target on the opposite side. Similar-size boxes still use
+    // the normal boundary duplicate gates above.
+    const float area_ratio = small_area / (large_area + 1.0e-6f);
+    if (area_ratio >= cfg_.final_boundary_dedup_size_ratio_thresh) {
+      return false;
+    }
+
+    const float y_cover = bbox_y_cover(a, b);
+    if (y_cover < 0.55f) {
+      return false;
+    }
+    const float dist = boundary_center_distance_norm(a, side_a, b, side_b);
+    if (dist > 2.20f) {
+      return false;
+    }
+    const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
+    const float x_gap = boundary_x_gap(a, side_a, b, side_b);
+    return x_gap / avg_h <= 0.80f;
+  }
+
   float boundary_intersection_stats(const std::array<float, 4>& a,
                                     BoundarySide side_a,
                                     const std::array<float, 4>& b,
@@ -1257,6 +1306,25 @@ class NativeHybridSortTracker {
     const float dy = ca[1] - cb[1];
     const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
     return std::sqrt(dx * dx + dy * dy) / avg_h;
+  }
+
+  float boundary_x_gap(const std::array<float, 4>& a,
+                       BoundarySide side_a,
+                       const std::array<float, 4>& b,
+                       BoundarySide side_b) const {
+    const int w = meta_.process_width > 0 ? meta_.process_width : meta_.img_width;
+    std::array<float, 4> shifted_b = b;
+    if (w > 0 && opposite_boundary(side_a) == side_b) {
+      const float fw = static_cast<float>(w);
+      if (side_a == BoundarySide::Right && side_b == BoundarySide::Left) {
+        shifted_b[0] += fw;
+        shifted_b[2] += fw;
+      } else if (side_a == BoundarySide::Left && side_b == BoundarySide::Right) {
+        shifted_b[0] -= fw;
+        shifted_b[2] -= fw;
+      }
+    }
+    return std::max(0.0f, std::max(a[0], shifted_b[0]) - std::min(a[2], shifted_b[2]));
   }
 
   int choose_final_boundary_duplicate_drop(const FrameResult& result,
@@ -1979,6 +2047,14 @@ class NativeHybridSortTracker {
         opposite_boundary(side_a) == side_b) {
       return is_final_boundary_duplicate(a, side_a, b, side_b);
     }
+    const BoundarySide dup_side_a = boundary_duplicate_side_for_bbox(a);
+    const BoundarySide dup_side_b = boundary_duplicate_side_for_bbox(b);
+    if (dup_side_a != BoundarySide::None &&
+        dup_side_b != BoundarySide::None &&
+        opposite_boundary(dup_side_a) == dup_side_b &&
+        is_boundary_residual_duplicate(a, dup_side_a, b, dup_side_b)) {
+      return true;
+    }
     const bool same_boundary_side = side_a != BoundarySide::None && side_a == side_b;
     const float x_gap = bbox_x_gap(a, b);
     const float avg_h = std::max((bbox_height(a) + bbox_height(b)) * 0.5f, 1.0f);
@@ -2157,18 +2233,36 @@ class NativeHybridSortTracker {
     std::set<int> active_public_ids;
     std::map<int, int> active_public_index;
     std::map<int, std::array<float, 4>> active_public_bbox;
+    std::map<int, int> visible_public_raw_id;
+    std::set<int> display_eligible_public_ids;
+    std::map<int, int> display_eligible_public_index;
+    std::map<int, std::array<float, 4>> display_eligible_public_bbox;
     for (int i = 0; i < result.detection_count; ++i) {
       const int public_id = result.track_ids[static_cast<size_t>(i)];
       if (public_id > 0) {
+        const std::array<float, 4> bbox = bbox4_from_ptr(
+            result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
         active_public_ids.insert(public_id);
         active_public_index[public_id] = i;
-        active_public_bbox[public_id] = bbox4_from_ptr(
-            result.detections.data() + static_cast<size_t>(i) * kDetectionFields);
+        active_public_bbox[public_id] = bbox;
+        if (display_slot_bbox_eligible(bbox)) {
+          display_eligible_public_ids.insert(public_id);
+          display_eligible_public_index[public_id] = i;
+          display_eligible_public_bbox[public_id] = bbox;
+        }
+        const int raw_id =
+            i < static_cast<int>(result.raw_track_ids.size())
+                ? result.raw_track_ids[static_cast<size_t>(i)]
+                : -1;
+        auto raw_it = visible_public_raw_id.find(public_id);
+        if (raw_it == visible_public_raw_id.end() || raw_it->second <= 0) {
+          visible_public_raw_id[public_id] = raw_id;
+        }
       }
     }
 
     for (auto it = display_id_by_public_.begin(); it != display_id_by_public_.end();) {
-      if (active_public_ids.find(it->first) != active_public_ids.end()) {
+      if (display_eligible_public_ids.find(it->first) != display_eligible_public_ids.end()) {
         ++it;
         continue;
       }
@@ -2235,6 +2329,13 @@ class NativeHybridSortTracker {
       if (bound_a != bound_b) {
         return bound_a;
       }
+      const auto raw_a_it = visible_public_raw_id.find(public_a);
+      const auto raw_b_it = visible_public_raw_id.find(public_b);
+      const bool live_a = raw_a_it != visible_public_raw_id.end() && raw_a_it->second > 0;
+      const bool live_b = raw_b_it != visible_public_raw_id.end() && raw_b_it->second > 0;
+      if (live_a != live_b) {
+        return live_a;
+      }
       const int hits_a = public_a > 0 ? public_consecutive_seen_count(public_a) : 0;
       const int hits_b = public_b > 0 ? public_consecutive_seen_count(public_b) : 0;
       if (hits_a != hits_b) {
@@ -2266,13 +2367,30 @@ class NativeHybridSortTracker {
       assign_debug.display_counter = display_id_counter_;
       assign_debug.display_max_count = cfg_.display_id_max_count;
       assign_debug.bbox_area = finite_bbox(debug_bbox) ? bbox_area4(debug_bbox) : 0.0f;
+      assign_debug.bbox_min_side = finite_bbox(debug_bbox) ? bbox_min_side(debug_bbox) : 0.0f;
 
       auto display_it = display_id_by_public_.find(public_id);
       assign_debug.had_existing_binding = display_it != display_id_by_public_.end();
       assign_debug.previous_display_id =
           assign_debug.had_existing_binding ? display_it->second : 0;
       DisplayReuseChoice reuse_choice;
+      if (!display_slot_bbox_eligible(debug_bbox)) {
+        assign_debug.action = "hidden";
+        assign_debug.hidden = true;
+        assign_debug.reason = "display_box_too_small";
+        result.display_assign_debug.push_back(assign_debug);
+        hidden_public_ids.insert(public_id);
+        continue;
+      }
       if (display_it == display_id_by_public_.end()) {
+        if (raw_track_id <= 0) {
+          assign_debug.action = "hidden";
+          assign_debug.hidden = true;
+          assign_debug.reason = "display_coast_without_binding";
+          result.display_assign_debug.push_back(assign_debug);
+          hidden_public_ids.insert(public_id);
+          continue;
+        }
         const float* det =
             result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
         const std::array<float, 4> bbox = bbox4_from_ptr(det);
@@ -2308,7 +2426,16 @@ class NativeHybridSortTracker {
         } else {
           const DisplayReplacementChoice replacement =
               choose_display_area_replacement(
-                  public_id, bbox, active_public_ids, active_public_index, active_public_bbox);
+                  public_id,
+                  raw_track_id,
+                  bbox,
+                  active_public_ids,
+                  active_public_index,
+                  active_public_bbox,
+                  display_eligible_public_ids,
+                  display_eligible_public_index,
+                  display_eligible_public_bbox,
+                  visible_public_raw_id);
           assign_debug.replace_pending_hits = replacement.pending_hits;
           assign_debug.replace_confirm_frames = cfg_.display_id_replace_confirm_frames;
           if (replacement.replace && replacement.display_id > 0) {
@@ -2425,16 +2552,35 @@ class NativeHybridSortTracker {
     }
   }
 
+  bool display_slot_bbox_eligible(const std::array<float, 4>& bbox) const {
+    if (!finite_bbox(bbox)) {
+      return false;
+    }
+    if (cfg_.display_id_min_box_size <= 0.0f) {
+      return true;
+    }
+    return bbox_min_side(bbox) >= cfg_.display_id_min_box_size;
+  }
+
   DisplayReplacementChoice choose_display_area_replacement(
       int new_public_id,
+      int new_raw_track_id,
       const std::array<float, 4>& new_bbox,
       const std::set<int>& active_public_ids,
       const std::map<int, int>& active_public_index,
-      const std::map<int, std::array<float, 4>>& active_public_bbox) {
+      const std::map<int, std::array<float, 4>>& active_public_bbox,
+      const std::set<int>& display_eligible_public_ids,
+      const std::map<int, int>& display_eligible_public_index,
+      const std::map<int, std::array<float, 4>>& display_eligible_public_bbox,
+      const std::map<int, int>& visible_public_raw_id) {
     DisplayReplacementChoice choice;
     if (cfg_.display_id_max_count <= 0 || new_public_id <= 0 ||
         !finite_bbox(new_bbox)) {
       choice.reject_reason = "replace_invalid_candidate";
+      return choice;
+    }
+    if (new_raw_track_id <= 0) {
+      choice.reject_reason = "replace_candidate_not_live_raw";
       return choice;
     }
     const float new_area = bbox_area4(new_bbox);
@@ -2442,28 +2588,152 @@ class NativeHybridSortTracker {
     int worst_display_id = 0;
     int worst_index = -1;
     int worst_hits = 0;
+    bool worst_skip_area_ratio = false;
+    std::string worst_pending_reason = "display_area_replace_pending";
     float worst_area = std::numeric_limits<float>::infinity();
+    int stale_missing_frames = -1;
+    const int stale_protect_frames =
+        cfg_.coast_frames > 0 ? cfg_.coast_frames : cfg_.display_id_public_binding_ttl;
+
+    // Active publics whose current bbox is too small for a display slot should
+    // not keep a slot from an eligible target. They stay tracked/public-mapped,
+    // but become first-class replacement candidates after confirmation.
     for (const auto& item : display_id_by_public_) {
       const int old_public_id = item.first;
       const int display_id = item.second;
       if (old_public_id == new_public_id || display_id <= 0 ||
-          active_public_ids.find(old_public_id) == active_public_ids.end()) {
+          active_public_ids.find(old_public_id) == active_public_ids.end() ||
+          display_eligible_public_ids.find(old_public_id) != display_eligible_public_ids.end()) {
         continue;
       }
-      const auto index_it = active_public_index.find(old_public_id);
+      const auto raw_it = visible_public_raw_id.find(old_public_id);
+      if (raw_it == visible_public_raw_id.end() || raw_it->second <= 0) {
+        continue;
+      }
       const auto bbox_it = active_public_bbox.find(old_public_id);
-      if (index_it == active_public_index.end() ||
-          bbox_it == active_public_bbox.end() ||
-          !finite_bbox(bbox_it->second)) {
+      if (bbox_it == active_public_bbox.end() || !finite_bbox(bbox_it->second)) {
         continue;
       }
       const float old_area = bbox_area4(bbox_it->second);
-      if (old_area < worst_area) {
+      const auto index_it = active_public_index.find(old_public_id);
+      const bool is_worse =
+          worst_public_id <= 0 ||
+          old_area < worst_area ||
+          (std::fabs(old_area - worst_area) <= 1.0e-3f &&
+           display_id < worst_display_id);
+      if (is_worse) {
         worst_public_id = old_public_id;
         worst_display_id = display_id;
-        worst_index = index_it->second;
+        worst_index =
+            index_it == active_public_index.end() ? -1 : index_it->second;
         worst_hits = public_consecutive_seen_count(old_public_id);
         worst_area = old_area;
+        worst_skip_area_ratio = true;
+        worst_pending_reason = "display_small_box_replace_pending";
+      }
+    }
+
+    // Prefer stale non-live display bindings after the raw track has been
+    // missing beyond the coast protection window. Short occlusions still keep
+    // their display slot; stale coast slots stop blocking new live tracks.
+    for (const auto& item : display_id_by_public_) {
+      const int old_public_id = item.first;
+      const int display_id = item.second;
+      if (old_public_id == new_public_id || display_id <= 0) {
+        continue;
+      }
+      const auto raw_it = visible_public_raw_id.find(old_public_id);
+      const bool old_live =
+          active_public_ids.find(old_public_id) != active_public_ids.end() &&
+          raw_it != visible_public_raw_id.end() && raw_it->second > 0;
+      if (old_live) {
+        continue;
+      }
+      const auto last_active_it = public_last_frame_.find(old_public_id);
+      const int raw_missing_frames =
+          last_active_it == public_last_frame_.end()
+              ? stale_protect_frames + 1
+              : frame_id_ - last_active_it->second;
+      if (raw_missing_frames <= stale_protect_frames) {
+        continue;
+      }
+
+      std::array<float, 4> old_bbox{{0.0f, 0.0f, 0.0f, 0.0f}};
+      const auto active_bbox_it = active_public_bbox.find(old_public_id);
+      if (active_bbox_it != active_public_bbox.end() &&
+          finite_bbox(active_bbox_it->second)) {
+        old_bbox = active_bbox_it->second;
+      } else {
+        const auto display_bbox_it = display_last_bbox_.find(display_id);
+        if (display_bbox_it != display_last_bbox_.end() &&
+            finite_bbox(display_bbox_it->second)) {
+          old_bbox = display_bbox_it->second;
+        } else {
+          const auto public_bbox_it = public_last_bbox_.find(old_public_id);
+          if (public_bbox_it != public_last_bbox_.end() &&
+              finite_bbox(public_bbox_it->second)) {
+            old_bbox = public_bbox_it->second;
+          }
+        }
+      }
+      const float old_area = finite_bbox(old_bbox) ? bbox_area4(old_bbox) : 0.0f;
+      const auto index_it = active_public_index.find(old_public_id);
+      const bool is_staler =
+          worst_public_id <= 0 || raw_missing_frames > stale_missing_frames ||
+          (raw_missing_frames == stale_missing_frames &&
+           (old_area < worst_area ||
+            (std::fabs(old_area - worst_area) <= 1.0e-3f &&
+             display_id < worst_display_id)));
+      if (is_staler) {
+        worst_public_id = old_public_id;
+        worst_display_id = display_id;
+        worst_index =
+            index_it == active_public_index.end() ? -1 : index_it->second;
+        worst_hits = public_consecutive_seen_count(old_public_id);
+        worst_area = old_area;
+        worst_skip_area_ratio = true;
+        worst_pending_reason = "display_stale_coast_replace_pending";
+        stale_missing_frames = raw_missing_frames;
+      }
+    }
+
+    if (worst_public_id <= 0) {
+      for (const auto& item : display_id_by_public_) {
+        const int old_public_id = item.first;
+        const int display_id = item.second;
+        if (old_public_id == new_public_id || display_id <= 0 ||
+            display_eligible_public_ids.find(old_public_id) == display_eligible_public_ids.end()) {
+          continue;
+        }
+        const auto index_it = display_eligible_public_index.find(old_public_id);
+        const auto bbox_it = display_eligible_public_bbox.find(old_public_id);
+        if (index_it == display_eligible_public_index.end() ||
+            bbox_it == display_eligible_public_bbox.end() ||
+            !finite_bbox(bbox_it->second)) {
+          continue;
+        }
+        const auto raw_it = visible_public_raw_id.find(old_public_id);
+        const bool old_live =
+            raw_it != visible_public_raw_id.end() && raw_it->second > 0;
+        if (!old_live) {
+          continue;
+        }
+        const float old_area = bbox_area4(bbox_it->second);
+        const int old_hits = public_consecutive_seen_count(old_public_id);
+        const bool is_worse =
+            worst_public_id <= 0 ||
+            (std::fabs(old_area - worst_area) > 1.0e-3f
+                 ? old_area < worst_area
+                 : old_hits < worst_hits);
+        if (is_worse) {
+          worst_public_id = old_public_id;
+          worst_display_id = display_id;
+          worst_index = index_it->second;
+          worst_hits = old_hits;
+          worst_area = old_area;
+          worst_skip_area_ratio = false;
+          worst_pending_reason = "display_area_replace_pending";
+        }
       }
     }
     if (worst_public_id <= 0 || worst_display_id <= 0 ||
@@ -2471,7 +2741,8 @@ class NativeHybridSortTracker {
       choice.reject_reason = "replace_no_active_display_candidate";
       return choice;
     }
-    if (new_area < worst_area * cfg_.display_id_replace_area_ratio) {
+    if (!worst_skip_area_ratio &&
+        new_area < worst_area * cfg_.display_id_replace_area_ratio) {
       choice.replaced_public_id = worst_public_id;
       choice.replaced_index = worst_index;
       choice.replaced_hits = worst_hits;
@@ -2497,7 +2768,9 @@ class NativeHybridSortTracker {
       choice.replaced_index = worst_index;
       choice.replaced_hits = worst_hits;
       choice.replaced_area = worst_area;
-      choice.reject_reason = "display_area_replace_pending";
+      choice.reject_reason =
+          worst_pending_reason.empty() ? "display_area_replace_pending"
+                                       : worst_pending_reason;
       return choice;
     }
     choice.display_id = worst_display_id;
@@ -2738,7 +3011,20 @@ class NativeHybridSortTracker {
     return public_seen_count(public_id) > 1;
   }
 
+  bool same_mapped_public_for_raws(int raw_a, int raw_b) const {
+    if (raw_a <= 0 || raw_b <= 0 || raw_a == raw_b) {
+      return false;
+    }
+    const int public_a = mapped_public_id_for_raw(raw_a);
+    const int public_b = mapped_public_id_for_raw(raw_b);
+    return public_a > 0 && public_a == public_b;
+  }
+
   void compact_result_to_displayed_targets(FrameResult& result) const {
+    result.hidden_detections.clear();
+    result.hidden_raw_track_ids.clear();
+    result.hidden_track_ids.clear();
+    result.hidden_detection_count = 0;
     if (!cfg_.display_id_reuse ||
         result.display_ids.size() < static_cast<size_t>(result.detection_count)) {
       return;
@@ -2763,6 +3049,19 @@ class NativeHybridSortTracker {
     kept_detections.reserve(result.detections.size());
     for (int i = 0; i < result.detection_count; ++i) {
       if (result.display_ids[static_cast<size_t>(i)] <= 0) {
+        const float* det =
+            result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+        result.hidden_detections.insert(
+            result.hidden_detections.end(), det, det + kDetectionFields);
+        result.hidden_raw_track_ids.push_back(
+            i < static_cast<int>(result.raw_track_ids.size())
+                ? result.raw_track_ids[static_cast<size_t>(i)]
+                : -1);
+        result.hidden_track_ids.push_back(
+            i < static_cast<int>(result.track_ids.size())
+                ? result.track_ids[static_cast<size_t>(i)]
+                : -1);
+        result.hidden_detection_count += 1;
         continue;
       }
       const float* det =
@@ -3275,6 +3574,33 @@ class NativeHybridSortTracker {
     check(BoundarySide::Left, 0.0f, 0.0f, margin_w, static_cast<float>(h));
     check(BoundarySide::Right, static_cast<float>(w) - margin_w, 0.0f, static_cast<float>(w), static_cast<float>(h));
     return best_side;
+  }
+
+  BoundarySide boundary_duplicate_side_for_bbox(const std::array<float, 4>& bbox) const {
+    const BoundarySide strict_side = boundary_side_for_bbox(bbox);
+    if (strict_side != BoundarySide::None) {
+      return strict_side;
+    }
+    const int w = meta_.process_width > 0 ? meta_.process_width : meta_.img_width;
+    const int h = meta_.process_height > 0 ? meta_.process_height : meta_.img_height;
+    if (w <= 0 || h <= 0 || !finite_bbox(bbox)) {
+      return BoundarySide::None;
+    }
+    const float margin_w = std::max(1.0f, w * cfg_.boundary_margin);
+    const float left_gap = std::max(0.0f, bbox[0]);
+    const float right_gap = std::max(0.0f, static_cast<float>(w) - bbox[2]);
+    const bool near_left = left_gap <= margin_w;
+    const bool near_right = right_gap <= margin_w;
+    if (near_left && near_right) {
+      return left_gap <= right_gap ? BoundarySide::Left : BoundarySide::Right;
+    }
+    if (near_left) {
+      return BoundarySide::Left;
+    }
+    if (near_right) {
+      return BoundarySide::Right;
+    }
+    return BoundarySide::None;
   }
 
   BoundarySide opposite_boundary(BoundarySide side) const {

@@ -107,6 +107,128 @@ class MeetEyeRuntime {
     return base_map_y_.empty() ? nullptr : &base_map_y_;
   }
 
+  bool detect_known_face_photo(const Image& image,
+                               std::array<float, kDetectionFields>* best_det,
+                               std::string* error) {
+    if (best_det == nullptr) {
+      if (error != nullptr) {
+        *error = "invalid output detection";
+      }
+      return false;
+    }
+    if (image.width <= 0 || image.height <= 0 ||
+        image.bgr.size() != static_cast<size_t>(image.width) * image.height * 3 ||
+        input_h_ <= 0 || input_w_ <= 0 || input_c_ != 3) {
+      if (error != nullptr) {
+        *error = "invalid photo image";
+      }
+      return false;
+    }
+    const float gain = std::min(static_cast<float>(input_w_) / static_cast<float>(image.width),
+                                static_cast<float>(input_h_) / static_cast<float>(image.height));
+    if (!std::isfinite(gain) || gain <= 0.0f) {
+      if (error != nullptr) {
+        *error = "invalid photo letterbox gain";
+      }
+      return false;
+    }
+    const int new_w = std::max(1, static_cast<int>(std::round(image.width * gain)));
+    const int new_h = std::max(1, static_cast<int>(std::round(image.height * gain)));
+    const int pad_left = std::max(0, (input_w_ - new_w) / 2);
+    const int pad_top = std::max(0, (input_h_ - new_h) / 2);
+
+    std::vector<uint8_t> input(
+        static_cast<size_t>(input_h_) * input_w_ * input_c_,
+        114);
+    for (int y = 0; y < new_h && y + pad_top < input_h_; ++y) {
+      for (int x = 0; x < new_w && x + pad_left < input_w_; ++x) {
+        const float sx = (static_cast<float>(x) + 0.5f) / gain - 0.5f;
+        const float sy = (static_cast<float>(y) + 0.5f) / gain - 0.5f;
+        float bgr[3] = {114.0f, 114.0f, 114.0f};
+        sample_image_bilinear_constant(image, sx, sy, bgr);
+        const size_t out_idx =
+            (static_cast<size_t>(y + pad_top) * input_w_ + (x + pad_left)) * 3;
+        input[out_idx + 0] = clamp_to_u8(bgr[2]);
+        input[out_idx + 1] = clamp_to_u8(bgr[1]);
+        input[out_idx + 2] = clamp_to_u8(bgr[0]);
+      }
+    }
+
+    std::vector<float> detections(
+        static_cast<size_t>(cfg_.max_output_dets) * kDetectionFields,
+        0.0f);
+    int detection_count = 0;
+    int merge_stats[4] = {0, 0, 0, 0};
+    double timings[20] = {0.0};
+    char err[4096] = {0};
+    const int ret = face_rknn_parallel_infer_merged_single_core(
+        rknn_.get(),
+        0,
+        input.data(),
+        input_h_,
+        input_w_,
+        input_c_,
+        image.height,
+        image.width,
+        gain,
+        pad_left,
+        pad_top,
+        cfg_.nms_iou_threshold,
+        cfg_.conf_threshold,
+        cfg_.max_det,
+        cfg_.max_nms,
+        detections.data(),
+        cfg_.max_output_dets,
+        &detection_count,
+        merge_stats,
+        timings,
+        err,
+        sizeof(err));
+    if (ret != 0) {
+      if (error != nullptr) {
+        *error = err[0] != '\0' ? err : "photo face detection failed";
+      }
+      return false;
+    }
+
+    int best_index = -1;
+    float best_score = -1.0f;
+    for (int i = 0; i < detection_count; ++i) {
+      const float* det = detections.data() + static_cast<size_t>(i) * kDetectionFields;
+      bool all_keypoints_valid = true;
+      for (int k = 0; k < 5; ++k) {
+        if (!valid_keypoint(det + 5 + k * 3)) {
+          all_keypoints_valid = false;
+          break;
+        }
+      }
+      if (!all_keypoints_valid) {
+        continue;
+      }
+      const float w = std::max(0.0f, det[2] - det[0]);
+      const float h = std::max(0.0f, det[3] - det[1]);
+      const float score = det[4] + 0.000001f * w * h;
+      if (score > best_score) {
+        best_score = score;
+        best_index = i;
+      }
+    }
+    if (best_index < 0) {
+      if (error != nullptr) {
+        std::ostringstream oss;
+        oss << "no valid five-point face detection";
+        if (detection_count > 0) {
+          oss << " detections=" << detection_count;
+        }
+        *error = oss.str();
+      }
+      return false;
+    }
+    const float* src = detections.data() + static_cast<size_t>(best_index) * kDetectionFields;
+    std::copy(src, src + kDetectionFields, best_det->begin());
+    return true;
+  }
+
   PreparedStagingFrame prepare_staging_frame(PreparedStagingFrame frame) {
     const Image& image = frame.image;
     if (meta_.img_width > 0 && meta_.img_height > 0 &&
@@ -726,6 +848,50 @@ class MeetEyeRuntime {
     }
     opencl_width_ = image.width;
     opencl_height_ = image.height;
+  }
+
+  static uint8_t clamp_to_u8(float value) {
+    if (!std::isfinite(value)) {
+      return 114;
+    }
+    value = std::max(0.0f, std::min(255.0f, value));
+    return static_cast<uint8_t>(std::lround(value));
+  }
+
+  static void sample_image_bilinear_constant(const Image& source,
+                                             float x,
+                                             float y,
+                                             float* bgr) {
+    if (bgr == nullptr) {
+      return;
+    }
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = x0 + 1;
+    const int y1 = y0 + 1;
+    const float tx = x - static_cast<float>(x0);
+    const float ty = y - static_cast<float>(y0);
+    const float weights[4] = {
+        (1.0f - tx) * (1.0f - ty),
+        tx * (1.0f - ty),
+        (1.0f - tx) * ty,
+        tx * ty,
+    };
+    const int xs[4] = {x0, x1, x0, x1};
+    const int ys[4] = {y0, y0, y1, y1};
+    for (int c = 0; c < 3; ++c) {
+      float v = 114.0f;
+      for (int i = 0; i < 4; ++i) {
+        const int sx = xs[i];
+        const int sy = ys[i];
+        if (sx < 0 || sx >= source.width || sy < 0 || sy >= source.height) {
+          continue;
+        }
+        const size_t idx = (static_cast<size_t>(sy) * source.width + sx) * 3 + c;
+        v += (static_cast<float>(source.bgr[idx]) - 114.0f) * weights[i];
+      }
+      bgr[c] = v;
+    }
   }
 
   Config cfg_;

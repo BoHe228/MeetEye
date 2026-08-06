@@ -208,6 +208,20 @@ taskset -c 0-6 bash run_smoke.sh \
   --webui \
   --webui-port 8080 \
   --debug-jsonl board_output/wide_angle_debug.jsonl \
+  --face-rec \
+  --face-rec-dynamic-library \
+  --dynamic-face-library-dir face_library_dynamic_camera_wide_angle \
+  --face-rec-model-preset ir50_webface4m \
+  --face-rec-align-mode five-point \
+  --known-face-dir face_photos \
+  --display-id-max-count 8 \
+  --no-target-output-compact-ids \
+  --face-rec-async \
+  --webui-jpeg-quality 80 \
+  --display-id-replace-area-ratio 1.50 \
+  --webui-show-hidden-targets \
+  --webui-slot-fps 5 \
+  --display-id-min-box-size 20 \
   --no-output-jsonl \
   --no-stdout-json
 ```
@@ -289,6 +303,7 @@ taskset -c 0-6 bash run_smoke.sh \
   --face-library-dir face_library \
   --face-rec-dynamic-library \
   --dynamic-face-library-dir face_library_dynamic_cpp \
+  --known-face-dir face_photos \
   --face-rec-min-box-size 100 \
   --face-rec-min-keypoint-conf 0.6 \
   --face-rec-threshold 0.65 \
@@ -303,7 +318,7 @@ taskset -c 0-6 bash run_smoke.sh \
   --face-rec-tentative-fail-frames 2 \
   --face-rec-update-similarity 0.65 \
   --face-rec-pose-sample-similarity 0.55 \
-  --face-rec-update-max-similarity 0.75 \
+  --face-rec-pose-library-max-similarity 0.90 \
   --face-rec-update-min-box-size 100 \
   --face-rec-update-min-keypoint-conf 0.7 \
   --face-rec-update-min-score 0.5 \
@@ -437,12 +452,32 @@ FaceID。正式创建时还要求 pending 样本里至少有 `1` 张满足 prima
 可恢复旧的单次注册行为。普通高质量姿态样本默认达到
 `--face-rec-pose-sample-similarity=0.55` 即可追加入库；主特征更新仍要求达到
 `--face-rec-update-similarity=0.65`，避免主向量被侧脸、低清晰度帧拉偏。高于
-`--face-rec-update-max-similarity=0.75` 的样本认为信息增量有限，不再重复追加。主特征只在更高质量帧上
+`--face-rec-pose-library-max-similarity=0.90` 的样本认为信息增量有限，不再重复追加。`--face-rec-update-max-similarity`
+仍保留为兼容旧命令的别名。主特征只在更高质量帧上
 更新，门控由 `--face-rec-primary-min-box-size`、`--face-rec-primary-min-keypoint-conf`、
 `--face-rec-primary-min-score` 和 `--face-rec-primary-max-yaw-deg` 控制；默认只允许
 yaw 不超过 `10°` 的正脸帧更新主特征，更新时按 `--face-rec-primary-ema-alpha` 做保守
 EMA。每个动态 FaceID 默认最多保留 `12` 条向量，由 `--face-rec-max-samples-per-id`
 控制；裁剪样本时会保留第一行主特征。静态 `.npy` 人脸库不会在运行中被自动改写。
+
+已知照片库用于给动态 FaceID 叠加姓名标签，不替代 `face_id`。当前板端默认从
+`face_photos/` 读取 JPEG 照片，文件名去后缀作为姓名。真实人脸照片属于隐私数据，
+不要把具体人员照片或姓名示例写入公开文档；部署时按现场需要在板端本地放入照片。
+文件名以 `_aligned` 结尾的照片会被视为已经完成五点对齐的 `112x112` 人脸图，
+加载时不再二次检测，姓名会自动去掉 `_aligned` 后缀。不开
+`--known-face-feature-library` 时，每次启动都只从照片临时提 AdaFace 特征做匹配，
+不写回。开启后会使用
+`--known-face-feature-dir face_photos/face_photo_features_cpp` 保存板端本地持久特征：
+第 0 行是原始照片特征，第 1 行是 EMA 主特征，后续最多
+`--known-face-feature-max-samples` 行为姿态特征。运行中样本与照片原始特征达到
+`--known-face-feature-update-threshold=0.65` 时才更新主特征；达到
+`--known-face-feature-pose-threshold=0.60` 但低于主特征阈值时，只作为姿态样本追加。
+原始照片和第 0 行照片特征不会被运行时样本替代。
+
+开/不开持久特征库的交互式行为说明放在
+[`docs/known_face_library_modes.html`](docs/known_face_library_modes.html)。之前临时生成在
+`board_output/known_face_library_modes.html` 的文件属于运行输出目录，`board_output/`
+默认被 Git 忽略，不再作为长期文档位置。
 
 排查人脸相似度异常时，可以保存 AdaFace 实际输入的 `112x112` crop：
 
@@ -648,6 +683,16 @@ debug JSONL 会在 `fps` 和 `timings_ms` 里写入运行帧率信息：
   `public_id` 会继续作为字段输出。
 - `--no-target-output-compact-ids`：关闭本帧输出序号，恢复用 `display_id/public_id`
   作为非扇区 `targets` JSON 的外层 key。
+- `--display-id-max-count N`：限制可对外输出的 display 槽数量，默认 `8`；设为 `0`
+  表示不限制。满槽后，已占槽目标不会被立即重排，只有新目标持续满足替换条件才会抢占。
+- `--display-id-replace-confirm-seconds VALUE`：新目标主动替换旧槽前需要连续满足条件的时间，
+  默认 `1` 秒。`--display-id-replace-confirm-frames N` 仍保留为旧帧数覆盖参数。
+- `--display-id-replace-area-ratio VALUE`：新目标 bbox 面积至少达到被替换目标的该倍数才进入
+  替换确认，默认 `1.50`。
+- `--display-id-min-box-size VALUE`：允许占用 display 槽的 bbox 最小短边，默认 `40` px。
+  低于该尺寸的检测框仍可在 WebUI 上以 hidden target 方式显示，但不会占槽，也不会抢槽。
+- `--webui-slot-fps VALUE`：display 槽小图 WebSocket 发送频率上限，默认 `10` FPS。
+  该参数只限制槽位 crop 小图，不改变主 WebUI JPEG 帧率和推理速度。
 - `--display-id-reuse`：开启输出层 display ID 复用池，默认开启。内部仍使用 public ID 做
   跟踪、遮挡继承和边界恢复；WebUI 标签显示可复用的 `display_id`，非扇区 JSON
   会同时保留原始 `display_id/public_id`。同一个 `public_id` 短暂不输出后，
@@ -977,6 +1022,12 @@ C++ runtime 接受当前 Python 板端无头命令里常用的参数，包括：
 --target-output-limit
 --target-output-compact-ids
 --no-target-output-compact-ids
+--display-id-max-count
+--display-id-replace-confirm-seconds
+--display-id-replace-confirm-frames
+--display-id-replace-area-ratio
+--display-id-min-box-size
+--webui-slot-fps
 --tracker-new-thresh
 --tracker-min-hits
 --display-id-reuse
@@ -1000,6 +1051,15 @@ C++ runtime 接受当前 Python 板端无头命令里常用的参数，包括：
 --no-face-rec-relink
 --face-rec-model-preset
 --face-rec-model-name
+--known-face-dir
+--known-face-feature-library
+--no-known-face-feature-library
+--known-face-feature-dir
+--known-face-feature-update-threshold
+--known-face-feature-pose-threshold
+--known-face-feature-update-margin
+--known-face-feature-primary-ema-alpha
+--known-face-feature-max-samples
 --face-rec-debug-crops
 --no-face-rec-debug-crops
 --face-rec-debug-crop-dir
@@ -1034,6 +1094,7 @@ C++ runtime 接受当前 Python 板端无头命令里常用的参数，包括：
 --face-rec-binding-ttl
 --face-rec-update-similarity
 --face-rec-pose-sample-similarity
+--face-rec-pose-library-max-similarity
 --face-rec-update-max-similarity
 --face-rec-min-sample-diversity
 --face-rec-max-samples-per-id

@@ -623,6 +623,7 @@ class BoardWebUiServer {
 	          std::lock_guard<std::mutex> lock(mutex_);
 	          latest = latest_slots_;
 	        }
+	        std::cerr << "[board_cpp-webui] slot WebSocket client connected\n";
 	        accept_websocket(fd, request, slot_clients_, latest);
 	        return;
 	      }
@@ -929,6 +930,7 @@ class BoardWebUiServer {
 		    let latestTargetsBySlot=new Map();
 		    let latestFrameId=0;
 		    const slotState=new Map();
+		    let configuredSlotFps=10;
 	    function fmtPct(v){return Number.isFinite(v)?`${v.toFixed(1)}%`:'-';}
 	    function fmtFreq(v){return Number.isFinite(v)&&v>0?`${(v/1000000).toFixed(0)}MHz`:'';}
     function fmtDeg(v){
@@ -949,8 +951,10 @@ class BoardWebUiServer {
 	      return Number.isFinite(id)&&id>0?Math.floor(id):0;
 	    }
 	    function targetFaceId(target){
-	      if(target&&target.face_id)return String(target.face_id);
 	      const rec=target&&target.face_recognition;
+	      if(rec&&rec.matched&&rec.known_name)return String(rec.known_name);
+	      if(target&&target.known_name)return String(target.known_name);
+	      if(target&&target.face_id)return String(target.face_id);
 	      if(rec&&rec.matched&&rec.face_id)return String(rec.face_id);
 	      return 'null';
 	    }
@@ -958,13 +962,18 @@ class BoardWebUiServer {
 	      const id=Number(target&&target.public_id);
 	      return Number.isFinite(id)&&id>0?Math.floor(id):0;
 	    }
-	    function targetRawTrackId(target){
-	      const id=Number(target&&target.raw_track_id);
-	      return Number.isFinite(id)&&id>0?Math.floor(id):0;
-	    }
-		    function renderDisplaySlots(){
+		    function targetRawTrackId(target){
+		      const id=Number(target&&target.raw_track_id);
+		      return Number.isFinite(id)&&id>0?Math.floor(id):0;
+		    }
+		    function slotFpsLabel(){
+		      return Number.isFinite(configuredSlotFps)&&configuredSlotFps>0
+		        ? configuredSlotFps.toFixed(configuredSlotFps>=10?0:1)
+		        : '10';
+		    }
+			    function renderDisplaySlots(){
 	      const count=Math.max(1,Math.min(32,configuredSlotCount||8));
-	      slotMetaEl.textContent=`固定 ${count} 槽，干净缩略图由板端低频发送`;
+		      slotMetaEl.textContent=`固定 ${count} 槽，槽图按 ${slotFpsLabel()} FPS 实时低频发送`;
 	      const cards=[];
 	      for(let slot=1;slot<=count;++slot){
 	        const target=latestTargetsBySlot.get(slot);
@@ -999,30 +1008,41 @@ class BoardWebUiServer {
 	              <span class="slot-stat"><i>Y</i><b>${fmtDeg(target.face_yaw)}</b></span>
 	            </div>
 	            <div class="slot-muted">${escapeHtml([publicId,rawId].filter(Boolean).join(' '))}</div>`:
-	            `<div class="slot-muted">空闲${state.image?'，保留历史正脸':''}</div>`}
+		            `<div class="slot-muted">空闲</div>`}
 	          </div>
 	        </div>`);
 	      }
 	      displaySlotsEl.innerHTML=cards.join('');
 	    }
-	    function updateSlotsFromPayload(obj){
-	      if(!obj||!Array.isArray(obj.slots))return;
-	      const maxCount=Number(obj.display_id_max_count);
-	      if(Number.isFinite(maxCount)&&maxCount>0){
-	        configuredSlotCount=Math.floor(maxCount);
-	      }
-	      obj.slots.forEach(slot=>{
-	        const id=Number(slot.display_id);
-	        if(!Number.isFinite(id)||id<=0)return;
-	        let state=slotState.get(id);
-	        if(!state){state={};slotState.set(id,state);}
-	        state.image=slot.image||state.image||null;
-	        state.faceId=slot.face_id||state.faceId||'null';
-	        state.publicId=Number(slot.public_id)||state.publicId||0;
-	        state.rawTrackId=Number(slot.raw_track_id)||state.rawTrackId||0;
-	      });
-	      renderDisplaySlots();
-	    }
+		    function updateSlotsFromPayload(obj){
+		      if(!obj||!Array.isArray(obj.slots))return;
+		      const maxCount=Number(obj.display_id_max_count);
+		      if(Number.isFinite(maxCount)&&maxCount>0){
+		        configuredSlotCount=Math.floor(maxCount);
+		      }
+		      const slotFps=Number(obj.slot_fps);
+		      if(Number.isFinite(slotFps)&&slotFps>0){
+		        configuredSlotFps=slotFps;
+		      }
+		      const seen=new Set();
+		      obj.slots.forEach(slot=>{
+		        const id=Number(slot.display_id);
+		        if(!Number.isFinite(id)||id<=0)return;
+		        seen.add(Math.floor(id));
+		        let state=slotState.get(id);
+		        if(!state){state={};slotState.set(id,state);}
+		        state.image=slot.image||null;
+		        state.faceId=slot.face_id||'null';
+		        state.publicId=Number(slot.public_id)||0;
+		        state.rawTrackId=Number(slot.raw_track_id)||0;
+		      });
+		      for(const id of Array.from(slotState.keys())){
+		        if(id>0&&!seen.has(id)){
+		          slotState.delete(id);
+		        }
+		      }
+		      renderDisplaySlots();
+		    }
 		    function updateDisplaySlotsFromTargets(entries,obj){
 	      const maxCount=Number(obj.display_id_max_count);
 	      const fallbackLimit=Number(obj.target_output_limit);
@@ -1218,7 +1238,8 @@ class AsyncWebUiFramePublisher {
               const FrameResult& result,
               const std::vector<TargetInfo>& targets,
               const FrameRateStats& fps) {
-    if (!running_.load() || webui_server_ == nullptr || !webui_server_->has_frame_clients()) {
+    if (!running_.load() || webui_server_ == nullptr ||
+        (!webui_server_->has_frame_clients() && !webui_server_->has_slot_clients())) {
       return false;
     }
     std::unique_ptr<Job> job(new Job);
@@ -1242,15 +1263,15 @@ class AsyncWebUiFramePublisher {
 	    FrameRateStats fps;
 	  };
 
-	  struct DisplaySlotCropState {
-	    int display_id = 0;
-	    int public_id = 0;
-	    int raw_track_id = 0;
-	    int frame_id = 0;
-	    double best_front_score = -1.0;
-	    std::string face_id;
-	    std::string image_data_url;
-	  };
+		  struct DisplaySlotCropState {
+		    int display_id = 0;
+		    int public_id = 0;
+		    int raw_track_id = 0;
+		    int frame_id = 0;
+		    double front_score = -1.0;
+		    std::string face_id;
+		    std::string image_data_url;
+		  };
 
 	  int display_slot_limit() const {
 	    if (cfg_.display_id_max_count > 0) {
@@ -1263,6 +1284,9 @@ class AsyncWebUiFramePublisher {
 	  }
 
 	  static std::string target_face_name(const TargetInfo& target) {
+	    if (target.has_known_face && !target.known_name.empty()) {
+	      return target.known_name;
+	    }
 	    return target.has_face_recognition && !target.face_id.empty() ? target.face_id : "null";
 	  }
 
@@ -1369,6 +1393,7 @@ class AsyncWebUiFramePublisher {
 	  std::string build_slot_payload() const {
 	    std::ostringstream os;
 	    os << "{\"display_id_max_count\":" << display_slot_limit()
+	       << ",\"slot_fps\":" << std::fixed << std::setprecision(3) << cfg_.webui_slot_fps
 	       << ",\"slots\":[";
 	    bool first = true;
 	    for (const auto& item : slot_crops_) {
@@ -1383,75 +1408,74 @@ class AsyncWebUiFramePublisher {
 	      os << "{\"display_id\":" << s.display_id
 	         << ",\"public_id\":" << s.public_id
 	         << ",\"raw_track_id\":" << s.raw_track_id
-	         << ",\"frame_id\":" << s.frame_id
-	         << ",\"face_id\":\"" << json_escape(s.face_id) << "\""
-	         << ",\"front_score\":" << std::fixed << std::setprecision(3)
-	         << s.best_front_score
-	         << ",\"image\":\"" << s.image_data_url << "\"}";
+		         << ",\"frame_id\":" << s.frame_id
+		         << ",\"face_id\":\"" << json_escape(s.face_id) << "\""
+		         << ",\"front_score\":" << std::fixed << std::setprecision(3)
+		         << s.front_score
+		         << ",\"image\":\"" << s.image_data_url << "\"}";
 	    }
 	    os << "]}";
 	    return os.str();
 	  }
 
 	  void publish_slot_crops(const Image& clean,
-	                          const FrameResult& result,
-	                          const std::vector<TargetInfo>& targets) {
-	    if (webui_server_ == nullptr || !webui_server_->has_slot_clients() || targets.empty()) {
-	      return;
-	    }
-	    const int limit = display_slot_limit();
-	    bool changed = false;
-	    const int n = std::min(result.detection_count, static_cast<int>(targets.size()));
-	    for (int i = 0; i < n; ++i) {
-	      const TargetInfo& target = targets[static_cast<size_t>(i)];
+		                          const FrameResult& result,
+		                          const std::vector<TargetInfo>& targets) {
+		    if (webui_server_ == nullptr || !webui_server_->has_slot_clients()) {
+		      return;
+		    }
+		    const auto now = std::chrono::steady_clock::now();
+		    const double fps_limit = std::max(0.1, cfg_.webui_slot_fps);
+		    const std::chrono::duration<double> min_interval(1.0 / fps_limit);
+		    if (last_slot_publish_time_.time_since_epoch().count() != 0 &&
+		        now - last_slot_publish_time_ < min_interval) {
+		      return;
+		    }
+		    last_slot_publish_time_ = now;
+
+		    const int limit = display_slot_limit();
+		    std::map<int, DisplaySlotCropState> next_slots;
+		    const int n = std::min(result.detection_count, static_cast<int>(targets.size()));
+		    for (int i = 0; i < n; ++i) {
+		      const TargetInfo& target = targets[static_cast<size_t>(i)];
 	      if (!target.has_display_id || target.display_id <= 0 || target.display_id > limit) {
 	        continue;
 	      }
-	      if (result.detections.size() < (static_cast<size_t>(i) + 1) * kDetectionFields) {
-	        continue;
-	      }
-	      const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
-	      DisplaySlotCropState& state = slot_crops_[target.display_id];
-	      const std::string face_id = target_face_name(target);
-	      const bool face_changed =
-	          !state.face_id.empty() && state.face_id != "null" && state.face_id != face_id;
-	      const bool public_changed = state.public_id > 0 && state.public_id != target.public_id;
-	      if (face_changed || public_changed) {
-	        state.best_front_score = -1.0;
-	        state.image_data_url.clear();
-	      }
-	      const double front_score = target_front_score(target, det);
-	      const bool should_update =
-	          state.image_data_url.empty() || front_score > state.best_front_score + 8.0;
-	      if (!should_update) {
-	        continue;
-	      }
-	      Image crop;
-	      if (!build_slot_crop(clean, det, &crop)) {
-	        continue;
+		      if (result.detections.size() < (static_cast<size_t>(i) + 1) * kDetectionFields) {
+		        continue;
+		      }
+		      const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
+		      const std::string face_id = target_face_name(target);
+		      const double front_score = target_front_score(target, det);
+		      Image crop;
+		      if (!build_slot_crop(clean, det, &crop)) {
+		        continue;
 	      }
 	      try {
-	        if (!slot_crop_encoder_) {
-	          slot_crop_encoder_.reset(new TurboJpegEncoder());
-	        }
-	        const std::vector<uint8_t> jpeg = slot_crop_encoder_->encode_bgr(crop, 72);
-	        state.display_id = target.display_id;
-	        state.public_id = target.public_id;
-	        state.raw_track_id = target.raw_track_id;
-	        state.frame_id = result.frame_index;
-	        state.face_id = face_id;
-	        state.best_front_score = std::max(state.best_front_score, front_score);
-	        state.image_data_url =
-	            "data:image/jpeg;base64," + base64_encode(jpeg.data(), jpeg.size());
-	        changed = true;
-	      } catch (const std::exception& e) {
-	        std::cerr << "[board_cpp-webui] slot crop encode failed: " << e.what() << "\n";
-	      }
-	    }
-	    if (changed) {
-	      webui_server_->publish_slots(build_slot_payload());
-	    }
-	  }
+		        if (!slot_crop_encoder_) {
+		          slot_crop_encoder_.reset(new TurboJpegEncoder());
+		        }
+		        const std::vector<uint8_t> jpeg = slot_crop_encoder_->encode_bgr(crop, 72);
+		        DisplaySlotCropState state;
+		        state.display_id = target.display_id;
+		        state.public_id = target.public_id;
+		        state.raw_track_id = target.raw_track_id;
+		        state.frame_id = result.frame_index;
+		        state.face_id = face_id;
+		        state.front_score = front_score;
+		        state.image_data_url =
+		            "data:image/jpeg;base64," + base64_encode(jpeg.data(), jpeg.size());
+		        next_slots[target.display_id] = std::move(state);
+		      } catch (const std::exception& e) {
+		        std::cerr << "[board_cpp-webui] slot crop encode failed: " << e.what() << "\n";
+		      }
+		    }
+		    if (next_slots.empty() && slot_crops_.empty()) {
+		      return;
+		    }
+		    slot_crops_.swap(next_slots);
+		    webui_server_->publish_slots(build_slot_payload());
+		  }
 
 	  void run_loop() {
 	    TurboJpegEncoder encoder;
@@ -1467,13 +1491,23 @@ class AsyncWebUiFramePublisher {
         }
         job = std::move(latest_job_);
       }
-      if (!job || webui_server_ == nullptr || !webui_server_->has_frame_clients()) {
+      if (!job || webui_server_ == nullptr) {
+        continue;
+      }
+      const bool has_frame_clients = webui_server_->has_frame_clients();
+      const bool has_slot_clients = webui_server_->has_slot_clients();
+      if (!has_frame_clients && !has_slot_clients) {
         continue;
       }
 	      try {
 	        Image annotated = remap_panorama_cpu(
 	            job->source, runtime_.meta(), runtime_.base_map_x(), runtime_.base_map_y());
-	        publish_slot_crops(annotated, job->result, job->targets);
+	        if (has_slot_clients) {
+	          publish_slot_crops(annotated, job->result, job->targets);
+	        }
+	        if (!has_frame_clients) {
+	          continue;
+	        }
 	        draw_annotation(annotated, cfg_, job->result, job->targets, job->fps);
 	        Image scaled;
 	        const Image* encode_image = &annotated;
@@ -1498,11 +1532,12 @@ class AsyncWebUiFramePublisher {
   std::atomic<bool> running_{false};
 	  std::thread worker_;
 	  std::mutex mutex_;
-	  std::condition_variable cv_;
-	  std::unique_ptr<Job> latest_job_;
-	  std::map<int, DisplaySlotCropState> slot_crops_;
-	  std::unique_ptr<TurboJpegEncoder> slot_crop_encoder_;
-	};
+		  std::condition_variable cv_;
+		  std::unique_ptr<Job> latest_job_;
+		  std::map<int, DisplaySlotCropState> slot_crops_;
+		  std::unique_ptr<TurboJpegEncoder> slot_crop_encoder_;
+		  std::chrono::steady_clock::time_point last_slot_publish_time_;
+		};
 
 class WebSocketServer {
  public:

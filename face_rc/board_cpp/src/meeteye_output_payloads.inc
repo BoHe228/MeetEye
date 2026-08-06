@@ -43,6 +43,34 @@ static std::vector<size_t> select_inference_target_indices(
     const FrameResult& result,
     int target_output_limit);
 
+static float wrapped_midpoint_x(float x1, float x2, float width, bool use_wrap) {
+  if (!use_wrap || width <= 1.0f || !std::isfinite(x1) || !std::isfinite(x2)) {
+    return (x1 + x2) * 0.5f;
+  }
+  double a = std::fmod(static_cast<double>(x1), static_cast<double>(width));
+  double b = std::fmod(static_cast<double>(x2), static_cast<double>(width));
+  if (a < 0.0) {
+    a += width;
+  }
+  if (b < 0.0) {
+    b += width;
+  }
+  double delta = b - a;
+  const double half_width = static_cast<double>(width) * 0.5;
+  if (delta > half_width) {
+    delta -= width;
+  } else if (delta < -half_width) {
+    delta += width;
+  }
+  double mid = a + delta * 0.5;
+  if (mid < 0.0) {
+    mid += width;
+  } else if (mid >= width) {
+    mid -= width;
+  }
+  return static_cast<float>(mid);
+}
+
 static void draw_annotation(Image& image,
                             const Config& cfg,
                             const FrameResult& result,
@@ -51,6 +79,20 @@ static void draw_annotation(Image& image,
   draw_text(image, 12, 12, "FPS:" + std::to_string(static_cast<int>(fps.average_fps + 0.5)),
             32, 255, 255, 3);
   draw_sector_overlay(image, cfg, targets);
+  if (cfg.webui_show_hidden_targets && result.hidden_detection_count > 0) {
+    const int hidden_count = std::min(
+        result.hidden_detection_count,
+        static_cast<int>(result.hidden_detections.size() / kDetectionFields));
+    for (int i = 0; i < hidden_count; ++i) {
+      const float* det =
+          result.hidden_detections.data() + static_cast<size_t>(i) * kDetectionFields;
+      const int x1 = static_cast<int>(std::lround(det[0]));
+      const int y1 = static_cast<int>(std::lround(det[1]));
+      const int x2 = static_cast<int>(std::lround(det[2]));
+      const int y2 = static_cast<int>(std::lround(det[3]));
+      draw_rect(image, x1, y1, x2, y2, 150, 150, 150, 2);
+    }
+  }
   const std::vector<size_t> draw_indices =
       select_inference_target_indices(targets, result, cfg.target_output_limit);
   for (size_t draw_pos = 0; draw_pos < draw_indices.size(); ++draw_pos) {
@@ -96,7 +138,13 @@ static void draw_annotation(Image& image,
       fill_rect(image, kx - 3, ky - 3, kx + 3, ky + 3, 0, 255, 255);
     }
     if (valid_keypoint(left_mouth) && valid_keypoint(right_mouth)) {
-      const int cx = static_cast<int>(std::lround((left_mouth[0] + right_mouth[0]) * 0.5f));
+      const bool use_wrap =
+          cfg.wrap_boundary_geometry && !is_wide_angle_projection(cfg.projection_mode);
+      const float center_x = wrapped_midpoint_x(left_mouth[0],
+                                                right_mouth[0],
+                                                static_cast<float>(image.width),
+                                                use_wrap);
+      const int cx = static_cast<int>(std::lround(center_x));
       const int cy = static_cast<int>(std::lround((left_mouth[1] + right_mouth[1]) * 0.5f));
       fill_rect(image, cx - 4, cy - 4, cx + 4, cy + 4, 0, 255, 0);
     }
@@ -105,7 +153,10 @@ static void draw_annotation(Image& image,
     const TargetInfo* target =
         i < static_cast<int>(targets.size()) ? &targets[static_cast<size_t>(i)] : nullptr;
     if (target != nullptr && target->has_face_recognition && !target->face_id.empty()) {
-      label << " F:" << target->face_id;
+      label << " F:"
+            << (target->has_known_face && !target->known_name.empty()
+                    ? target->known_name
+                    : target->face_id);
     }
     if (target != nullptr && target->has_azimuth && std::isfinite(target->azimuth)) {
       label << " A:" << static_cast<int>(std::lround(target->azimuth));
@@ -285,7 +336,13 @@ class AngleAndDistanceRuntime {
     const float* face_nose = det + 5 + 2 * 3;
     const float* fallback0 = det + 5;
     if (valid_keypoint(left_mouth) && valid_keypoint(right_mouth)) {
-      *out_x = (left_mouth[0] + right_mouth[0]) * 0.5f;
+      const int pano_w = meta_.process_width > 0 ? meta_.process_width : meta_.img_width;
+      const bool use_wrap =
+          cfg_.wrap_boundary_geometry && !is_wide_angle_projection(meta_.projection_mode);
+      *out_x = wrapped_midpoint_x(left_mouth[0],
+                                  right_mouth[0],
+                                  static_cast<float>(pano_w),
+                                  use_wrap);
       *out_y = (left_mouth[1] + right_mouth[1]) * 0.5f;
       return;
     }
@@ -746,11 +803,13 @@ static void print_result_json(std::ostream& os,
             << ", \"close_small_dedup_removed\": " << result.close_small_dedup_removed
             << ", \"normal_duplicate_dedup_removed\": "
             << result.normal_duplicate_dedup_removed
-            << ", \"raw_duplicate_retired\": " << result.raw_duplicate_retired << "},\n";
+            << ", \"raw_duplicate_retired\": " << result.raw_duplicate_retired
+            << ", \"hidden_display_targets\": " << result.hidden_detection_count << "},\n";
   os << "  \"tracker_debug\": ";
   print_tracker_debug_json(os, result);
   os << ",\n";
   os << "  \"detection_count\": " << result.detection_count << ",\n";
+  os << "  \"hidden_detection_count\": " << result.hidden_detection_count << ",\n";
   os << "  \"detections\": [\n";
   for (int i = 0; i < result.detection_count; ++i) {
     const float* det = result.detections.data() + static_cast<size_t>(i) * kDetectionFields;
@@ -787,6 +846,38 @@ static void print_result_json(std::ostream& os,
     }
     os << "]}";
     if (i + 1 < result.detection_count) {
+      os << ",";
+    }
+    os << "\n";
+  }
+  os << "  ],\n";
+  os << "  \"hidden_detections\": [\n";
+  const int hidden_count = std::min(
+      result.hidden_detection_count,
+      static_cast<int>(result.hidden_detections.size() / kDetectionFields));
+  for (int i = 0; i < hidden_count; ++i) {
+    const float* det =
+        result.hidden_detections.data() + static_cast<size_t>(i) * kDetectionFields;
+    os << "    {\"bbox\": ";
+    print_json_array(os, det, 4);
+    if (i < static_cast<int>(result.hidden_track_ids.size()) &&
+        result.hidden_track_ids[static_cast<size_t>(i)] > 0) {
+      os << ", \"track_id\": " << result.hidden_track_ids[static_cast<size_t>(i)];
+    }
+    if (i < static_cast<int>(result.hidden_raw_track_ids.size()) &&
+        result.hidden_raw_track_ids[static_cast<size_t>(i)] > 0) {
+      os << ", \"raw_track_id\": " << result.hidden_raw_track_ids[static_cast<size_t>(i)];
+    }
+    os << ", \"score\": " << std::fixed << std::setprecision(6) << det[4]
+       << ", \"keypoints\": [";
+    for (int k = 0; k < 5; ++k) {
+      if (k > 0) {
+        os << ",";
+      }
+      print_json_array(os, det + 5 + k * 3, 3);
+    }
+    os << "]}";
+    if (i + 1 < hidden_count) {
       os << ",";
     }
     os << "\n";
@@ -879,11 +970,13 @@ static void print_result_jsonl(std::ostream& os,
      << ",\"final_dedup_removed\":" << result.final_dedup_removed
      << ",\"close_small_dedup_removed\":" << result.close_small_dedup_removed
      << ",\"normal_duplicate_dedup_removed\":" << result.normal_duplicate_dedup_removed
-     << ",\"raw_duplicate_retired\":" << result.raw_duplicate_retired << "}"
+     << ",\"raw_duplicate_retired\":" << result.raw_duplicate_retired
+     << ",\"hidden_display_targets\":" << result.hidden_detection_count << "}"
      << ",\"tracker_debug\":";
   print_tracker_debug_json(os, result);
   os
      << ",\"detection_count\":" << result.detection_count
+     << ",\"hidden_detection_count\":" << result.hidden_detection_count
      << ",\"detections\":[";
   for (int i = 0; i < result.detection_count; ++i) {
     if (i > 0) {
@@ -931,6 +1024,36 @@ static void print_result_jsonl(std::ostream& os,
       write_face_recognition_json(os, (*targets)[static_cast<size_t>(i)]);
     }
     os << "}";
+  }
+  os << "],\"hidden_detections\":[";
+  const int hidden_count = std::min(
+      result.hidden_detection_count,
+      static_cast<int>(result.hidden_detections.size() / kDetectionFields));
+  for (int i = 0; i < hidden_count; ++i) {
+    if (i > 0) {
+      os << ",";
+    }
+    const float* det =
+        result.hidden_detections.data() + static_cast<size_t>(i) * kDetectionFields;
+    os << "{\"bbox\":";
+    print_json_array(os, det, 4);
+    if (i < static_cast<int>(result.hidden_track_ids.size()) &&
+        result.hidden_track_ids[static_cast<size_t>(i)] > 0) {
+      os << ",\"track_id\":" << result.hidden_track_ids[static_cast<size_t>(i)];
+    }
+    if (i < static_cast<int>(result.hidden_raw_track_ids.size()) &&
+        result.hidden_raw_track_ids[static_cast<size_t>(i)] > 0) {
+      os << ",\"raw_track_id\":" << result.hidden_raw_track_ids[static_cast<size_t>(i)];
+    }
+    os << ",\"score\":" << std::fixed << std::setprecision(6) << det[4]
+       << ",\"keypoints\":[";
+    for (int k = 0; k < 5; ++k) {
+      if (k > 0) {
+        os << ",";
+      }
+      print_json_array(os, det + 5 + k * 3, 3);
+    }
+    os << "]}";
   }
   os << "]}\n";
 }
