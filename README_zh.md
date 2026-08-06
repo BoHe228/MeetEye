@@ -112,8 +112,12 @@ sudo taskset -c 0-6 bash run_smoke.sh \
   --face-rec-align-mode five-point \
   --face-rec-async \
   --display-id-max-count 8 \
+  --no-target-output-compact-ids \
   --webui-jpeg-quality 80 \
   --webui-frame-scale 0.5 \
+  --webui-slot-fps 5 \
+  --display-id-replace-area-ratio 1.50 \
+  --display-id-min-box-size 20 \
   --no-output-jsonl \
   --no-stdout-json
 ```
@@ -134,11 +138,16 @@ sudo taskset -c 0-6 bash run_smoke.sh \
   --face-rec \
   --face-rec-dynamic-library \
   --dynamic-face-library-dir face_library_dynamic_camera_fisheye \
+  --known-face-dir face_photos \
   --face-rec-model-preset ir50_webface4m \
   --face-rec-align-mode five-point \
   --face-rec-async \
   --display-id-max-count 8 \
-  --webui-frame-scale 0.5 \
+  --no-target-output-compact-ids \
+  --webui-jpeg-quality 80 \
+  --webui-slot-fps 5 \
+  --display-id-replace-area-ratio 1.50 \
+  --display-id-min-box-size 20 \
   --no-output-jsonl \
   --no-stdout-json
 ```
@@ -158,14 +167,23 @@ sudo taskset -c 0-6 bash run_smoke.sh \
   --webui \
   --face-rec \
   --face-rec-dynamic-library \
-  --dynamic-face-library-dir face_library_dynamic_camera_wide \
+  --dynamic-face-library-dir face_library_dynamic_camera_wide_angle \
+  --known-face-dir face_photos \
   --face-rec-model-preset ir50_webface4m \
   --face-rec-align-mode five-point \
+  --display-id-max-count 8 \
+  --no-target-output-compact-ids \
+  --face-rec-async \
+  --webui-jpeg-quality 80 \
+  --display-id-replace-area-ratio 1.50 \
+  --webui-show-hidden-targets \
+  --webui-slot-fps 5 \
+  --display-id-min-box-size 20 \
   --no-output-jsonl \
   --no-stdout-json
 ```
 
-详细板端环境、map 生成、AdaFace ONNX/RKNN 转换、锁频检查、性能记录和常见问题见 [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md)。
+详细板端环境、map 生成、AdaFace ONNX/RKNN 转换、已知人脸库模式、锁频检查、性能记录和常见问题见 [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md)。开/不开持久特征库的行为展示页放在 [`face_rc/board_cpp/docs/known_face_library_modes.html`](face_rc/board_cpp/docs/known_face_library_modes.html)；`board_output/` 只作为运行输出目录，默认被 Git 忽略。
 
 ---
 
@@ -221,6 +239,7 @@ YOLO 训练与校准工作区位于 [`fine-tune/`](fine-tune/)，包含：
 | `public_id` | C++ 输出层维护的 public track ID，用于短暂遮挡继承和边界恢复 |
 | `raw_track_id` | native HybridSORT 底层 raw track ID；当前 FaceID 主绑定对象 |
 | `face_id` | AdaFace 动态或静态人脸身份；没有识别结果时为 `null` |
+| `face_recognition.known_name` | 已知照片库匹配到的姓名，来自照片文件名；与 `face_id` 共存，不替代动态 FaceID |
 | `azimuth` / `elevation` | 方位角和俯仰角，单位为度 |
 | `distance` | 基于人脸关键点距离估计的目标距离 |
 

@@ -171,11 +171,17 @@ sudo taskset -c 0-6 bash run_smoke.sh \
   --webui \
   --face-rec \
   --face-rec-dynamic-library \
+  --known-face-dir face_photos \
   --face-rec-model-preset ir50_webface4m \
   --face-rec-align-mode five-point \
   --face-rec-async \
   --display-id-max-count 8 \
+  --no-target-output-compact-ids \
+  --webui-jpeg-quality 80 \
   --webui-frame-scale 0.5 \
+  --webui-slot-fps 5 \
+  --display-id-replace-area-ratio 1.50 \
+  --display-id-min-box-size 20 \
   --no-output-jsonl \
   --no-stdout-json
 ```
@@ -197,12 +203,21 @@ sudo taskset -c 0-6 bash run_smoke.sh \
   --face-rec-dynamic-library \
   --face-rec-model-preset ir50_webface4m \
   --face-rec-align-mode five-point \
-  --dynamic-face-library-dir face_library_dynamic_wide \
+  --dynamic-face-library-dir face_library_dynamic_camera_wide_angle \
+  --known-face-dir face_photos \
+  --display-id-max-count 8 \
+  --no-target-output-compact-ids \
+  --face-rec-async \
+  --webui-jpeg-quality 80 \
+  --display-id-replace-area-ratio 1.50 \
+  --webui-show-hidden-targets \
+  --webui-slot-fps 5 \
+  --display-id-min-box-size 20 \
   --no-output-jsonl \
   --no-stdout-json
 ```
 
-For board setup, map generation, model conversion, lock-frequency checks, profiling reports, and troubleshooting, see [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md).
+For board setup, map generation, model conversion, known-face library modes, lock-frequency checks, profiling reports, and troubleshooting, see [`face_rc/board_cpp/README.md`](face_rc/board_cpp/README.md). The known-face persistent-library behavior page is stored as [`face_rc/board_cpp/docs/known_face_library_modes.html`](face_rc/board_cpp/docs/known_face_library_modes.html); `board_output/` is only for runtime artifacts and is ignored by Git.
 
 ---
 
@@ -286,10 +301,14 @@ In `face_rc/board_cpp`, use `--face-rec` instead. The board runtime supports `--
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--display-id-max-count` | `8` | Maximum public-facing display slots; `0` means unlimited |
-| `--display-id-replace-confirm-frames` | `3` | Consecutive frames required before a new target can replace an occupied display slot |
+| `--display-id-replace-confirm-seconds` | `1` | Consecutive seconds required before a larger new target can replace an occupied display slot |
+| `--display-id-replace-confirm-frames` | legacy off | Frame-count override for replacement confirmation; prefer the seconds-based option |
+| `--display-id-replace-area-ratio` | `1.50` | New target area must be at least this ratio larger before replacement is considered |
+| `--display-id-min-box-size` | `40` | Minimum bbox short side allowed to occupy a display slot |
 | `--target-output-limit` | `8` | Maximum non-sector JSON targets; `0` means unlimited |
 | `--target-output-compact-ids` / `--no-target-output-compact-ids` | compact on | Controls whether JSON target keys are `1..N` or actual display/public IDs |
 | `--webui-frame-scale` | `1.0` | Downscale only the WebUI JPEG stream before sending; does not change inference coordinates |
+| `--webui-slot-fps` | `10` | FPS limit for display-slot crop WebSocket updates |
 
 ### Output
 
@@ -345,6 +364,7 @@ Every frame result is broadcast on `/ws/inference` (WebUI mode) and optionally w
 | `public_id` | — | Long-running output track ID maintained above the native raw tracker |
 | `raw_track_id` | — | Native HybridSORT raw track ID; FaceID is primarily bound to this value in `board_cpp` |
 | `face_id` | — | AdaFace dynamic/static identity label, or `null` when not available |
+| `face_recognition.known_name` | — | Optional known-photo label derived from the source photo filename; coexists with, and does not replace, the dynamic `face_id` |
 | `features` | — | 512-dim L2-normalised OSNet ReID feature vector in the Python/GPU path |
 
 ### Sector-aggregated format (`--sector-output`)
